@@ -25,7 +25,12 @@ pub const AGENT_PATH: &str = "/org/kalo/obex/agent";
 /// One in-flight incoming transfer.
 #[derive(Debug, Clone)]
 pub struct PendingTransfer {
+    /// Stable identity for poll bookkeeping: obexd reuses transfer object
+    /// paths, so entries must never be matched or removed by path.
+    pub id: String,
     pub path: String,
+    /// The staging destination this entry authorized (obexd writes here).
+    pub dest: PathBuf,
     pub staging_dir: PathBuf,
     pub started: Instant,
 }
@@ -147,7 +152,8 @@ impl AgentService {
         let size = t.size().await.ok();
 
         // Stage inside obexd's root (it may refuse to write outside it).
-        let staging_dir = PathBuf::from(&root).join(format!("kalo-{}", Uuid::new_v4().simple()));
+        let id = Uuid::new_v4().simple().to_string();
+        let staging_dir = PathBuf::from(&root).join(format!("kalo-{id}"));
         std::fs::create_dir_all(&staging_dir)
             .with_context(|| format!("create staging dir {staging_dir:?}"))?;
         let dest = staging_dir.join(&safe_name);
@@ -156,8 +162,10 @@ impl AgentService {
             .lock()
             .expect("pending lock")
             .push(PendingTransfer {
+                id,
                 path: transfer.to_string(),
-                staging_dir: staging_dir.clone(),
+                dest: dest.clone(),
+                staging_dir,
                 started: Instant::now(),
             });
 
@@ -182,6 +190,32 @@ fn cleanup_staging(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Guard against obexd reusing transfer object paths: only touch the
+/// transfer this entry authorized (`Transfer1.Filename` must equal the
+/// authorized staging destination). Returns `true` when the object now
+/// belongs to some other transfer.
+async fn stale_transfer(t: &TransferPropsProxy<'_>, dest: &Path) -> bool {
+    match t.filename().await {
+        Ok(filename) => Path::new(&filename) != dest,
+        Err(_) => false, // object likely gone; let the caller recover from `dest`
+    }
+}
+
+fn fail(tx: &UnboundedSender<Event>, name: &str, error: impl Into<String>) {
+    let _ = tx.send(Event::IncomingFailed {
+        name: name.to_string(),
+        error: error.into(),
+    });
+}
+
+fn stale_failure(tx: &UnboundedSender<Event>, p: &PendingTransfer) {
+    fail(
+        tx,
+        &p.path,
+        "stale transfer object (path reused by another transfer); staged file kept in the obexd cache",
+    );
+}
+
 /// Poll pending incoming transfers; completion is detected by polling
 /// (simple and runtime-agnostic for the spike).
 pub async fn poll_pending(
@@ -194,6 +228,7 @@ pub async fn poll_pending(
     if list.is_empty() {
         return;
     }
+    // Entries are finished by `id`, never by object path (obexd reuses paths).
     let mut finished: Vec<String> = Vec::new();
 
     for p in &list {
@@ -201,22 +236,16 @@ pub async fn poll_pending(
             Ok(b) => match b.build().await {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Event::IncomingFailed {
-                        name: p.path.clone(),
-                        error: format!("proxy: {e}"),
-                    });
+                    fail(tx, &p.path, format!("proxy: {e}"));
                     cleanup_staging(&p.staging_dir);
-                    finished.push(p.path.clone());
+                    finished.push(p.id.clone());
                     continue;
                 }
             },
             Err(e) => {
-                let _ = tx.send(Event::IncomingFailed {
-                    name: p.path.clone(),
-                    error: format!("proxy path: {e}"),
-                });
+                fail(tx, &p.path, format!("proxy path: {e}"));
                 cleanup_staging(&p.staging_dir);
-                finished.push(p.path.clone());
+                finished.push(p.id.clone());
                 continue;
             }
         };
@@ -224,22 +253,26 @@ pub async fn poll_pending(
         match proxy.status().await {
             Ok(status) => match status.as_str() {
                 "complete" => {
-                    if let Err(e) = finish_transfer(p, &proxy, downloads, tx).await {
-                        let _ = tx.send(Event::IncomingFailed {
-                            name: p.path.clone(),
-                            error: e.to_string(),
-                        });
+                    if stale_transfer(&proxy, &p.dest).await {
+                        stale_failure(tx, p);
+                        finished.push(p.id.clone());
+                        continue; // keep the staging dir: it may hold the old file
+                    }
+                    if let Err(e) = finish_transfer(p, downloads, tx) {
+                        fail(tx, &p.path, e.to_string());
                     }
                     cleanup_staging(&p.staging_dir);
-                    finished.push(p.path.clone());
+                    finished.push(p.id.clone());
                 }
                 "error" => {
-                    let _ = tx.send(Event::IncomingFailed {
-                        name: p.path.clone(),
-                        error: "transfer reported error".into(),
-                    });
+                    if stale_transfer(&proxy, &p.dest).await {
+                        stale_failure(tx, p);
+                        finished.push(p.id.clone());
+                        continue; // keep the staging dir
+                    }
+                    fail(tx, &p.path, "transfer reported error");
                     cleanup_staging(&p.staging_dir);
-                    finished.push(p.path.clone());
+                    finished.push(p.id.clone());
                 }
                 _ => {
                     let transferred = proxy.transferred().await.ok();
@@ -249,13 +282,23 @@ pub async fn poll_pending(
                     });
                 }
             },
-            Err(e) => {
-                let _ = tx.send(Event::IncomingFailed {
-                    name: p.path.clone(),
-                    error: format!("status: {e}"),
-                });
+            Err(_) => {
+                // The transfer object is gone (obexd dropped it or crashed).
+                // If the staged file exists, recover it instead of silently
+                // losing it; a partially written file is kept and reported.
+                if p.dest.exists() {
+                    let _ = tx.send(Event::Log(format!(
+                        "{}: transfer object disappeared; recovering staged file",
+                        p.dest.display()
+                    )));
+                    if let Err(e) = finish_transfer(p, downloads, tx) {
+                        fail(tx, &p.path, e.to_string());
+                    }
+                } else {
+                    fail(tx, &p.path, "transfer object disappeared before completion");
+                }
                 cleanup_staging(&p.staging_dir);
-                finished.push(p.path.clone());
+                finished.push(p.id.clone());
             }
         }
     }
@@ -264,24 +307,24 @@ pub async fn poll_pending(
         pending
             .lock()
             .expect("pending lock")
-            .retain(|x| !finished.contains(&x.path));
+            .retain(|x| !finished.contains(&x.id));
     }
 }
 
-async fn finish_transfer(
+/// Move the authorized staging file into `~/Downloads` and report stats.
+fn finish_transfer(
     p: &PendingTransfer,
-    t: &TransferPropsProxy<'_>,
     downloads: &Path,
     tx: &UnboundedSender<Event>,
 ) -> Result<()> {
-    let filename = t.filename().await.context("final filename")?;
-    let bytes = std::fs::metadata(&filename).map(|m| m.len()).unwrap_or(0);
-    let base = Path::new(&filename)
+    let bytes = std::fs::metadata(&p.dest).map(|m| m.len()).unwrap_or(0);
+    let base = p
+        .dest
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "received-file".into());
     let final_path = sanitize::unique_in_dir(downloads, &sanitize::filename(&base));
-    sanitize::move_file(Path::new(&filename), &final_path).context("move into Downloads")?;
+    sanitize::move_file(&p.dest, &final_path).context("move into Downloads")?;
 
     let elapsed_secs = p.started.elapsed().as_secs_f64();
     let mbps = if elapsed_secs > 0.0 {

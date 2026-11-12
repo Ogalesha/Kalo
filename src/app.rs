@@ -31,7 +31,7 @@ struct EventBus {
 pub enum Message {
     DevicesLoaded(Result<Vec<DeviceInfo>, String>),
     RefreshDevices,
-    PickDevice(usize),
+    PickDevice(String),
     PickFile,
     FilePicked(Option<PathBuf>),
     SendClicked,
@@ -42,7 +42,9 @@ pub enum Message {
 struct App {
     tx: UnboundedSender<Event>,
     devices: Vec<DeviceInfo>,
-    selected: Option<usize>,
+    /// Selected device address (stable across list refreshes; an index would
+    /// go stale because `list_known_devices` re-sorts on every refresh).
+    selected: Option<String>,
     file: Option<PathBuf>,
     log: Vec<String>,
     sending: bool,
@@ -111,8 +113,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::RefreshDevices => Task::perform(bluez::list_known_devices(), |result| {
             Message::DevicesLoaded(result.map_err(|e| e.to_string()))
         }),
-        Message::PickDevice(index) => {
-            app.selected = (index < app.devices.len()).then_some(index);
+        Message::PickDevice(address) => {
+            app.selected = Some(address);
             Task::none()
         }
         Message::PickFile => Task::perform(
@@ -130,7 +132,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SendClicked => {
-            let Some(device) = app.selected.and_then(|i| app.devices.get(i)) else {
+            let Some(device) = resolve_target(&app.devices, app.selected.as_deref()) else {
                 app.log("select a device first");
                 return Task::none();
             };
@@ -234,6 +236,14 @@ fn subscription(_app: &App) -> Subscription<Message> {
                 return;
             };
             let Some(mut rx) = bus.rx_slot.lock().expect("rx slot").take() else {
+                // The channel was already consumed (subscription re-created):
+                // surface it instead of dying silently.
+                let _ = out
+                    .send(Message::Event(Event::ReceiverState(
+                        "event pump restarted but its channel was already consumed — restart Kalo"
+                            .into(),
+                    )))
+                    .await;
                 return;
             };
             let conn = match Connection::session().await {
@@ -247,8 +257,12 @@ fn subscription(_app: &App) -> Subscription<Message> {
                     return;
                 }
             };
-            // The receiver registers itself and reports state via events.
-            let _ = agent::start(&conn, bus.pending.clone(), bus.tx.clone()).await;
+            // The receiver registers itself and reports state via events. On
+            // failure (e.g. the OBEX agent slot is taken by Blueman) the pump
+            // goes passive: it still forwards events, but stops polling
+            // incoming transfers that will never arrive.
+            let receiver_active =
+                agent::start(&conn, bus.pending.clone(), bus.tx.clone()).await.is_ok();
 
             loop {
                 tokio::select! {
@@ -260,7 +274,7 @@ fn subscription(_app: &App) -> Subscription<Message> {
                             None => break,
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    _ = tokio::time::sleep(Duration::from_millis(500)), if receiver_active => {
                         agent::poll_pending(&conn, &bus.pending, &bus.downloads, &bus.tx).await;
                     }
                 }
@@ -273,9 +287,8 @@ fn view(app: &App) -> Element<'_, Message> {
     let device_rows: Vec<Element<'_, Message>> = app
         .devices
         .iter()
-        .enumerate()
-        .map(|(index, device)| {
-            let marker = if app.selected == Some(index) {
+        .map(|device| {
+            let marker = if app.selected.as_deref() == Some(device.address.as_str()) {
                 "▶ "
             } else {
                 "  "
@@ -286,7 +299,7 @@ fn view(app: &App) -> Element<'_, Message> {
             );
             button(text(label))
                 .width(Length::Fill)
-                .on_press(Message::PickDevice(index))
+                .on_press(Message::PickDevice(device.address.clone()))
                 .into()
         })
         .collect();
@@ -298,9 +311,7 @@ fn view(app: &App) -> Element<'_, Message> {
         scrollable(column(device_rows).spacing(4)).height(Length::FillPortion(3))
     };
 
-    let target = app
-        .selected
-        .and_then(|i| app.devices.get(i))
+    let target = resolve_target(&app.devices, app.selected.as_deref())
         .map(|d| format!("target: {} ({})", d.alias, d.address))
         .unwrap_or_else(|| "target: —".to_string());
     let file = app
@@ -308,7 +319,9 @@ fn view(app: &App) -> Element<'_, Message> {
         .as_ref()
         .map(|p| format!("file: {}", p.display()))
         .unwrap_or_else(|| "file: —".to_string());
-    let can_send = app.selected.is_some() && app.file.is_some() && !app.sending;
+    let can_send = resolve_target(&app.devices, app.selected.as_deref()).is_some()
+        && app.file.is_some()
+        && !app.sending;
 
     let mut send_box = column![
         text(target).size(13),
@@ -353,4 +366,56 @@ fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill);
 
     container(content).padding(16).into()
+}
+
+/// Resolve the selected device by address (pure helper, unit-tested):
+/// stale selections that no longer match any listed device resolve to
+/// `None` instead of pointing at the wrong entry.
+fn resolve_target<'a>(
+    devices: &'a [DeviceInfo],
+    selected: Option<&str>,
+) -> Option<&'a DeviceInfo> {
+    let address = selected?;
+    devices
+        .iter()
+        .find(|d| d.address.eq_ignore_ascii_case(address))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(address: &str, alias: &str) -> DeviceInfo {
+        DeviceInfo {
+            address: address.into(),
+            alias: alias.into(),
+            paired: true,
+            trusted: false,
+            connected: false,
+        }
+    }
+
+    #[test]
+    fn resolve_target_matches_selected_address() {
+        let devices = vec![device("AA:BB", "phone"), device("CC:DD", "laptop")];
+        assert_eq!(
+            resolve_target(&devices, Some("CC:DD")).unwrap().alias,
+            "laptop"
+        );
+    }
+
+    #[test]
+    fn resolve_target_is_case_insensitive() {
+        let devices = vec![device("AA:BB", "phone")];
+        assert!(resolve_target(&devices, Some("aa:bb")).is_some());
+    }
+
+    #[test]
+    fn resolve_target_is_none_for_stale_selection() {
+        // After a refresh the selected device may no longer be listed: it
+        // must not resolve (a stale index used to point at another device).
+        let devices = vec![device("CC:DD", "laptop")];
+        assert!(resolve_target(&devices, Some("AA:BB")).is_none());
+        assert!(resolve_target(&devices, None).is_none());
+    }
 }
