@@ -1,0 +1,15 @@
+[package]
+name = "kalo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+futures-util = "0.3"
+iced = { version = "0.14", features = ["tokio"] }
+rfd = "0.15"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+zbus = "5"
