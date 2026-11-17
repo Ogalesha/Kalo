@@ -1,0 +1,29 @@
+pkgbase = kalo-git
+	pkgdesc = Bluetooth file transfer over OBEX/OPP
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Ogalesha/Kalo
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	makedepends = rust
+	depends = bluez
+	depends = bluez-obexd
+	depends = gcc-libs
+	depends = glibc
+	depends = libx11
+	depends = libxkbcommon
+	depends = libxkbcommon-x11
+	depends = wayland
+	optdepends = vulkan-icd-loader: preferred GPU renderer
+	optdepends = xdg-desktop-portal: native file picker
+	optdepends = xdg-desktop-portal-gtk: portal backend for GTK desktops
+	optdepends = xdg-desktop-portal-kde: portal backend for KDE Plasma
+	provides = kalo
+	conflicts = kalo
+	source = git+https://github.com/Ogalesha/Kalo.git#branch=main
+	sha256sums = SKIP
+
+pkgname = kalo-git

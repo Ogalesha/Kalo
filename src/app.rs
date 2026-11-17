@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::SinkExt;
 use iced::widget::{button, column, container, progress_bar, row, rule, scrollable, space, text};
-use iced::{Alignment, Color, Element, Font, Length, Padding, Subscription, Task, Theme};
+use iced::{Alignment, Color, Element, Font, Length, Padding, Subscription, Task};
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 
@@ -182,8 +182,8 @@ pub fn run() -> iced::Result {
         view,
     )
     .title("Kalo")
-    .theme(|_: &App| Theme::Light)
-    .window_size((880.0, 640.0))
+    .theme(|_: &App| ui::theme())
+    .window_size((980.0, 710.0))
     .centered()
     .subscription(subscription)
     .run()
@@ -523,18 +523,51 @@ fn view(app: &App) -> Element<'_, Message> {
     let target = resolve_target(&app.devices, app.selected.as_deref());
 
     let header = row![
-        column![
-            text("Kalo").size(26).font(ui::BOLD).color(ui::TEXT),
-            text("Bluetooth file transfer")
-                .size(12.5)
-                .color(ui::TEXT_SECONDARY),
+        row![
+            brand_mark(),
+            column![
+                text("Kalo").size(22).font(ui::BOLD).color(ui::TEXT),
+                text("Bluetooth file transfer")
+                    .size(11.5)
+                    .color(ui::TEXT_MUTED),
+            ]
+            .spacing(0),
         ]
-        .spacing(1),
+        .spacing(11)
+        .align_y(Alignment::Center),
         space().width(Length::Fill),
         receiver_summary(&app.receiver_state),
     ]
     .width(Length::Fill)
     .align_y(Alignment::Center);
+
+    let hero = container(
+        row![
+            column![
+                text("Pass a file. No cables.")
+                    .size(30)
+                    .font(ui::BOLD)
+                    .color(ui::TEXT),
+                text("Send directly to the devices around you. Nothing goes through the cloud.")
+                    .size(13)
+                    .color(ui::TEXT_SECONDARY),
+                row![
+                    chip("Local transfer"),
+                    chip("No sign-in"),
+                    chip("Saves to Downloads"),
+                ]
+                .spacing(8),
+            ]
+            .spacing(9)
+            .width(Length::Fill),
+            transfer_orb(),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center),
+    )
+    .padding([19, 24])
+    .width(Length::Fill)
+    .style(ui::hero);
 
     let device_rows: Vec<Element<'_, Message>> = app
         .devices
@@ -558,10 +591,7 @@ fn view(app: &App) -> Element<'_, Message> {
 
     let mut device_section = column![
         row![
-            text("Device")
-                .size(12)
-                .font(ui::MEDIUM)
-                .color(ui::TEXT_MUTED),
+            step_label("1", "Choose a device"),
             space().width(Length::Fill),
             button(
                 text(if app.devices_loading {
@@ -569,7 +599,7 @@ fn view(app: &App) -> Element<'_, Message> {
                 } else {
                     "Refresh"
                 })
-                .size(12)
+                .size(11.5)
                 .font(ui::MEDIUM),
             )
             .padding([5, 10])
@@ -579,7 +609,7 @@ fn view(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .align_y(Alignment::Center),
     ]
-    .spacing(8)
+    .spacing(9)
     .height(Length::Fill);
     if let Some(error) = app.devices_error.as_deref()
         && !app.devices.is_empty()
@@ -599,7 +629,7 @@ fn view(app: &App) -> Element<'_, Message> {
         .unwrap_or_else(|| "No file chosen".to_string());
     let mut file_info = column![
         text(file_title)
-            .size(14)
+            .size(13.5)
             .font(if app.file.is_some() {
                 ui::SEMIBOLD
             } else {
@@ -616,7 +646,7 @@ fn view(app: &App) -> Element<'_, Message> {
     if let Some(path) = app.file.as_deref() {
         file_info = file_info.push(
             text(path.display().to_string())
-                .size(11.5)
+                .size(11)
                 .color(ui::TEXT_MUTED),
         );
     }
@@ -624,33 +654,41 @@ fn view(app: &App) -> Element<'_, Message> {
     let file_button_label = if app.picking_file {
         "Choosing…"
     } else if app.file.is_some() {
-        "Change file…"
+        "Change…"
     } else {
         "Choose file…"
     };
-    let file_section = column![
-        text("File").size(12).font(ui::MEDIUM).color(ui::TEXT_MUTED),
+    let file_zone = container(
         row![
+            container(text("↥").size(18).font(ui::BOLD).color(ui::ACCENT_TEXT))
+                .width(38)
+                .height(38)
+                .center(38)
+                .style(ui::icon_tile),
             file_info,
-            button(text(file_button_label).size(12.5).font(ui::MEDIUM))
-                .padding([8, 12])
+            button(text(file_button_label).size(12).font(ui::MEDIUM))
+                .padding([7, 11])
                 .style(ui::secondary_button)
                 .on_press_maybe((!is_sending && !app.picking_file).then_some(Message::PickFile)),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
-    ]
-    .spacing(6);
+    )
+    .padding([11, 12])
+    .width(Length::Fill)
+    .style(ui::inset);
+
+    let file_section = column![step_label("2", "Pick a file"), file_zone,].spacing(9);
 
     let send_panel = container(
         column![
             column![
                 text("Send a file")
-                    .size(18)
+                    .size(20)
                     .font(ui::SEMIBOLD)
                     .color(ui::TEXT),
-                text("Pick a paired device, then choose a file.")
-                    .size(12.5)
+                text("Choose a device and a file, then send.")
+                    .size(12)
                     .color(ui::TEXT_SECONDARY),
             ]
             .spacing(3),
@@ -659,27 +697,27 @@ fn view(app: &App) -> Element<'_, Message> {
             file_section,
             send_action(app, target),
         ]
-        .spacing(16)
+        .spacing(15)
         .height(Length::Fill),
     )
-    .padding(22)
+    .padding(20)
     .width(Length::FillPortion(3))
     .height(Length::Fill)
     .style(ui::panel);
 
-    let mut incoming_header = row![text("Incoming").size(18).font(ui::SEMIBOLD).color(ui::TEXT),]
+    let mut incoming_header = row![text("Incoming").size(19).font(ui::SEMIBOLD).color(ui::TEXT),]
         .spacing(8)
         .align_y(Alignment::Center);
     if !app.incoming.is_empty() {
-        incoming_header = incoming_header.push(
-            text(format!("{} in progress", app.incoming.len()))
-                .size(11.5)
-                .font(ui::MEDIUM)
+        incoming_header = incoming_header.push(space().width(Length::Fill)).push(
+            text(format!("{} active", app.incoming.len()))
+                .size(10.5)
+                .font(ui::BOLD)
                 .color(ui::ACCENT_TEXT),
         );
     }
 
-    let mut incoming_body = column![].spacing(10).width(Length::Fill);
+    let mut incoming_body = column![].spacing(9).width(Length::Fill);
     if let ReceiverStatus::Off(reason) = &app.receiver_state {
         incoming_body = incoming_body.push(receiver_notice(reason));
     }
@@ -696,24 +734,29 @@ fn view(app: &App) -> Element<'_, Message> {
                         .map(incoming_row)
                         .collect::<Vec<Element<'_, Message>>>(),
                 )
-                .spacing(14)
+                .spacing(8)
                 .width(Length::Fill),
             )
-            .height(Length::Fixed(160.0)),
+            .height(Length::Fixed(150.0)),
         );
     }
 
     let activity: Element<'_, Message> = if app.log.is_empty() {
-        column![
-            text("No activity yet")
-                .size(13)
-                .font(ui::MEDIUM)
-                .color(ui::TEXT),
-            text("Sent and received files will be listed here.")
-                .size(12)
-                .color(ui::TEXT_SECONDARY),
-        ]
-        .spacing(3)
+        container(
+            column![
+                text("No activity yet")
+                    .size(13)
+                    .font(ui::MEDIUM)
+                    .color(ui::TEXT),
+                text("Sent and received files will be listed here.")
+                    .size(11.5)
+                    .color(ui::TEXT_SECONDARY),
+            ]
+            .spacing(3),
+        )
+        .padding(13)
+        .width(Length::Fill)
+        .style(ui::inset)
         .into()
     } else {
         let rows: Vec<Element<'_, Message>> = app
@@ -721,55 +764,137 @@ fn view(app: &App) -> Element<'_, Message> {
             .iter()
             .rev()
             .map(|line| {
-                text(line.clone())
-                    .size(12)
-                    .line_height(1.35)
-                    .color(ui::TEXT_SECONDARY)
-                    .width(Length::Fill)
-                    .into()
+                row![
+                    container(space())
+                        .width(5)
+                        .height(5)
+                        .style(ui::dot(ui::ACCENT)),
+                    text(line.clone())
+                        .size(11.5)
+                        .line_height(1.4)
+                        .color(ui::TEXT_SECONDARY)
+                        .width(Length::Fill),
+                ]
+                .spacing(9)
+                .align_y(Alignment::Start)
+                .into()
             })
             .collect();
-        scrollable(column(rows).spacing(8).width(Length::Fill))
+        scrollable(column(rows).spacing(9).width(Length::Fill))
             .height(Length::Fill)
             .into()
     };
 
     let activity_block = column![
-        text("Activity").size(18).font(ui::SEMIBOLD).color(ui::TEXT),
+        row![
+            text("Activity").size(19).font(ui::SEMIBOLD).color(ui::TEXT),
+            space().width(Length::Fill),
+            text(format!("{} entries", app.log.len()))
+                .size(10.5)
+                .color(ui::TEXT_MUTED),
+        ]
+        .align_y(Alignment::Center),
         activity,
     ]
     .spacing(10)
     .height(Length::Fill);
 
-    let right_panel = container(
-        column![
-            column![incoming_header, incoming_body].spacing(10),
-            rule::horizontal(1).style(ui::divider),
-            activity_block,
-        ]
-        .spacing(16)
-        .height(Length::Fill),
+    let incoming_card = container(
+        column![incoming_header, incoming_body]
+            .spacing(10)
+            .width(Length::Fill),
     )
-    .padding(22)
-    .width(Length::FillPortion(2))
-    .height(Length::Fill)
+    .padding(18)
+    .width(Length::Fill)
     .style(ui::panel);
 
+    let activity_card = container(activity_block)
+        .padding(18)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(ui::panel);
+
+    let right_panel = column![incoming_card, activity_card]
+        .spacing(16)
+        .width(Length::FillPortion(2))
+        .height(Length::Fill);
+
     let body = row![send_panel, right_panel]
-        .spacing(20)
+        .spacing(16)
         .width(Length::Fill)
         .height(Length::Fill);
 
     container(
-        column![header, body]
-            .spacing(20)
+        column![header, hero, body]
+            .spacing(16)
             .width(Length::Fill)
             .height(Length::Fill),
     )
-    .padding(Padding::from([24, 28]))
+    .padding(Padding::from([22, 26]))
     .width(Length::Fill)
     .height(Length::Fill)
     .style(ui::canvas)
+    .into()
+}
+
+fn brand_mark<'a>() -> Element<'a, Message> {
+    container(text("K").size(19).font(ui::BOLD).color(ui::ON_ACCENT))
+        .width(40)
+        .height(40)
+        .center(40)
+        .style(ui::brand)
+        .into()
+}
+
+fn chip<'a>(label: &'a str) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(10.5)
+            .font(ui::MEDIUM)
+            .color(ui::TEXT_SECONDARY),
+    )
+    .padding([4, 9])
+    .style(ui::chip)
+    .into()
+}
+
+fn step_label<'a>(step: &'a str, label: &'a str) -> Element<'a, Message> {
+    row![
+        container(text(step).size(10).font(ui::BOLD).color(ui::ON_ACCENT))
+            .width(20)
+            .height(20)
+            .center(20)
+            .style(ui::step_badge),
+        text(label)
+            .size(12.5)
+            .font(ui::SEMIBOLD)
+            .color(ui::TEXT_SECONDARY),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A quiet orbit graphic for the hero: rings read as "nearby devices" without
+/// adding another moving part to the interface.
+fn transfer_orb<'a>() -> Element<'a, Message> {
+    container(
+        container(
+            container(text("⇄").size(25).font(ui::BOLD).color(ui::ACCENT_TEXT))
+                .width(54)
+                .height(54)
+                .center(54)
+                .style(ui::orb_core),
+        )
+        .width(76)
+        .height(76)
+        .center(76)
+        .style(ui::orb_ring),
+    )
+    .width(96)
+    .height(96)
+    .center(96)
+    .style(ui::orb_outer)
     .into()
 }
 
@@ -800,35 +925,34 @@ fn receiver_summary(state: &ReceiverStatus) -> Element<'_, Message> {
     let detail_color = if matches!(state, ReceiverStatus::Off(_)) {
         ui::DANGER_TEXT
     } else {
-        ui::TEXT_SECONDARY
+        ui::TEXT_MUTED
     };
 
-    column![
-        container(
+    container(
+        column![
             row![
                 container(space()).width(7).height(7).style(ui::dot(dot)),
-                text(label).size(12).font(ui::MEDIUM).color(text_color),
+                text(label).size(11.5).font(ui::SEMIBOLD).color(text_color),
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-        )
-        .padding([5, 10])
-        .style(ui::pill(tint)),
-        text(detail).size(11).color(detail_color),
-    ]
-    .spacing(4)
-    .align_x(Alignment::End)
+            text(detail).size(10.5).color(detail_color),
+        ]
+        .spacing(2),
+    )
+    .padding([7, 12])
+    .style(ui::pill(tint))
     .into()
 }
 
 fn device_button(device: &DeviceInfo, selected: bool, enabled: bool) -> Element<'_, Message> {
     let mut meta = row![
         text(&device.address)
-            .size(11.5)
+            .size(11)
             .font(ui::MONO)
             .color(ui::TEXT_MUTED),
     ]
-    .spacing(7)
+    .spacing(6)
     .align_y(Alignment::Center);
     if device.connected {
         meta = meta.push(badge("Connected", ui::SUCCESS_TINT, ui::SUCCESS_TEXT));
@@ -837,19 +961,34 @@ fn device_button(device: &DeviceInfo, selected: bool, enabled: bool) -> Element<
         meta = meta.push(badge("Not paired", ui::WARNING_TINT, ui::WARNING_TEXT));
     }
 
-    let trailing = if selected {
-        text("Selected")
-            .size(11.5)
-            .font(ui::SEMIBOLD)
-            .color(ui::ACCENT_TEXT)
+    let avatar = container(text(device_initial(device)).size(14).font(ui::BOLD).color(
+        if selected {
+            ui::ON_ACCENT
+        } else {
+            ui::ACCENT_TEXT
+        },
+    ))
+    .width(34)
+    .height(34)
+    .center(34)
+    .style(ui::avatar(selected));
+
+    let trailing: Element<'_, Message> = if selected {
+        container(text("✓").size(11).font(ui::BOLD).color(ui::ON_ACCENT))
+            .width(21)
+            .height(21)
+            .center(21)
+            .style(ui::fill(ui::ACCENT, 999.0))
+            .into()
     } else {
-        text("Select").size(11.5).color(ui::TEXT_MUTED)
+        text("Select").size(11).color(ui::TEXT_MUTED).into()
     };
 
     let content = row![
+        avatar,
         column![
             text(device_name(device))
-                .size(14)
+                .size(13.5)
                 .font(ui::SEMIBOLD)
                 .color(if enabled {
                     ui::TEXT
@@ -858,38 +997,46 @@ fn device_button(device: &DeviceInfo, selected: bool, enabled: bool) -> Element<
                 }),
             meta,
         ]
-        .spacing(3)
+        .spacing(2)
         .width(Length::Fill),
         trailing,
     ]
-    .spacing(12)
+    .spacing(11)
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
     button(content)
         .width(Length::Fill)
-        .padding([9, 11])
+        .padding([8, 10])
         .style(ui::device_row(selected))
         .on_press_maybe(enabled.then(|| Message::PickDevice(device.address.clone())))
         .into()
 }
 
+fn device_initial(device: &DeviceInfo) -> String {
+    device_name(device)
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "B".to_string())
+}
+
 fn badge(label: &str, background: Color, text_color: Color) -> Element<'_, Message> {
-    container(text(label).size(11).font(ui::SEMIBOLD).color(text_color))
-        .padding([1, 7])
+    container(text(label).size(10).font(ui::SEMIBOLD).color(text_color))
+        .padding([1, 6])
         .style(ui::fill(background, 999.0))
         .into()
 }
 
 fn device_empty_state(loaded: bool, error: Option<&str>) -> Element<'_, Message> {
-    if !loaded {
+    let content: Element<'_, Message> = if !loaded {
         column![
             text("Looking for paired devices…")
-                .size(13.5)
+                .size(13)
                 .font(ui::MEDIUM)
                 .color(ui::TEXT),
             text("This usually takes a moment.")
-                .size(12)
+                .size(11.5)
                 .color(ui::TEXT_SECONDARY),
         ]
         .spacing(4)
@@ -897,12 +1044,12 @@ fn device_empty_state(loaded: bool, error: Option<&str>) -> Element<'_, Message>
     } else if let Some(error) = error {
         column![
             text("Couldn't load paired devices")
-                .size(13.5)
+                .size(13)
                 .font(ui::MEDIUM)
                 .color(ui::DANGER_TEXT),
             text(error).size(11.5).color(ui::TEXT_SECONDARY),
             text("Choose Refresh to try again.")
-                .size(11.5)
+                .size(11)
                 .color(ui::TEXT_MUTED),
         ]
         .spacing(3)
@@ -910,35 +1057,41 @@ fn device_empty_state(loaded: bool, error: Option<&str>) -> Element<'_, Message>
     } else {
         column![
             text("No paired devices")
-                .size(13.5)
+                .size(13)
                 .font(ui::MEDIUM)
                 .color(ui::TEXT),
             text("Pair one in your Bluetooth settings, then choose Refresh.")
-                .size(12)
+                .size(11.5)
                 .color(ui::TEXT_SECONDARY),
         ]
         .spacing(4)
         .into()
-    }
+    };
+
+    container(content)
+        .padding(14)
+        .width(Length::Fill)
+        .style(ui::inset)
+        .into()
 }
 
 fn receiver_notice(reason: &str) -> Element<'_, Message> {
     container(
         column![
             text("Incoming files are unavailable")
-                .size(12.5)
+                .size(12)
                 .font(ui::SEMIBOLD)
                 .color(ui::DANGER_TEXT),
-            text(reason).size(11.5).color(ui::TEXT_SECONDARY),
+            text(reason).size(11).color(ui::TEXT_SECONDARY),
             text("Kalo retries automatically. Restart it if this persists.")
-                .size(11.5)
-                .color(ui::TEXT_SECONDARY),
+                .size(11)
+                .color(ui::TEXT_MUTED),
         ]
         .spacing(3),
     )
-    .padding(11)
+    .padding(12)
     .width(Length::Fill)
-    .style(ui::fill(ui::DANGER_TINT, 10.0))
+    .style(ui::notice)
     .into()
 }
 
@@ -948,14 +1101,29 @@ fn incoming_empty(state: &ReceiverStatus) -> Element<'_, Message> {
         _ => "Files sent to this computer appear here.",
     };
 
-    column![
-        text("Nothing incoming")
-            .size(13.5)
-            .font(ui::MEDIUM)
-            .color(ui::TEXT),
-        text(detail).size(12).color(ui::TEXT_SECONDARY),
-    ]
-    .spacing(3)
+    container(
+        row![
+            container(text("↓").size(16).font(ui::BOLD).color(ui::TEXT_MUTED))
+                .width(34)
+                .height(34)
+                .center(34)
+                .style(ui::icon_tile_muted),
+            column![
+                text("Nothing incoming")
+                    .size(12.5)
+                    .font(ui::MEDIUM)
+                    .color(ui::TEXT),
+                text(detail).size(11).color(ui::TEXT_SECONDARY),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+        ]
+        .spacing(11)
+        .align_y(Alignment::Center),
+    )
+    .padding(12)
+    .width(Length::Fill)
+    .style(ui::inset)
     .into()
 }
 
@@ -983,7 +1151,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
 
     let mut title = row![
         text(name)
-            .size(14)
+            .size(13)
             .font(ui::MEDIUM)
             .color(ui::TEXT)
             .width(Length::Fill),
@@ -993,7 +1161,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
     if let Some(percent) = percent {
         title = title.push(
             text(percent)
-                .size(12)
+                .size(11.5)
                 .font(ui::SEMIBOLD)
                 .color(ui::ACCENT_TEXT),
         );
@@ -1002,7 +1170,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
     let mut content = column![
         title,
         text(format!("{from} · {amount}"))
-            .size(12)
+            .size(11)
             .color(ui::TEXT_SECONDARY)
             .width(Length::Fill),
     ]
@@ -1014,7 +1182,23 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
                 .style(ui::progress),
         );
     }
-    content.into()
+
+    container(
+        row![
+            container(text("↓").size(14).font(ui::BOLD).color(ui::ACCENT_TEXT))
+                .width(32)
+                .height(32)
+                .center(32)
+                .style(ui::icon_tile),
+            content.width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(ui::inset)
+    .into()
 }
 
 fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, Message> {
@@ -1026,7 +1210,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
             .unwrap_or_else(|| "Preparing transfer…".to_string());
         let mut top = row![
             text(format!("Sending to {}", active.target))
-                .size(14)
+                .size(13.5)
                 .font(ui::SEMIBOLD)
                 .color(ui::TEXT)
                 .width(Length::Fill),
@@ -1036,8 +1220,8 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         if let Some(fraction) = fraction {
             top = top.push(
                 text(format!("{:.0}%", fraction * 100.0))
-                    .size(13)
-                    .font(ui::SEMIBOLD)
+                    .size(12.5)
+                    .font(ui::BOLD)
                     .color(ui::ACCENT_TEXT),
             );
         }
@@ -1048,16 +1232,16 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
             } else {
                 "Cancel"
             })
-            .size(12.5)
+            .size(11.5)
             .font(ui::MEDIUM),
         )
-        .padding([7, 12])
+        .padding([6, 11])
         .style(ui::secondary_button)
         .on_press_maybe((!active.cancel_requested).then_some(Message::CancelSend));
 
         let bottom = row![
             text(detail)
-                .size(12)
+                .size(11.5)
                 .color(ui::TEXT_SECONDARY)
                 .width(Length::Fill),
             cancel,
@@ -1073,7 +1257,11 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
                     .style(ui::progress),
             );
         }
-        return block.push(bottom).into();
+        return container(block.push(bottom))
+            .padding(13)
+            .width(Length::Fill)
+            .style(ui::active_transfer)
+            .into();
     }
 
     let can_send = target.is_some() && app.file.is_some() && !app.picking_file;
@@ -1081,19 +1269,26 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         (false, false) => "Select a device and choose a file.",
         (false, true) => "Select a device to send this file.",
         (true, false) => "Choose a file to send.",
-        (true, true) => "",
+        (true, true) => "Ready when you are.",
     };
     let send_label = target
         .map(|device| format!("Send to {}", device_name(device)))
         .unwrap_or_else(|| "Send file".to_string());
 
     let mut block = column![
-        container(text(guidance).size(12).color(ui::TEXT_MUTED)).height(Length::Fixed(18.0)),
-        button(text(send_label).size(14.5).font(ui::SEMIBOLD))
-            .width(Length::Fill)
-            .padding([11, 16])
-            .style(ui::primary_button)
-            .on_press_maybe(can_send.then_some(Message::SendClicked)),
+        container(text(guidance).size(11.5).color(ui::TEXT_MUTED)).height(Length::Fixed(17.0)),
+        button(
+            row![
+                text(send_label).size(14).font(ui::SEMIBOLD),
+                space().width(Length::Fill),
+                text("→").size(16).font(ui::BOLD),
+            ]
+            .align_y(Alignment::Center)
+        )
+        .width(Length::Fill)
+        .padding([11, 15])
+        .style(ui::primary_button)
+        .on_press_maybe(can_send.then_some(Message::SendClicked)),
     ]
     .spacing(8);
     if let Some(result) = &app.send_result {
@@ -1106,7 +1301,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
             row![
                 container(space()).width(7).height(7).style(ui::dot(color)),
                 text(&result.message)
-                    .size(12)
+                    .size(11.5)
                     .color(color)
                     .width(Length::Fill),
             ]
@@ -1141,39 +1336,48 @@ fn resolve_target<'a>(devices: &'a [DeviceInfo], selected: Option<&str>) -> Opti
         .find(|d| d.address.eq_ignore_ascii_case(address))
 }
 
-/// Visual system for the Operate surface. Colors are fixed to a light theme
-/// so contrast and state meaning stay predictable on every desktop.
+/// Visual system for Kalo's midnight surface. A single dark palette keeps
+/// contrast and state meaning predictable while giving the product a distinct
+/// identity.
 mod ui {
+    use std::f32::consts::FRAC_PI_4;
+
     use iced::font::Weight;
+    use iced::gradient;
     use iced::widget::{button, container, progress_bar, rule};
     use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
-    pub const CANVAS: Color = Color::from_rgb8(0xF3, 0xF5, 0xF7);
-    pub const SURFACE: Color = Color::WHITE;
-    pub const BORDER: Color = Color::from_rgb8(0xE1, 0xE7, 0xED);
-    pub const BORDER_STRONG: Color = Color::from_rgb8(0xC9, 0xD3, 0xDD);
-    pub const TEXT: Color = Color::from_rgb8(0x18, 0x22, 0x2D);
-    pub const TEXT_SECONDARY: Color = Color::from_rgb8(0x55, 0x61, 0x6E);
-    pub const TEXT_MUTED: Color = Color::from_rgb8(0x66, 0x72, 0x7F);
-    pub const ACCENT: Color = Color::from_rgb8(0x1D, 0x4E, 0xD8);
-    pub const ACCENT_HOVER: Color = Color::from_rgb8(0x1E, 0x40, 0xAF);
-    pub const ACCENT_PRESSED: Color = Color::from_rgb8(0x1E, 0x3A, 0x8A);
-    pub const ACCENT_TEXT: Color = Color::from_rgb8(0x1E, 0x40, 0xAF);
-    pub const ACCENT_TINT: Color = Color::from_rgb8(0xEE, 0xF4, 0xFF);
-    pub const ROW_HOVER: Color = Color::from_rgb8(0xF7, 0xF9, 0xFB);
-    pub const ROW_PRESSED: Color = Color::from_rgb8(0xEF, 0xF3, 0xF7);
-    pub const TRACK: Color = Color::from_rgb8(0xE6, 0xEC, 0xF2);
-    pub const DISABLED_BG: Color = Color::from_rgb8(0xEC, 0xF0, 0xF4);
-    pub const DISABLED_TEXT: Color = Color::from_rgb8(0x5B, 0x6B, 0x7C);
-    pub const SUCCESS: Color = Color::from_rgb8(0x16, 0xA3, 0x4A);
-    pub const SUCCESS_TINT: Color = Color::from_rgb8(0xEC, 0xFD, 0xF3);
-    pub const SUCCESS_TEXT: Color = Color::from_rgb8(0x16, 0x65, 0x34);
-    pub const WARNING: Color = Color::from_rgb8(0xD9, 0x77, 0x06);
-    pub const WARNING_TINT: Color = Color::from_rgb8(0xFF, 0xF7, 0xED);
-    pub const WARNING_TEXT: Color = Color::from_rgb8(0x92, 0x40, 0x0E);
-    pub const DANGER: Color = Color::from_rgb8(0xDC, 0x26, 0x26);
-    pub const DANGER_TINT: Color = Color::from_rgb8(0xFE, 0xF2, 0xF2);
-    pub const DANGER_TEXT: Color = Color::from_rgb8(0x99, 0x1B, 0x1B);
+    pub const CANVAS: Color = Color::from_rgb8(0x07, 0x0A, 0x0F);
+    pub const SURFACE: Color = Color::from_rgb8(0x0D, 0x12, 0x19);
+    pub const SURFACE_ALT: Color = Color::from_rgb8(0x11, 0x18, 0x23);
+    pub const BORDER: Color = Color::from_rgb8(0x1D, 0x27, 0x35);
+    pub const BORDER_STRONG: Color = Color::from_rgb8(0x2B, 0x3B, 0x4F);
+    pub const TEXT: Color = Color::from_rgb8(0xF3, 0xF7, 0xFB);
+    pub const TEXT_SECONDARY: Color = Color::from_rgb8(0xA6, 0xB3, 0xC4);
+    pub const TEXT_MUTED: Color = Color::from_rgb8(0x76, 0x85, 0x9A);
+    pub const ACCENT: Color = Color::from_rgb8(0x5E, 0xEA, 0xD4);
+    pub const ACCENT_BLUE: Color = Color::from_rgb8(0x60, 0xA5, 0xFA);
+    pub const ACCENT_HOVER: Color = Color::from_rgb8(0x7F, 0xF3, 0xE1);
+    pub const ACCENT_PRESSED: Color = Color::from_rgb8(0x2D, 0xD4, 0xBF);
+    pub const ACCENT_TEXT: Color = Color::from_rgb8(0x7D, 0xF0, 0xDC);
+    pub const ACCENT_TINT: Color = Color::from_rgb8(0x0D, 0x26, 0x24);
+    pub const ACCENT_DIM: Color = Color::from_rgb8(0x1C, 0x4A, 0x46);
+    pub const ON_ACCENT: Color = Color::from_rgb8(0x04, 0x12, 0x0F);
+    pub const ROW_HOVER: Color = Color::from_rgb8(0x14, 0x1D, 0x29);
+    pub const ROW_PRESSED: Color = Color::from_rgb8(0x19, 0x24, 0x32);
+    pub const TRACK: Color = Color::from_rgb8(0x1A, 0x25, 0x33);
+    pub const CHIP: Color = Color::from_rgb8(0x14, 0x1C, 0x26);
+    pub const DISABLED_BG: Color = Color::from_rgb8(0x16, 0x1E, 0x29);
+    pub const DISABLED_TEXT: Color = Color::from_rgb8(0x64, 0x73, 0x87);
+    pub const SUCCESS: Color = Color::from_rgb8(0x34, 0xD3, 0x99);
+    pub const SUCCESS_TINT: Color = Color::from_rgb8(0x0D, 0x28, 0x1F);
+    pub const SUCCESS_TEXT: Color = Color::from_rgb8(0x6E, 0xE7, 0xB7);
+    pub const WARNING: Color = Color::from_rgb8(0xFB, 0xBF, 0x24);
+    pub const WARNING_TINT: Color = Color::from_rgb8(0x2A, 0x23, 0x14);
+    pub const WARNING_TEXT: Color = Color::from_rgb8(0xFD, 0xE6, 0x8A);
+    pub const DANGER: Color = Color::from_rgb8(0xFB, 0x71, 0x85);
+    pub const DANGER_TINT: Color = Color::from_rgb8(0x2C, 0x15, 0x1B);
+    pub const DANGER_TEXT: Color = Color::from_rgb8(0xFD, 0xA4, 0xAF);
 
     pub const SEMIBOLD: Font = Font {
         family: iced::font::Family::SansSerif,
@@ -1200,9 +1404,54 @@ mod ui {
         style: iced::font::Style::Normal,
     };
 
+    /// The custom iced theme used for built-in widget details such as
+    /// scrollbars, so they belong to the same surface as the app.
+    pub fn theme() -> Theme {
+        Theme::custom(
+            "Kalo Midnight",
+            iced::theme::Palette {
+                background: CANVAS,
+                text: TEXT,
+                primary: ACCENT,
+                success: SUCCESS,
+                warning: WARNING,
+                danger: DANGER,
+            },
+        )
+    }
+
+    fn gradient_background(from: Color, to: Color) -> Background {
+        Background::Gradient(
+            gradient::Linear::new(FRAC_PI_4)
+                .add_stop(0.0, from)
+                .add_stop(1.0, to)
+                .into(),
+        )
+    }
+
     pub fn canvas(_: &Theme) -> container::Style {
         container::Style {
             background: Some(Background::Color(CANVAS)),
+            ..container::Style::default()
+        }
+    }
+
+    pub fn hero(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(gradient_background(
+                Color::from_rgb8(0x0E, 0x20, 0x26),
+                Color::from_rgb8(0x0C, 0x12, 0x1B),
+            )),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 20.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba8(0x00, 0x00, 0x00, 0.35),
+                offset: Vector::new(0.0, 8.0),
+                blur_radius: 24.0,
+            },
             ..container::Style::default()
         }
     }
@@ -1213,18 +1462,160 @@ mod ui {
             border: Border {
                 color: BORDER,
                 width: 1.0,
-                radius: 14.0.into(),
+                radius: 18.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0x0F, 0x17, 0x2A, 0.04),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 4.0,
+                color: Color::from_rgba8(0x00, 0x00, 0x00, 0.28),
+                offset: Vector::new(0.0, 6.0),
+                blur_radius: 18.0,
             },
             ..container::Style::default()
         }
     }
 
-    /// A flat tinted surface: used for badges, status pills and notices.
+    pub fn inset(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(SURFACE_ALT)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn active_transfer(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(ACCENT_TINT)),
+            border: Border {
+                color: ACCENT_DIM,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn notice(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(DANGER_TINT)),
+            border: Border {
+                color: Color::from_rgb8(0x4A, 0x26, 0x30),
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn brand(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(gradient_background(ACCENT, ACCENT_BLUE)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 12.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.22),
+                offset: Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn step_badge(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(ACCENT)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 7.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn avatar(selected: bool) -> impl Fn(&Theme) -> container::Style {
+        move |_| container::Style {
+            background: Some(Background::Color(if selected {
+                ACCENT
+            } else {
+                ACCENT_TINT
+            })),
+            border: Border {
+                color: if selected { ACCENT } else { ACCENT_DIM },
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn icon_tile(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(ACCENT_TINT)),
+            border: Border {
+                color: ACCENT_DIM,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn icon_tile_muted(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(CHIP)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    fn accent_ring(alpha: f32) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.03))),
+            border: Border {
+                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, alpha),
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn orb_outer(_: &Theme) -> container::Style {
+        accent_ring(0.12)
+    }
+
+    pub fn orb_ring(_: &Theme) -> container::Style {
+        accent_ring(0.24)
+    }
+
+    pub fn orb_core(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(ACCENT_TINT)),
+            border: Border {
+                color: ACCENT_DIM,
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.18),
+                offset: Vector::new(0.0, 0.0),
+                blur_radius: 22.0,
+            },
+            ..container::Style::default()
+        }
+    }
+
+    /// A flat tinted surface: used for badges, status pills and chips.
     pub fn fill(background: Color, radius: f32) -> impl Fn(&Theme) -> container::Style {
         move |_| container::Style {
             background: Some(Background::Color(background)),
@@ -1245,6 +1636,18 @@ mod ui {
         fill(background, 999.0)
     }
 
+    pub fn chip(_: &Theme) -> container::Style {
+        container::Style {
+            background: Some(Background::Color(CHIP)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
     pub fn divider(_: &Theme) -> rule::Style {
         rule::Style {
             color: BORDER,
@@ -1257,7 +1660,7 @@ mod ui {
     pub fn progress(_: &Theme) -> progress_bar::Style {
         progress_bar::Style {
             background: Background::Color(TRACK),
-            bar: Background::Color(ACCENT),
+            bar: gradient_background(ACCENT, ACCENT_BLUE),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -1268,19 +1671,30 @@ mod ui {
 
     pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
         let (background, text_color) = match status {
-            button::Status::Active => (ACCENT, Color::WHITE),
-            button::Status::Hovered => (ACCENT_HOVER, Color::WHITE),
-            button::Status::Pressed => (ACCENT_PRESSED, Color::WHITE),
-            button::Status::Disabled => (DISABLED_BG, DISABLED_TEXT),
+            button::Status::Active => (gradient_background(ACCENT, ACCENT_BLUE), ON_ACCENT),
+            button::Status::Hovered => (
+                gradient_background(ACCENT_HOVER, Color::from_rgb8(0x8B, 0xC5, 0xFF)),
+                ON_ACCENT,
+            ),
+            button::Status::Pressed => (
+                gradient_background(ACCENT_PRESSED, Color::from_rgb8(0x38, 0x7B, 0xD9)),
+                ON_ACCENT,
+            ),
+            button::Status::Disabled => (Background::Color(DISABLED_BG), DISABLED_TEXT),
         };
 
         button::Style {
-            background: Some(Background::Color(background)),
+            background: Some(background),
             text_color,
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
-                radius: 10.0.into(),
+                radius: 11.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba8(0x00, 0x00, 0x00, 0.25),
+                offset: Vector::new(0.0, 2.0),
+                blur_radius: 8.0,
             },
             ..button::Style::default()
         }
@@ -1288,10 +1702,10 @@ mod ui {
 
     pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
         let (background, text_color, border_color) = match status {
-            button::Status::Active => (SURFACE, TEXT_SECONDARY, BORDER_STRONG),
+            button::Status::Active => (SURFACE_ALT, TEXT_SECONDARY, BORDER_STRONG),
             button::Status::Hovered => (ROW_HOVER, TEXT, BORDER_STRONG),
             button::Status::Pressed => (ROW_PRESSED, TEXT, BORDER_STRONG),
-            button::Status::Disabled => (SURFACE, DISABLED_TEXT, BORDER),
+            button::Status::Disabled => (DISABLED_BG, DISABLED_TEXT, BORDER),
         };
 
         button::Style {
@@ -1300,7 +1714,7 @@ mod ui {
             border: Border {
                 color: border_color,
                 width: 1.0,
-                radius: 8.0.into(),
+                radius: 9.0.into(),
             },
             ..button::Style::default()
         }
@@ -1317,7 +1731,7 @@ mod ui {
             } else if hovered {
                 ROW_HOVER
             } else {
-                SURFACE
+                SURFACE_ALT
             };
             let border_color = if selected {
                 ACCENT
@@ -1333,7 +1747,7 @@ mod ui {
                 border: Border {
                     color: border_color,
                     width: 1.0,
-                    radius: 10.0.into(),
+                    radius: 12.0.into(),
                 },
                 ..button::Style::default()
             }

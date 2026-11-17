@@ -1,0 +1,62 @@
+# Maintainer: Kalo Maintainers <kalo@localhost>
+#
+# Builds the latest `main` branch. A stable `kalo` package can be published
+# once tagged releases are available.
+pkgname=kalo-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Bluetooth file transfer over OBEX/OPP"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Ogalesha/Kalo"
+license=('MIT')
+depends=(
+  'bluez'
+  'bluez-obexd'
+  'gcc-libs'
+  'glibc'
+  'libx11'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'wayland'
+)
+makedepends=('cargo' 'git' 'rust')
+optdepends=(
+  'vulkan-icd-loader: preferred GPU renderer'
+  'xdg-desktop-portal: native file picker'
+  'xdg-desktop-portal-gtk: portal backend for GTK desktops'
+  'xdg-desktop-portal-kde: portal backend for KDE Plasma'
+)
+provides=('kalo')
+conflicts=('kalo')
+source=("git+$url.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  local version
+  version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+  printf '%s.r%s.g%s' \
+    "$version" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  cargo build --release --locked --frozen
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+
+  install -Dm755 target/release/kalo "$pkgdir/usr/bin/kalo"
+  install -Dm644 packaging/common/kalo.desktop \
+    "$pkgdir/usr/share/applications/kalo.desktop"
+  install -Dm644 packaging/common/kalo.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/kalo.svg"
+  install -Dm644 packaging/common/kalo.1 \
+    "$pkgdir/usr/share/man/man1/kalo.1"
+  gzip -9n "$pkgdir/usr/share/man/man1/kalo.1"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

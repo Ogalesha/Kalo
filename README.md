@@ -21,14 +21,15 @@ operations through a small CLI.
   stalled transfers.
 - Safe handling of untrusted remote filenames.
 - CLI commands for adapters, discovery, pairing, diagnostics and transfers.
-- Self-contained Ubuntu `.deb` build; no background daemon to enable.
+- Self-contained Ubuntu `.deb` and Arch Linux `kalo-git` package builds; no
+  background daemon to enable.
 
 ## Platform support
 
 | Platform | Status |
 | --- | --- |
 | Ubuntu | Supported: build the native `.deb` with `packaging/ubuntu/build-deb.sh` |
-| Arch Linux | Planned: the Linux backend (BlueZ, obexd, D-Bus) can be reused; packaging and AUR metadata are still missing |
+| Arch Linux | Supported: build `kalo-git` with `packaging/arch/PKGBUILD` (AUR publication pending) |
 | Windows | Planned: requires a separate Bluetooth/OBEX backend because the current code depends on BlueZ, obexd and D-Bus |
 
 See [TODO.md](TODO.md) for the platform roadmap and other outstanding work.
@@ -41,14 +42,22 @@ Runtime, on Ubuntu:
 sudo apt install bluez bluez-obexd
 ```
 
+On Arch Linux:
+
+```sh
+sudo pacman -S bluez bluez-obexd
+```
+
 Kalo talks to the system bus (`org.bluez`) and the session bus
 (`org.bluez.obex`). The file picker uses the XDG desktop portal, which is
-installed by default on Ubuntu desktop.
+installed by default on Ubuntu desktop; on Arch, install
+`xdg-desktop-portal-gtk` (or another portal backend).
 
 To build from source you also need a recent Rust toolchain (edition 2024;
 Rust 1.98 or newer is known to work) and the usual Linux GUI build
-dependencies. The release package recommends `libvulkan1`; iced can fall back
-to software rendering, but a working GPU driver gives the best experience.
+dependencies. On Arch, `base-devel`, `rust` and `cargo` are enough. The release
+packages recommend Vulkan; iced can fall back to software rendering, but a
+working GPU driver gives the best experience.
 
 ## Install on Ubuntu
 
@@ -69,6 +78,22 @@ Remove Kalo with:
 ```sh
 sudo apt remove kalo
 ```
+
+## Install on Arch Linux
+
+The Arch package builds the current `main` branch as `kalo-git`:
+
+```sh
+sudo pacman -S --needed base-devel git rust cargo
+cd packaging/arch
+makepkg -si
+kalo
+```
+
+The package declares BlueZ, obexd and the required GUI libraries, and installs
+the same desktop entry, icon and manual page as the Ubuntu build. See
+[packaging/arch/README.md](packaging/arch/README.md) for details. The package is
+not published to the AUR yet.
 
 ## Build and run
 

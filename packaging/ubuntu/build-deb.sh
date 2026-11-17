@@ -42,13 +42,13 @@ chmod 0755 "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
 
 install -Dm755 target/release/kalo "$STAGE/usr/bin/kalo"
-install -Dm644 packaging/ubuntu/kalo.desktop \
+install -Dm644 packaging/common/kalo.desktop \
   "$STAGE/usr/share/applications/kalo.desktop"
-install -Dm644 packaging/ubuntu/kalo.svg \
+install -Dm644 packaging/common/kalo.svg \
   "$STAGE/usr/share/icons/hicolor/scalable/apps/kalo.svg"
 install -Dm644 packaging/ubuntu/copyright \
   "$STAGE/usr/share/doc/$PKG/copyright"
-install -Dm644 packaging/ubuntu/kalo.1 "$STAGE/usr/share/man/man1/kalo.1"
+install -Dm644 packaging/common/kalo.1 "$STAGE/usr/share/man/man1/kalo.1"
 gzip -9n "$STAGE/usr/share/man/man1/kalo.1"
 chmod 0644 "$STAGE/usr/share/man/man1/kalo.1.gz"
 
