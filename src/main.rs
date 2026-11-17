@@ -92,22 +92,29 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
         Cmd::Pair { mac } => bluez::pair(&mac).await,
         Cmd::AgentCheck => agent::agent_check().await,
         Cmd::Send { mac, file } => {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<events::Event>();
+            let events = events::EventSink::new(256);
+            let mut rx = events.subscribe();
             let printer = tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    if let events::Event::SendProgress {
-                        transferred,
-                        size,
-                        status,
-                        ..
-                    } = event
-                    {
-                        println!("{}", events::send_progress_line(transferred, size, &status));
+                loop {
+                    match rx.recv().await {
+                        Ok(events::Event::SendProgress {
+                            transferred,
+                            size,
+                            status,
+                            ..
+                        }) => {
+                            println!("{}", events::send_progress_line(transferred, size, &status));
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                            eprintln!("warning: event stream lagged; dropped {dropped} events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
-            let summary = obex::send(&mac, &file, &tx, 0, None).await;
-            drop(tx);
+            let summary = obex::send(&mac, &file, &events, 0, None).await;
+            drop(events);
             let _ = printer.await;
             match summary {
                 Ok(summary) => {

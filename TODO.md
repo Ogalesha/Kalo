@@ -23,8 +23,11 @@
 
 ## Engineering
 
-- [ ] Run the requested implicit state-machine audit, review the prioritized
-      findings, and apply only approved minimal fixes with regression tests.
+- [x] Run the implicit state-machine audit and apply the approved fixes with
+      regression tests: partial-file preservation, cancel-aware send preflight,
+      a single receiver status source, stale `Release` isolation, shared
+      receiver supervision, discovery cleanup, per-status stall policies,
+      interval-based watchdogs, pairing timeouts and periodic staging recovery.
 - [ ] Add CI for `fmt`, `clippy`, tests and package builds.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
       adapters where the environment allows it.

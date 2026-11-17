@@ -4,18 +4,20 @@
 //! `ObjectPush1.SendFile` → watch `Transfer1` status/progress.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio::time::MissedTickBehavior;
 use zbus::Connection;
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::events::{Event, TransferStatus};
+use crate::events::{Event, EventSink, TransferStatus};
 
 /// How often the transfer status is re-read as a safety net: D-Bus
 /// property-change signals are not replayed to late subscribers, so the
@@ -32,6 +34,12 @@ const SUSPENDED_TIMEOUT: Duration = Duration::from_secs(600);
 const UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const STATUS_ERROR_LIMIT: u32 = 3;
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+/// `CreateSession`/`SendFile` must not leave the UI stuck forever when the
+/// device is out of range or obexd is unresponsive.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+/// After a cancel request, give an in-flight preflight call a moment to
+/// return so the session/transfer object it created can be cleaned up.
+const CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[proxy(
     default_service = "org.bluez.obex",
@@ -96,7 +104,7 @@ impl SendSummary {
 pub async fn send(
     mac: &str,
     file: &Path,
-    events: &UnboundedSender<Event>,
+    events: &EventSink,
     send_id: u64,
     cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<SendSummary> {
@@ -104,19 +112,40 @@ pub async fn send(
     let conn = Connection::session().await?;
     let client = ClientProxy::new(&conn).await?;
 
-    let _ = events.send(Event::Log(format!("opening OPP session to {mac}…")));
+    events.send(Event::Log(format!("opening OPP session to {mac}…")));
     let mut args: HashMap<&str, Value<'_>> = HashMap::new();
     args.insert("Target", Value::new("opp"));
-    let session = client
-        .create_session(mac, args)
-        .await
-        .context("CreateSession failed (is the device paired, in range and reachable?)")?;
+
+    let mut cancel = cancel;
+    let create = client.create_session(mac, args);
+    tokio::pin!(create);
+    let session = match preflight_outcome(PREFLIGHT_TIMEOUT, &mut cancel, create.as_mut()).await {
+        Preflight::Ready(result) => result
+            .context("CreateSession failed (is the device paired, in range and reachable?)")?,
+        Preflight::Canceled => {
+            // The bus call cannot be interrupted; wait briefly for its reply
+            // so a session it creates is removed instead of leaking.
+            if let Ok(Ok(session)) =
+                tokio::time::timeout(CANCEL_CLEANUP_TIMEOUT, create.as_mut()).await
+            {
+                let _ = client.remove_session(session).await;
+            }
+            events.send(Event::Log(
+                "send canceled while opening the OPP session".into(),
+            ));
+            bail!("send canceled");
+        }
+        Preflight::TimedOut => bail!(
+            "CreateSession did not answer within {}s; is the device paired and in range?",
+            PREFLIGHT_TIMEOUT.as_secs()
+        ),
+    };
 
     // From here on the session must always be torn down, including on
     // early failures (send_file, proxy setup, stream errors).
     let outcome = push_to_session(&conn, &session, &file, events, send_id, cancel).await;
     if let Err(e) = client.remove_session(session).await {
-        let _ = events.send(Event::Log(format!("remove OPP session failed: {e}")));
+        events.send(Event::Log(format!("remove OPP session failed: {e}")));
     }
 
     let (bytes, elapsed_secs) = outcome?;
@@ -134,7 +163,7 @@ async fn push_to_session(
     conn: &Connection,
     session: &OwnedObjectPath,
     file: &Path,
-    events: &UnboundedSender<Event>,
+    events: &EventSink,
     send_id: u64,
     cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<(u64, f64)> {
@@ -144,7 +173,33 @@ async fn push_to_session(
         .build()
         .await?;
 
-    let (transfer, props) = push.send_file(file.to_string_lossy().as_ref()).await?;
+    let mut cancel = cancel;
+    let source = file.to_string_lossy();
+    let send_file = push.send_file(source.as_ref());
+    tokio::pin!(send_file);
+    let (transfer, props) =
+        match preflight_outcome(PREFLIGHT_TIMEOUT, &mut cancel, send_file.as_mut()).await {
+            Preflight::Ready(result) => result.context("SendFile failed")?,
+            Preflight::Canceled => {
+                // Cancel a transfer object that appears while we are backing
+                // out, so the peer does not keep receiving a canceled file.
+                if let Ok(Ok((transfer, _))) =
+                    tokio::time::timeout(CANCEL_CLEANUP_TIMEOUT, send_file.as_mut()).await
+                    && let Ok(builder) = TransferProxy::builder(conn).path(transfer.as_str())
+                    && let Ok(proxy) = builder.build().await
+                {
+                    let _ = tokio::time::timeout(CANCEL_TIMEOUT, proxy.cancel()).await;
+                }
+                events.send(Event::Log(
+                    "send canceled before the transfer started".into(),
+                ));
+                bail!("send canceled");
+            }
+            Preflight::TimedOut => bail!(
+                "SendFile did not answer within {}s; is the device paired and in range?",
+                PREFLIGHT_TIMEOUT.as_secs()
+            ),
+        };
     // `Size` is optional in the BlueZ API (absent when unknown). Fall back to
     // the local file size so the UI can still render a meaningful fraction.
     let size = props
@@ -169,11 +224,15 @@ async fn push_to_session(
 
     let mut status_stream = transfer_proxy.receive_status_changed().await;
     let mut transferred_stream = transfer_proxy.receive_transferred_changed().await;
-    let mut cancel = cancel;
     let mut status_since = Instant::now();
     let mut last_progress_at = Instant::now();
     let mut last_transferred = 0u64;
     let mut status_errors = 0u32;
+    // A re-created `sleep` restarts on every signal and can be starved by a
+    // busy status stream; a fixed interval is the reliable watchdog.
+    let mut tick = tokio::time::interval(STATUS_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await; // consume the immediate first tick
 
     while !status.is_terminal() {
         tokio::select! {
@@ -191,7 +250,7 @@ async fn push_to_session(
                             last_transferred = transferred;
                             last_progress_at = Instant::now();
                         }
-                        let _ = events.send(Event::SendProgress {
+                        events.send(Event::SendProgress {
                             send_id,
                             transferred,
                             size,
@@ -199,7 +258,7 @@ async fn push_to_session(
                         });
                     }
                     Err(e) => {
-                        let _ = events.send(Event::Log(format!("transfer status signal failed: {e}")));
+                        events.send(Event::Log(format!("transfer status signal failed: {e}")));
                     }
                 }
             }
@@ -212,7 +271,7 @@ async fn push_to_session(
                     last_transferred = transferred;
                     last_progress_at = Instant::now();
                 }
-                let _ = events.send(Event::SendProgress {
+                events.send(Event::SendProgress {
                     send_id,
                     transferred,
                     size,
@@ -221,7 +280,7 @@ async fn push_to_session(
             }
             // Safety net for missed property-change signals and a place to
             // enforce the stall watchdog.
-            _ = tokio::time::sleep(STATUS_TICK) => {
+            _ = tick.tick() => {
                 match transfer_proxy.status().await {
                     Ok(raw) => {
                         status_errors = 0;
@@ -239,7 +298,7 @@ async fn push_to_session(
                             last_progress_at = Instant::now();
                         }
                         if status.is_terminal() {
-                            let _ = events.send(Event::SendProgress {
+                            events.send(Event::SendProgress {
                                 send_id,
                                 transferred,
                                 size,
@@ -252,7 +311,7 @@ async fn push_to_session(
                         if status_errors >= STATUS_ERROR_LIMIT {
                             bail!("transfer status unavailable after {status_errors} attempts: {e}");
                         }
-                        let _ = events.send(Event::Log(format!(
+                        events.send(Event::Log(format!(
                             "transfer status read failed ({status_errors}/{STATUS_ERROR_LIMIT}): {e}"
                         )));
                     }
@@ -263,13 +322,13 @@ async fn push_to_session(
                     status_since.elapsed(),
                     last_progress_at.elapsed(),
                 ) {
-                    let _ = events.send(Event::Log(reason.clone()));
+                    events.send(Event::Log(reason.clone()));
                     bail!(reason);
                 }
             }
             _ = wait_cancel(&mut cancel) => {
                 let _ = tokio::time::timeout(CANCEL_TIMEOUT, transfer_proxy.cancel()).await;
-                let _ = events.send(Event::Log("send canceled".into()));
+                events.send(Event::Log("send canceled".into()));
                 bail!("send canceled");
             }
         }
@@ -287,6 +346,29 @@ async fn push_to_session(
         bail!("transfer failed (status=error)");
     }
     Ok((bytes, elapsed_secs))
+}
+
+/// Outcome of a preflight D-Bus call that must observe cancellation and a
+/// deadline (SM-02).
+enum Preflight<T> {
+    Ready(zbus::Result<T>),
+    Canceled,
+    TimedOut,
+}
+
+async fn preflight_outcome<T, F>(
+    deadline: Duration,
+    cancel: &mut Option<oneshot::Receiver<()>>,
+    call: Pin<&mut F>,
+) -> Preflight<T>
+where
+    F: Future<Output = zbus::Result<T>>,
+{
+    tokio::select! {
+        result = call => Preflight::Ready(result),
+        _ = wait_cancel(cancel) => Preflight::Canceled,
+        _ = tokio::time::sleep(deadline) => Preflight::TimedOut,
+    }
 }
 
 /// Resolve a cancel request. With no receiver this future never completes, so
@@ -406,5 +488,31 @@ mod tests {
             send_progress_line(1, Some(2), &TransferStatus::Active),
             "send active: 1/2 bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_pending_preflight_call() {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let mut cancel = Some(cancel_rx);
+        let call = std::future::pending::<zbus::Result<()>>();
+        tokio::pin!(call);
+        cancel_tx.send(()).unwrap();
+
+        match preflight_outcome(Duration::from_secs(60), &mut cancel, call.as_mut()).await {
+            Preflight::Canceled => {}
+            _ => panic!("cancel must win over a pending preflight call"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_calls_have_a_bounded_deadline() {
+        let mut cancel = None;
+        let call = std::future::pending::<zbus::Result<()>>();
+        tokio::pin!(call);
+
+        match preflight_outcome(Duration::from_millis(10), &mut cancel, call.as_mut()).await {
+            Preflight::TimedOut => {}
+            _ => panic!("preflight must time out instead of hanging forever"),
+        }
     }
 }

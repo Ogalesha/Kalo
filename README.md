@@ -12,9 +12,13 @@ operations through a small CLI.
 
 - Desktop UI with paired-device selection, send progress, live incoming
   transfers, receiver status and an activity log.
-- Outgoing OPP/OBEX transfers with explicit cancel and a stall watchdog.
+- Outgoing OPP/OBEX transfers with explicit cancel (including during connection
+  setup) and a stall watchdog.
+- Supervised incoming receiver: automatic agent re-registration after obexd or
+  session-bus restarts, plus periodic recovery of abandoned staging files.
 - Incoming OBEX agent that stages, validates and moves files into the XDG
-  Downloads directory.
+  Downloads directory. Partial files are preserved on errors, cancellation and
+  stalled transfers.
 - Safe handling of untrusted remote filenames.
 - CLI commands for adapters, discovery, pairing, diagnostics and transfers.
 - Self-contained Ubuntu `.deb` build; no background daemon to enable.
@@ -113,13 +117,17 @@ kalo send AA:BB:CC:DD:EE:FF ~/Documents/report.pdf
 ## How it works
 
 - **Outgoing:** Kalo creates an OBEX session through obexd, pushes the file over
-  OPP, streams progress to the UI/CLI, supports cancellation and fails safely
-  when a transfer stalls.
+  OPP, streams progress to the UI/CLI, supports cancellation at every stage and
+  fails safely when a transfer stalls.
 - **Incoming:** Kalo registers an OBEX agent. Authorized pushes are written to
   a staging directory, checked, then moved atomically into Downloads. Partial
-  transfers are preserved for manual recovery.
-- **Events:** background work publishes typed events to a single bus consumed by
-  the UI or the CLI, keeping progress rendering consistent between both.
+  transfers are preserved for manual recovery, and stalled or orphaned files
+  are recovered periodically.
+- **Supervision:** one shared receiver supervisor handles registration retries,
+  obexd restarts and session-bus reconnects for both the UI and the CLI.
+- **Events:** background work publishes typed events to a broadcast bus shared
+  by the UI or the CLI, keeping progress rendering consistent between both and
+  allowing the UI subscription to be re-created safely.
 
 ## Limitations
 

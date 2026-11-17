@@ -4,12 +4,12 @@
 //! SPIKE NOTE: authorization is accept-all; the trust store arrives in Phase 1.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
-use tokio::sync::mpsc::UnboundedSender;
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::StreamExt;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 use zbus::Connection;
 use zbus::fdo;
@@ -17,10 +17,13 @@ use zbus::interface;
 use zbus::proxy;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-use crate::events::{Event, ReceiverStatus, TransferStatus};
+use crate::events::{Event, EventSink, ReceiverStatus, TransferStatus};
 use crate::paths;
 use crate::sanitize;
 
+/// Root path for agent objects. Every registration exports a unique child
+/// path so a late `Release` from an old registration can never affect the
+/// current one.
 pub const AGENT_PATH: &str = "/org/kalo/obex/agent";
 
 /// How long transient D-Bus failures are tolerated before a pending transfer
@@ -30,6 +33,18 @@ const TRANSIENT_ERROR_GRACE: Duration = Duration::from_secs(10);
 /// Incoming transfers that make no progress for this long are finalized as
 /// interrupted (keeping a partial file) instead of waiting forever.
 const INCOMING_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// A queued incoming transfer that never starts is likely stranded.
+const INCOMING_QUEUED_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// A suspended transfer is a deliberate pause, so it gets more room.
+const INCOMING_SUSPENDED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Status values Kalo does not know cannot be watched forever.
+const INCOMING_UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Receiver supervision cadence.
+const REGISTRATION_RETRY: Duration = Duration::from_secs(15);
+const SESSION_BUS_RETRY: Duration = Duration::from_secs(5);
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const STAGING_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// One in-flight incoming transfer.
 #[derive(Debug, Clone)]
@@ -53,41 +68,115 @@ pub struct PendingTransfer {
     /// Last time the byte counter changed (or the entry was created).
     pub last_progress_at: Instant,
     pub last_transferred: u64,
+    /// Last observed `Transfer1.Status` (raw) and when it changed. The
+    /// per-status stall policy uses these clocks.
+    pub last_status: Option<String>,
+    pub status_since: Instant,
 }
 
 /// Shared registry of in-flight incoming transfers.
 pub type PendingTransfers = Arc<Mutex<Vec<PendingTransfer>>>;
 
-/// Whether the OBEX agent is currently registered with obexd. Shared between
-/// the D-Bus service and the UI pump so `Release` can trigger a retry.
-pub type ReceiverActive = Arc<AtomicBool>;
+/// Single source of truth for the OBEX agent slot. Both the D-Bus service and
+/// the supervisor read and update it, so the UI never has to reconcile
+/// separate "active" flags with status events. Status changes are published
+/// while the state lock is held, which keeps a stale `Active` from racing
+/// ahead of an immediately following `Release`.
+#[derive(Debug, Clone)]
+pub struct ReceiverHandle {
+    inner: Arc<Mutex<ReceiverInner>>,
+    events: EventSink,
+}
+
+#[derive(Debug)]
+struct ReceiverInner {
+    status: ReceiverStatus,
+    /// Registration id currently allowed to speak for the receiver.
+    current: Option<u64>,
+    next: u64,
+}
+
+impl ReceiverHandle {
+    pub fn new(events: EventSink) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ReceiverInner {
+                status: ReceiverStatus::Starting,
+                current: None,
+                next: 1,
+            })),
+            events,
+        }
+    }
+
+    pub fn status(&self) -> ReceiverStatus {
+        self.inner.lock().expect("receiver lock").status.clone()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status() == ReceiverStatus::Active
+    }
+
+    /// Allocate the id for a registration attempt and make it the only one
+    /// whose `Release` is honored.
+    fn begin_registration(&self) -> u64 {
+        let mut inner = self.inner.lock().expect("receiver lock");
+        let id = inner.next;
+        inner.next += 1;
+        inner.current = Some(id);
+        id
+    }
+
+    /// Mark a registration active. Returns whether this changed the state.
+    /// A registration invalidated by a release/restart in the meantime is
+    /// left alone.
+    fn mark_active(&self, id: u64) -> bool {
+        let mut inner = self.inner.lock().expect("receiver lock");
+        if inner.current != Some(id) || inner.status == ReceiverStatus::Active {
+            return false;
+        }
+        self.set_status(&mut inner, ReceiverStatus::Active);
+        true
+    }
+
+    /// A `Release` for `id`. Stale releases from earlier registrations are
+    /// ignored; only the current registration can turn the receiver off.
+    fn release(&self, id: u64, reason: &str) {
+        let mut inner = self.inner.lock().expect("receiver lock");
+        if inner.current != Some(id) {
+            return;
+        }
+        inner.current = None;
+        let next = ReceiverStatus::Off(reason.to_string());
+        self.set_status(&mut inner, next);
+    }
+
+    /// Any reason the current registration is no longer valid (obexd restart,
+    /// session-bus failure, registration error).
+    fn mark_lost(&self, reason: &str) {
+        let mut inner = self.inner.lock().expect("receiver lock");
+        inner.current = None;
+        let next = ReceiverStatus::Off(reason.to_string());
+        self.set_status(&mut inner, next);
+    }
+
+    /// Caller holds the state lock, so the published order always matches
+    /// the stored state.
+    fn set_status(&self, inner: &mut ReceiverInner, next: ReceiverStatus) {
+        if inner.status == next {
+            return;
+        }
+        inner.status = next.clone();
+        self.events.send(Event::ReceiverState(next));
+    }
+}
 
 pub fn new_pending() -> PendingTransfers {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-pub fn new_active() -> ReceiverActive {
-    Arc::new(AtomicBool::new(false))
-}
-
-/// Apply an obexd `Release`: this process no longer owns the agent slot, so
-/// the pump retries registration and reports the receiver as off.
-fn mark_released(active: &ReceiverActive, tx: &UnboundedSender<Event>) {
-    mark_registration_lost(active, tx, "released by obexd; will retry registration");
-}
-
-/// A registration is no longer valid (released, or obexd restarted). The pump
-/// retries registration while the receiver is reported off.
-pub fn mark_registration_lost(active: &ReceiverActive, tx: &UnboundedSender<Event>, reason: &str) {
-    active.store(false, Ordering::Relaxed);
-    let _ = tx.send(Event::ReceiverState(ReceiverStatus::Off(
-        reason.to_string(),
-    )));
-}
-
 /// Watch `org.bluez.obex` owner changes on the session bus. obexd restarting
-/// silently invalidates our registration, so the pump must treat any change
-/// as a lost slot and re-register.
+/// silently invalidates our registration, so the supervisor must treat any
+/// change as a lost slot and re-register.
 pub async fn obexd_owner_changes(
     conn: &Connection,
 ) -> Result<zbus::proxy::OwnerChangedStream<'static>> {
@@ -150,19 +239,22 @@ fn opath(s: &str) -> zbus::Result<OwnedObjectPath> {
 pub struct AgentService {
     conn: Connection,
     pending: PendingTransfers,
-    tx: UnboundedSender<Event>,
-    active: ReceiverActive,
+    events: EventSink,
+    handle: ReceiverHandle,
+    registration: u64,
 }
 
 #[interface(name = "org.bluez.obex.Agent1")]
 impl AgentService {
     async fn release(&self) {
-        mark_released(&self.active, &self.tx);
+        self.handle.release(
+            self.registration,
+            "released by obexd; will retry registration",
+        );
     }
 
     async fn cancel(&self) {
-        let _ = self
-            .tx
+        self.events
             .send(Event::Log("OBEX agent request canceled".into()));
     }
 
@@ -170,8 +262,7 @@ impl AgentService {
         match self.authorize(&transfer).await {
             Ok(dest) => Ok(dest.to_string_lossy().into_owned()),
             Err(e) => {
-                let _ = self
-                    .tx
+                self.events
                     .send(Event::Log(format!("rejected incoming push: {e}")));
                 Err(fdo::Error::Failed(format!("kalo agent: {e}")))
             }
@@ -238,9 +329,11 @@ impl AgentService {
                 last_error_at: None,
                 last_progress_at: Instant::now(),
                 last_transferred: 0,
+                last_status: None,
+                status_since: Instant::now(),
             });
 
-        let _ = self.tx.send(Event::IncomingStarted {
+        self.events.send(Event::IncomingStarted {
             id,
             sender,
             name: safe_name,
@@ -256,8 +349,8 @@ fn obexd_root_fallback() -> String {
 }
 
 /// Default cache root obexd stages files under. A custom `obexd -r` root is
-/// only discoverable from a live session, so the startup sweep covers the
-/// default location only.
+/// only discoverable from a live session, so the sweep covers the default
+/// location only.
 fn staging_root() -> PathBuf {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -275,26 +368,17 @@ fn cleanup_staging(dir: &Path) {
 /// staged file also keeps the directory fresh.
 const STAGING_STALE_AGE: Duration = INCOMING_STALL_TIMEOUT;
 
-/// One-shot startup cleanup: recover files staged by a crashed/interrupted
-/// Kalo run into Downloads, then remove the now-empty `kalo-*` directories.
+/// Recover files staged by a crashed/interrupted Kalo run into Downloads and
+/// remove the now-empty `kalo-*` directories.
 ///
-/// Call only after this process owns the OBEX agent slot, so a live receiver
-/// cannot be writing into these directories.
-pub fn sweep_stale_staging_once(tx: &UnboundedSender<Event>) {
-    static SWEPT: Once = Once::new();
-    SWEPT.call_once(|| {
-        let recovered = sweep_stale_staging(
-            &staging_root(),
-            &paths::downloads_dir(),
-            STAGING_STALE_AGE,
-            tx,
-        );
-        if recovered > 0 {
-            let _ = tx.send(Event::Log(format!(
-                "recovered {recovered} file(s) from an interrupted transfer"
-            )));
-        }
-    });
+/// The supervisor runs this after registration and periodically afterwards.
+fn sweep_staging(downloads: &Path, events: &EventSink) {
+    let recovered = sweep_stale_staging(&staging_root(), downloads, STAGING_STALE_AGE, events);
+    if recovered > 0 {
+        events.send(Event::Log(format!(
+            "recovered {recovered} file(s) from an interrupted transfer"
+        )));
+    }
 }
 
 /// Recover every regular file from stale `kalo-*` staging dirs, then delete
@@ -303,7 +387,7 @@ fn sweep_stale_staging(
     root: &Path,
     downloads: &Path,
     min_age: Duration,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -326,7 +410,7 @@ fn sweep_stale_staging(
         if !stale {
             continue;
         }
-        recovered += recover_staging_dir(&entry.path(), downloads, tx);
+        recovered += recover_staging_dir(&entry.path(), downloads, events);
     }
     recovered
 }
@@ -350,7 +434,7 @@ fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
     newest
 }
 
-fn recover_staging_dir(dir: &Path, downloads: &Path, tx: &UnboundedSender<Event>) -> usize {
+fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -363,7 +447,7 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, tx: &UnboundedSender<Event>
             continue;
         }
         if let Err(e) = std::fs::create_dir_all(downloads) {
-            let _ = tx.send(Event::Log(format!(
+            events.send(Event::Log(format!(
                 "cannot recover staged files into {downloads:?}: {e}"
             )));
             break;
@@ -380,7 +464,7 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, tx: &UnboundedSender<Event>
                     dest = sanitize::unique_in_dir(downloads, &name);
                 }
                 Err(e) => {
-                    let _ = tx.send(Event::Log(format!(
+                    events.send(Event::Log(format!(
                         "recover staged file {:?} failed: {e}",
                         entry.path()
                     )));
@@ -411,12 +495,12 @@ async fn stale_transfer(t: &TransferPropsProxy<'_>, dest: &Path) -> bool {
 }
 
 fn fail(
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
     p: &PendingTransfer,
     error: impl Into<String>,
     staged_at: Option<PathBuf>,
 ) {
-    let _ = tx.send(Event::IncomingFailed {
+    events.send(Event::IncomingFailed {
         id: p.id.clone(),
         sender: p.sender.clone(),
         name: p.name.clone(),
@@ -425,9 +509,9 @@ fn fail(
     });
 }
 
-fn stale_failure(tx: &UnboundedSender<Event>, p: &PendingTransfer) {
+fn stale_failure(events: &EventSink, p: &PendingTransfer) {
     fail(
-        tx,
+        events,
         p,
         format!(
             "stale transfer object (path reused by another transfer); staged file kept at {}",
@@ -460,7 +544,7 @@ fn clear_transient_error(pending: &PendingTransfers, id: &str) {
 }
 
 /// Record inbound progress and return how long the byte counter has been
-/// unchanged. This is also the incoming stall clock.
+/// unchanged. This is the active-transfer stall clock.
 fn record_progress(pending: &PendingTransfers, id: &str, transferred: u64) -> Duration {
     let mut list = pending.lock().expect("pending lock");
     let Some(p) = list.iter_mut().find(|p| p.id == id) else {
@@ -472,6 +556,22 @@ fn record_progress(pending: &PendingTransfers, id: &str, transferred: u64) -> Du
         p.last_progress_at = now;
     }
     now.duration_since(p.last_progress_at)
+}
+
+/// Record a status change and return how long the transfer has been in the
+/// current status. Queued/suspended/unknown policies use this clock.
+fn record_status(pending: &PendingTransfers, id: &str, status: &TransferStatus) -> Duration {
+    let mut list = pending.lock().expect("pending lock");
+    let Some(p) = list.iter_mut().find(|p| p.id == id) else {
+        return Duration::ZERO;
+    };
+    let now = Instant::now();
+    let raw = status.to_string();
+    if p.last_status.as_deref() != Some(raw.as_str()) {
+        p.last_status = Some(raw);
+        p.status_since = now;
+    }
+    now.duration_since(p.status_since)
 }
 
 /// True when a D-Bus error means the object really is gone rather than a
@@ -494,7 +594,7 @@ fn is_object_gone(e: &zbus::Error) -> bool {
 fn transient_should_recover(
     pending: &PendingTransfers,
     p: &PendingTransfer,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
     error: &str,
     gone: bool,
 ) -> bool {
@@ -504,7 +604,7 @@ fn transient_should_recover(
     match note_transient_error(pending, &p.id) {
         Some((age, first)) if age < TRANSIENT_ERROR_GRACE => {
             if first {
-                let _ = tx.send(Event::Log(format!(
+                events.send(Event::Log(format!(
                     "{}: waiting for transfer object ({error})",
                     p.name
                 )));
@@ -520,25 +620,78 @@ fn transient_should_recover(
 fn handle_object_gone(
     p: &PendingTransfer,
     downloads: &Path,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
     reason: impl Into<String>,
 ) {
     if p.dest.exists() {
-        let _ = tx.send(Event::Log(format!(
+        events.send(Event::Log(format!(
             "{}: transfer object disappeared; recovering staged file",
             p.dest.display()
         )));
-        if let Err(e) = finalize_transfer(p, downloads, tx, true) {
+        if let Err(e) = finalize_transfer(p, downloads, events, true) {
             fail(
-                tx,
+                events,
                 p,
                 format!("recover staged file: {e}"),
                 Some(p.staging_dir.clone()),
             );
         }
     } else {
-        fail(tx, p, reason, None);
+        fail(events, p, reason, None);
         cleanup_staging(&p.staging_dir);
+    }
+}
+
+/// obexd reported a terminal failure. Anything it already wrote is the only
+/// copy of the received bytes, so it must be kept and moved to Downloads
+/// (marked partial) instead of deleting the staging directory.
+fn recover_failed_transfer(p: &PendingTransfer, downloads: &Path, events: &EventSink, error: &str) {
+    if p.dest.exists() {
+        events.send(Event::Log(format!(
+            "{}: {error}; keeping the staged partial file",
+            p.dest.display()
+        )));
+        if let Err(e) = finalize_transfer(p, downloads, events, true) {
+            fail(
+                events,
+                p,
+                format!("keep partial file: {e}"),
+                Some(p.staging_dir.clone()),
+            );
+        }
+    } else {
+        fail(events, p, error, None);
+        cleanup_staging(&p.staging_dir);
+    }
+}
+
+/// Per-status incoming stall policy (pure, unit-tested). A single timeout
+/// would either kill legitimate long transfers or leave unknown statuses
+/// hanging forever.
+fn incoming_stall_reason(
+    status: &TransferStatus,
+    status_since: Duration,
+    progress_since: Duration,
+) -> Option<String> {
+    match status {
+        TransferStatus::Complete | TransferStatus::Error => None,
+        TransferStatus::Queued if status_since > INCOMING_QUEUED_TIMEOUT => Some(format!(
+            "incoming transfer stayed queued for more than {}s",
+            INCOMING_QUEUED_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Active if progress_since > INCOMING_STALL_TIMEOUT => Some(format!(
+            "incoming transfer made no progress for more than {}s",
+            INCOMING_STALL_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Suspended if status_since > INCOMING_SUSPENDED_TIMEOUT => Some(format!(
+            "incoming transfer stayed suspended for more than {}s",
+            INCOMING_SUSPENDED_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Unknown(raw) if status_since > INCOMING_UNKNOWN_TIMEOUT => Some(format!(
+            "incoming transfer stuck in unknown status '{raw}' for more than {}s",
+            INCOMING_UNKNOWN_TIMEOUT.as_secs()
+        )),
+        _ => None,
     }
 }
 
@@ -548,7 +701,7 @@ pub async fn poll_pending(
     conn: &Connection,
     pending: &PendingTransfers,
     downloads: &Path,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
 ) {
     let list = pending.lock().expect("pending lock").clone();
     if list.is_empty() {
@@ -565,7 +718,7 @@ pub async fn poll_pending(
                     if !transient_should_recover(
                         pending,
                         p,
-                        tx,
+                        events,
                         &format!("proxy: {e}"),
                         is_object_gone(&e),
                     ) {
@@ -574,7 +727,7 @@ pub async fn poll_pending(
                     handle_object_gone(
                         p,
                         downloads,
-                        tx,
+                        events,
                         format!("transfer object unavailable: {e}"),
                     );
                     finished.push(p.id.clone());
@@ -585,7 +738,7 @@ pub async fn poll_pending(
                 if !transient_should_recover(
                     pending,
                     p,
-                    tx,
+                    events,
                     &format!("proxy path: {e}"),
                     is_object_gone(&e),
                 ) {
@@ -594,7 +747,7 @@ pub async fn poll_pending(
                 handle_object_gone(
                     p,
                     downloads,
-                    tx,
+                    events,
                     format!("transfer object unavailable: {e}"),
                 );
                 finished.push(p.id.clone());
@@ -611,7 +764,7 @@ pub async fn poll_pending(
                 if !transient_should_recover(
                     pending,
                     p,
-                    tx,
+                    events,
                     &format!("status: {e}"),
                     is_object_gone(&e),
                 ) {
@@ -620,7 +773,7 @@ pub async fn poll_pending(
                 handle_object_gone(
                     p,
                     downloads,
-                    tx,
+                    events,
                     format!("transfer object disappeared before completion: {e}"),
                 );
                 finished.push(p.id.clone());
@@ -628,18 +781,18 @@ pub async fn poll_pending(
             }
         };
 
-        match status {
+        match &status {
             TransferStatus::Complete => {
                 if stale_transfer(&proxy, &p.dest).await {
-                    stale_failure(tx, p);
+                    stale_failure(events, p);
                     finished.push(p.id.clone());
                     continue; // keep the staging dir: it may hold the old file
                 }
-                if let Err(e) = finalize_transfer(p, downloads, tx, false) {
+                if let Err(e) = finalize_transfer(p, downloads, events, false) {
                     // Keep the staged source: a failed move must not destroy
                     // the only copy of the received file.
                     fail(
-                        tx,
+                        events,
                         p,
                         format!("save failed: {e}"),
                         Some(p.staging_dir.clone()),
@@ -649,32 +802,33 @@ pub async fn poll_pending(
             }
             TransferStatus::Error => {
                 if stale_transfer(&proxy, &p.dest).await {
-                    stale_failure(tx, p);
+                    stale_failure(events, p);
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                fail(tx, p, "transfer reported error", None);
-                cleanup_staging(&p.staging_dir);
+                recover_failed_transfer(p, downloads, events, "transfer reported error");
+                finished.push(p.id.clone());
+            }
+            TransferStatus::Unknown(raw) if raw.eq_ignore_ascii_case("cancelled") => {
+                if stale_transfer(&proxy, &p.dest).await {
+                    stale_failure(events, p);
+                    finished.push(p.id.clone());
+                    continue; // keep the staging dir
+                }
+                recover_failed_transfer(p, downloads, events, "transfer was canceled");
                 finished.push(p.id.clone());
             }
             _ => {
+                let status_since = record_status(pending, &p.id, &status);
                 let transferred = proxy.transferred().await.ok();
                 let idle =
                     record_progress(pending, &p.id, transferred.unwrap_or(p.last_transferred));
-                if idle > INCOMING_STALL_TIMEOUT {
-                    handle_object_gone(
-                        p,
-                        downloads,
-                        tx,
-                        format!(
-                            "incoming transfer stalled for more than {}s",
-                            INCOMING_STALL_TIMEOUT.as_secs()
-                        ),
-                    );
+                if let Some(reason) = incoming_stall_reason(&status, status_since, idle) {
+                    handle_object_gone(p, downloads, events, reason);
                     finished.push(p.id.clone());
                     continue;
                 }
-                let _ = tx.send(Event::IncomingProgress {
+                events.send(Event::IncomingProgress {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     transferred,
@@ -697,10 +851,10 @@ pub async fn poll_pending(
 fn finalize_transfer(
     p: &PendingTransfer,
     downloads: &Path,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
     interrupted: bool,
 ) -> Result<()> {
-    finish_transfer(p, downloads, tx, interrupted)?;
+    finish_transfer(p, downloads, events, interrupted)?;
     cleanup_staging(&p.staging_dir);
     Ok(())
 }
@@ -708,7 +862,7 @@ fn finalize_transfer(
 fn finish_transfer(
     p: &PendingTransfer,
     downloads: &Path,
-    tx: &UnboundedSender<Event>,
+    events: &EventSink,
     interrupted: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(downloads)
@@ -746,7 +900,7 @@ fn finish_transfer(
     } else {
         0.0
     };
-    let _ = tx.send(Event::IncomingDone {
+    events.send(Event::IncomingDone {
         id: p.id.clone(),
         sender: p.sender.clone(),
         name: p.name.clone(),
@@ -759,38 +913,93 @@ fn finish_transfer(
     Ok(())
 }
 
-/// Export the agent object on the connection. Kept separate from
-/// registration so a failed registration can be retried without re-exporting.
-pub async fn export_agent(
+fn registration_path(id: u64) -> String {
+    format!("{AGENT_PATH}/{id}")
+}
+
+async fn export_agent(
     conn: &Connection,
+    path: &str,
     pending: PendingTransfers,
-    tx: UnboundedSender<Event>,
-    active: ReceiverActive,
+    events: EventSink,
+    handle: ReceiverHandle,
+    registration: u64,
 ) -> Result<()> {
     let service = AgentService {
         conn: conn.clone(),
         pending,
-        tx,
-        active,
+        events,
+        handle,
+        registration,
     };
     conn.object_server()
-        .at(AGENT_PATH, service)
+        .at(path, service)
         .await
         .context("export OBEX agent object")?;
     Ok(())
 }
 
-/// Register the already-exported agent with obexd.
-pub async fn register_agent(
+/// Export a uniquely-pathed agent object and register it with obexd. Returns
+/// the object path so the supervisor can remove it once replaced.
+async fn register_receiver(
     conn: &Connection,
-    active: ReceiverActive,
-    tx: &UnboundedSender<Event>,
-) -> Result<()> {
-    let manager = AgentManagerProxy::new(conn).await?;
-    manager.register_agent(opath(AGENT_PATH)?).await?;
-    active.store(true, Ordering::Relaxed);
-    let _ = tx.send(Event::ReceiverState(ReceiverStatus::Active));
-    Ok(())
+    handle: ReceiverHandle,
+    pending: PendingTransfers,
+    events: EventSink,
+) -> Result<String> {
+    let registration = handle.begin_registration();
+    let path = registration_path(registration);
+
+    export_agent(
+        conn,
+        &path,
+        pending,
+        events.clone(),
+        handle.clone(),
+        registration,
+    )
+    .await?;
+
+    let manager = match AgentManagerProxy::new(conn).await {
+        Ok(manager) => manager,
+        Err(e) => {
+            let _ = conn
+                .object_server()
+                .remove::<AgentService, _>(path.as_str())
+                .await;
+            return Err(e.into());
+        }
+    };
+    let agent_path = match opath(&path) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = conn
+                .object_server()
+                .remove::<AgentService, _>(path.as_str())
+                .await;
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = manager.register_agent(agent_path.clone()).await {
+        let _ = conn
+            .object_server()
+            .remove::<AgentService, _>(path.as_str())
+            .await;
+        return Err(e.into());
+    }
+
+    let became_active = handle.mark_active(registration);
+    if !became_active && !handle.is_active() {
+        // A Release (or an obexd restart) invalidated this registration
+        // before the reply arrived. Undo it and let the supervisor retry.
+        let _ = manager.unregister_agent(agent_path).await;
+        let _ = conn
+            .object_server()
+            .remove::<AgentService, _>(path.as_str())
+            .await;
+        return Err(anyhow!("agent registration was invalidated during startup"));
+    }
+    Ok(path)
 }
 
 fn is_already_exists(e: &anyhow::Error) -> bool {
@@ -811,20 +1020,146 @@ pub fn registration_error(e: &anyhow::Error) -> String {
     }
 }
 
-/// Export and register the agent (CLI entry point).
-pub async fn start(
-    conn: &Connection,
+/// Supervisor shared by the UI and `kalo receive`: connects to the session
+/// bus, registers the agent, retries lost registrations and replaces the
+/// connection when the bus goes away.
+pub async fn run_receiver(
+    handle: ReceiverHandle,
     pending: PendingTransfers,
-    tx: UnboundedSender<Event>,
+    downloads: PathBuf,
+    events: EventSink,
+) -> ! {
+    loop {
+        match Connection::session().await {
+            Ok(conn) => {
+                if let Err(e) =
+                    receiver_session(&conn, &handle, &pending, &downloads, &events).await
+                {
+                    let reason = format!("session bus connection lost: {e}; reconnecting");
+                    handle.mark_lost(&reason);
+                    events.send(Event::Log(reason));
+                }
+            }
+            Err(e) => {
+                let reason = format!("D-Bus session error: {e}; retrying");
+                handle.mark_lost(&reason);
+            }
+        }
+        tokio::time::sleep(SESSION_BUS_RETRY).await;
+    }
+}
+
+async fn receiver_session(
+    conn: &Connection,
+    handle: &ReceiverHandle,
+    pending: &PendingTransfers,
+    downloads: &Path,
+    events: &EventSink,
 ) -> Result<()> {
-    let active = new_active();
-    export_agent(conn, pending, tx.clone(), active.clone()).await?;
-    match register_agent(conn, active, &tx).await {
-        Ok(()) => Ok(()),
+    let mut owner_changes = match obexd_owner_changes(conn).await {
+        Ok(changes) => Some(changes),
         Err(e) => {
-            let msg = registration_error(&e);
-            let _ = tx.send(Event::ReceiverState(ReceiverStatus::Off(msg.clone())));
-            Err(anyhow!(msg))
+            events.send(Event::Log(format!("obexd owner watch unavailable: {e}")));
+            None
+        }
+    };
+
+    let mut last_registration_error: Option<String> = None;
+    let mut current_path =
+        match register_receiver(conn, handle.clone(), pending.clone(), events.clone()).await {
+            Ok(path) => {
+                sweep_staging(downloads, events);
+                Some(path)
+            }
+            Err(e) => {
+                let reason = registration_error(&e);
+                handle.mark_lost(&reason);
+                events.send(Event::Log(format!(
+                    "receiver registration failed: {reason}"
+                )));
+                last_registration_error = Some(reason);
+                None
+            }
+        };
+    // Poll while any agent object exists: in-flight transfers may still
+    // finish even after obexd released the registration.
+    let mut exported = current_path.is_some();
+
+    let mut retry = tokio::time::interval(REGISTRATION_RETRY);
+    retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    retry.tick().await; // consume the immediate first tick
+    let mut poll = tokio::time::interval(PENDING_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    poll.tick().await;
+    let mut sweep = tokio::time::interval(STAGING_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    sweep.tick().await;
+
+    loop {
+        if conn.is_closed() {
+            bail!("session bus connection closed");
+        }
+        tokio::select! {
+            change = async {
+                match owner_changes.as_mut() {
+                    Some(changes) => changes.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match change {
+                    Some(_) => {
+                        events.send(Event::Log(
+                            "obexd restarted; re-registering the receiver".into(),
+                        ));
+                        handle.mark_lost("obexd restarted; will retry registration");
+                        last_registration_error = None;
+                        // Retry now instead of waiting for the next tick.
+                        retry.reset();
+                    }
+                    None => {
+                        owner_changes = None;
+                        events.send(Event::Log(
+                            "obexd owner watch ended; using registration retries".into(),
+                        ));
+                    }
+                }
+            }
+            _ = poll.tick(), if exported => {
+                poll_pending(conn, pending, downloads, events).await;
+                if conn.is_closed() {
+                    bail!("session bus connection closed");
+                }
+            }
+            _ = retry.tick(), if !handle.is_active() => {
+                match register_receiver(conn, handle.clone(), pending.clone(), events.clone()).await {
+                    Ok(path) => {
+                        if let Some(old) = current_path.replace(path) {
+                            let _ = conn
+                                .object_server()
+                                .remove::<AgentService, _>(old.as_str())
+                                .await;
+                        }
+                        exported = true;
+                        last_registration_error = None;
+                        sweep_staging(downloads, events);
+                    }
+                    Err(e) => {
+                        let reason = registration_error(&e);
+                        handle.mark_lost(&reason);
+                        // Log only when the reason changes: retries are
+                        // frequent and the status event already carries it.
+                        if last_registration_error.as_deref() != Some(reason.as_str()) {
+                            events.send(Event::Log(format!(
+                                "receiver registration retry failed: {reason}"
+                            )));
+                            last_registration_error = Some(reason);
+                        }
+                    }
+                }
+            }
+            _ = sweep.tick(), if handle.is_active() => {
+                sweep_staging(downloads, events);
+            }
         }
     }
 }
@@ -832,10 +1167,16 @@ pub async fn start(
 /// CLI: grab and immediately release the OBEX agent slot (non-destructive).
 pub async fn agent_check() -> Result<()> {
     let conn = Connection::session().await?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    start(&conn, new_pending(), tx).await?;
+    let events = EventSink::new(64);
+    let mut rx = events.subscribe();
+    let handle = ReceiverHandle::new(events.clone());
+    let path = register_receiver(&conn, handle, new_pending(), events.clone()).await?;
     let manager = AgentManagerProxy::new(&conn).await?;
-    manager.unregister_agent(opath(AGENT_PATH)?).await?;
+    manager.unregister_agent(opath(&path)?).await?;
+    let _ = conn
+        .object_server()
+        .remove::<AgentService, _>(path.as_str())
+        .await;
     while let Ok(event) = rx.try_recv() {
         println!("{event:?}");
     }
@@ -845,33 +1186,38 @@ pub async fn agent_check() -> Result<()> {
 
 /// CLI: run the receiver in the foreground (SPIKE: accepts everything).
 pub async fn receive() -> Result<()> {
-    let conn = Connection::session().await?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let events = EventSink::new(1024);
+    let mut rx = events.subscribe();
+    let handle = ReceiverHandle::new(events.clone());
     let pending = new_pending();
     let downloads = paths::downloads_dir();
-    start(&conn, pending.clone(), tx.clone()).await?;
-    sweep_stale_staging_once(&tx);
 
     println!("listening… (Ctrl-C to stop)");
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Some(event) => println!("{event:?}"),
-                    None => break,
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => println!("{event:?}"),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    eprintln!("warning: event stream lagged; dropped {dropped} events");
                 }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                poll_pending(&conn, &pending, &downloads, &tx).await;
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    }
-    Ok(())
+    });
+
+    run_receiver(handle, pending, downloads, events).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
+
+    fn event_sink() -> (EventSink, broadcast::Receiver<Event>) {
+        let sink = EventSink::new(64);
+        let rx = sink.subscribe();
+        (sink, rx)
+    }
 
     fn pending_transfer(dest: PathBuf, size: Option<u64>) -> PendingTransfer {
         let staging_dir = dest.parent().unwrap().to_path_buf();
@@ -887,6 +1233,8 @@ mod tests {
             last_error_at: None,
             last_progress_at: Instant::now(),
             last_transferred: 0,
+            last_status: None,
+            status_since: Instant::now(),
         }
     }
 
@@ -909,10 +1257,10 @@ mod tests {
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
         let downloads = blocker.join("Downloads");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        assert!(finalize_transfer(&p, &downloads, &tx, false).is_err());
+        assert!(finalize_transfer(&p, &downloads, &events, false).is_err());
         assert!(dest.exists(), "staged source must be kept on save failure");
         let _ = rx.try_recv();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -926,10 +1274,10 @@ mod tests {
         let dest = staging.join("photo.jpg");
         std::fs::write(&dest, b"hello").unwrap();
         let downloads = dir.join("Downloads");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        finalize_transfer(&p, &downloads, &tx, false).unwrap();
+        finalize_transfer(&p, &downloads, &events, false).unwrap();
         assert!(!dest.exists());
         assert!(!staging.exists());
         let event = rx.try_recv().unwrap();
@@ -957,10 +1305,10 @@ mod tests {
         let dest = staging.join("photo.jpg");
         std::fs::write(&dest, b"hello").unwrap();
         let downloads = dir.join("Downloads");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, Some(10));
 
-        finalize_transfer(&p, &downloads, &tx, false).unwrap();
+        finalize_transfer(&p, &downloads, &events, false).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, bytes, .. } => {
                 assert_eq!(bytes, 5);
@@ -979,12 +1327,64 @@ mod tests {
         let dest = staging.join("photo.jpg");
         std::fs::write(&dest, b"hello").unwrap();
         let downloads = dir.join("Downloads");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, None);
 
-        finalize_transfer(&p, &downloads, &tx, true).unwrap();
+        finalize_transfer(&p, &downloads, &events, true).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, .. } => assert!(partial),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn error_keeps_partial_staged_file() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.jpg");
+        std::fs::write(&dest, b"hello").unwrap();
+        let downloads = dir.join("Downloads");
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(dest, Some(10));
+
+        // SM-01 regression: an obexd error after some bytes were written must
+        // move the partial file to Downloads instead of deleting it.
+        recover_failed_transfer(&p, &downloads, &events, "transfer reported error");
+
+        match rx
+            .try_recv()
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+            .find(|event| !matches!(event, Event::Log(_)))
+            .expect("completion event")
+        {
+            Event::IncomingDone { partial, bytes, .. } => {
+                assert!(partial);
+                assert_eq!(bytes, 5);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(downloads.join("photo.jpg").exists());
+        assert!(!staging.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn canceled_transfer_with_nothing_staged_reports_failure() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let downloads = dir.join("Downloads");
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(staging.join("photo.jpg"), Some(10));
+
+        recover_failed_transfer(&p, &downloads, &events, "transfer was canceled");
+        match rx.try_recv().unwrap() {
+            Event::IncomingFailed { error, .. } => {
+                assert_eq!(error, "transfer was canceled");
+            }
             other => panic!("unexpected event: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -996,9 +1396,9 @@ mod tests {
         let staging = dir.join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let p = pending_transfer(staging.join("photo.jpg"), Some(5));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = event_sink();
 
-        fail(&tx, &p, "boom", Some(staging.clone()));
+        fail(&events, &p, "boom", Some(staging.clone()));
         match rx.try_recv().unwrap() {
             Event::IncomingFailed {
                 name,
@@ -1023,10 +1423,10 @@ mod tests {
         let p = pending_transfer(staging.join("photo.jpg"), Some(5));
         let pending = new_pending();
         pending.lock().unwrap().push(p.clone());
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = event_sink();
 
         assert!(!transient_should_recover(
-            &pending, &p, &tx, "timeout", false
+            &pending, &p, &events, "timeout", false
         ));
         let (_, first) = note_transient_error(&pending, &p.id).unwrap();
         assert!(!first, "second observation must not log again");
@@ -1043,12 +1443,12 @@ mod tests {
         let p = pending_transfer(staging.join("photo.jpg"), Some(5));
         let pending = new_pending();
         pending.lock().unwrap().push(p.clone());
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = event_sink();
 
         assert!(transient_should_recover(
             &pending,
             &p,
-            &tx,
+            &events,
             "unknown object",
             true
         ));
@@ -1056,20 +1456,50 @@ mod tests {
     }
 
     #[test]
-    fn release_clears_active_and_reports_receiver_off() {
-        let active = new_active();
-        active.store(true, Ordering::Relaxed);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    fn stale_release_from_previous_registration_is_ignored() {
+        let (events, mut rx) = event_sink();
+        let handle = ReceiverHandle::new(events);
+        let first = handle.begin_registration();
+        assert!(handle.mark_active(first));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ReceiverState(ReceiverStatus::Active)
+        ));
 
-        mark_released(&active, &tx);
+        // A new registration starts before obexd's late Release for the old
+        // object arrives: the stale Release must not turn the receiver off.
+        let second = handle.begin_registration();
+        assert!(handle.is_active());
+        handle.release(first, "stale release");
+        assert!(handle.is_active());
+        assert!(rx.try_recv().is_err());
 
-        assert!(!active.load(Ordering::Relaxed));
+        handle.release(second, "released by obexd");
+        assert!(!handle.is_active());
         match rx.try_recv().unwrap() {
             Event::ReceiverState(ReceiverStatus::Off(reason)) => {
-                assert!(reason.contains("retry"), "reason: {reason}");
+                assert_eq!(reason, "released by obexd");
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_off_status_is_not_reemitted() {
+        let (events, mut rx) = event_sink();
+        let handle = ReceiverHandle::new(events);
+        handle.mark_lost("bus down");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ReceiverState(ReceiverStatus::Off(reason)) if reason == "bus down"
+        ));
+        handle.mark_lost("bus down");
+        assert!(rx.try_recv().is_err());
+        handle.mark_lost("other reason");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ReceiverState(ReceiverStatus::Off(reason)) if reason == "other reason"
+        ));
     }
 
     #[test]
@@ -1084,12 +1514,12 @@ mod tests {
         std::fs::create_dir_all(&downloads).unwrap();
         std::fs::write(downloads.join("photo.jpg"), b"keep").unwrap();
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let recovered = sweep_stale_staging(&root, &downloads, Duration::ZERO, &tx);
+        let (events, _rx) = event_sink();
+        let recovered = sweep_stale_staging(&root, &downloads, Duration::ZERO, &events);
 
         assert_eq!(recovered, 1);
         assert!(!staging.exists(), "empty staging dir must be removed");
-        // C1: the pre-existing file is never replaced.
+        // The pre-existing file is never replaced.
         assert_eq!(std::fs::read(downloads.join("photo.jpg")).unwrap(), b"keep");
         assert_eq!(
             std::fs::read(downloads.join("photo (1).jpg")).unwrap(),
@@ -1109,18 +1539,18 @@ mod tests {
         std::fs::write(foreign.join("a.bin"), b"x").unwrap();
         std::fs::write(fresh.join("b.bin"), b"y").unwrap();
         let downloads = dir.join("Downloads");
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = event_sink();
 
         // A recent directory may belong to another live receiver.
         assert_eq!(
-            sweep_stale_staging(&root, &downloads, Duration::from_secs(3600), &tx),
+            sweep_stale_staging(&root, &downloads, Duration::from_secs(3600), &events),
             0
         );
         assert!(fresh.join("b.bin").exists());
 
         // Old enough: only Kalo's own staging is recovered.
         assert_eq!(
-            sweep_stale_staging(&root, &downloads, Duration::ZERO, &tx),
+            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events),
             1
         );
         assert!(!fresh.exists());
@@ -1176,5 +1606,77 @@ mod tests {
         let unchanged_again = record_progress(&pending, &p.id, 5);
         assert!(unchanged_again >= after_change);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn status_clock_advances_only_on_change() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let p = pending_transfer(staging.join("photo.jpg"), Some(5));
+        let pending = new_pending();
+        pending.lock().unwrap().push(p.clone());
+
+        {
+            let mut list = pending.lock().unwrap();
+            let entry = list.iter_mut().find(|e| e.id == p.id).unwrap();
+            entry.status_since = Instant::now() - Duration::from_secs(9);
+            entry.last_status = Some("active".into());
+        }
+
+        let same = record_status(&pending, &p.id, &TransferStatus::Active);
+        assert!(same >= Duration::from_secs(9), "got {same:?}");
+
+        let changed = record_status(&pending, &p.id, &TransferStatus::Queued);
+        assert!(changed < Duration::from_secs(1), "got {changed:?}");
+        assert_eq!(
+            pending.lock().unwrap()[0].last_status.as_deref(),
+            Some("queued")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incoming_stall_policy_is_per_status() {
+        let zero = Duration::ZERO;
+        assert!(incoming_stall_reason(&TransferStatus::Complete, zero, zero).is_none());
+        assert!(incoming_stall_reason(&TransferStatus::Error, zero, zero).is_none());
+
+        assert!(
+            incoming_stall_reason(&TransferStatus::Queued, Duration::from_secs(301), zero)
+                .is_some()
+        );
+        assert!(
+            incoming_stall_reason(&TransferStatus::Queued, Duration::from_secs(299), zero)
+                .is_none()
+        );
+        assert!(
+            incoming_stall_reason(&TransferStatus::Active, zero, Duration::from_secs(1801))
+                .is_some()
+        );
+        assert!(
+            incoming_stall_reason(&TransferStatus::Active, zero, Duration::from_secs(1799))
+                .is_none()
+        );
+        assert!(
+            incoming_stall_reason(&TransferStatus::Suspended, Duration::from_secs(601), zero)
+                .is_some()
+        );
+        assert!(
+            incoming_stall_reason(
+                &TransferStatus::Unknown("weird".into()),
+                Duration::from_secs(61),
+                zero
+            )
+            .is_some()
+        );
+        assert!(
+            incoming_stall_reason(
+                &TransferStatus::Unknown("cancelled".into()),
+                Duration::from_secs(61),
+                zero
+            )
+            .is_some()
+        );
     }
 }

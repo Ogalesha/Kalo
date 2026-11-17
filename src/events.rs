@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use tokio::sync::broadcast;
+
 /// `org.bluez.obex.Transfer1.Status` as a closed set plus a forward-compatible
 /// escape hatch. BlueZ documents exactly five values; anything else is kept
 /// verbatim so it can be displayed and handled without guessing.
@@ -115,6 +117,31 @@ pub enum Event {
     },
     /// State of the receiver (OBEX agent).
     ReceiverState(ReceiverStatus),
+}
+
+/// Fan-out sink for background events. A broadcast channel lets the UI
+/// re-create its subscription (for example after a window/stream restart)
+/// without consuming the only receiver, and lets the CLI follow along.
+#[derive(Debug, Clone)]
+pub struct EventSink {
+    tx: broadcast::Sender<Event>,
+}
+
+impl EventSink {
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    /// Publish an event. With no live subscriber the event is dropped, exactly
+    /// like the previous `UnboundedSender` behavior.
+    pub fn send(&self, event: Event) {
+        let _ = self.tx.send(event);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.tx.subscribe()
+    }
 }
 
 /// Shared rendering of outgoing progress so the UI and CLI cannot drift.
@@ -271,5 +298,20 @@ mod tests {
         assert_eq!(transfer_fraction(0, Some(10)), Some(0.0));
         assert_eq!(transfer_fraction(5, Some(10)), Some(0.5));
         assert_eq!(transfer_fraction(20, Some(10)), Some(1.0));
+    }
+
+    #[test]
+    fn event_sink_can_be_subscribed_again() {
+        let sink = EventSink::new(8);
+        let mut first = sink.subscribe();
+        sink.send(Event::Log("one".into()));
+        assert!(matches!(first.try_recv().unwrap(), Event::Log(line) if line == "one"));
+
+        // Dropping the first receiver must not consume the bus: a re-created
+        // subscription (iced may rebuild it) still observes new events.
+        drop(first);
+        let mut second = sink.subscribe();
+        sink.send(Event::Log("two".into()));
+        assert!(matches!(second.try_recv().unwrap(), Event::Log(line) if line == "two"));
     }
 }

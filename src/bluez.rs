@@ -79,6 +79,23 @@ fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// BlueZ method errors are matched by their final D-Bus name component so
+/// vendor prefixes cannot hide `InProgress`/`AlreadyExists`.
+fn error_name_matches(name: &str, suffix: &str) -> bool {
+    name.ends_with(suffix)
+}
+
+fn is_error_named(e: &zbus::Error, suffix: &str) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, _, _) if error_name_matches(name.as_str(), suffix)
+    )
+}
+
+/// Pairing waits for a user confirmation on the remote device, but it must
+/// not hang forever when that confirmation never comes.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Pick a powered adapter when possible, otherwise the first one in stable
 /// lexicographic order. This keeps the CLI working when the adapter is not
 /// `hci0` or when the first adapter is powered off.
@@ -187,25 +204,16 @@ pub async fn connectable(state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Whether a discovery window needs to start and stop discovery. A session
-/// that was already running belongs to another client and must be left alone.
+/// Whether a discovery window needs to start discovery. A session that was
+/// already running belongs to another client and must be left alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiscoveryPlan {
     start: bool,
-    stop: bool,
 }
 
 fn discovery_plan(already_discovering: bool) -> DiscoveryPlan {
-    if already_discovering {
-        DiscoveryPlan {
-            start: false,
-            stop: false,
-        }
-    } else {
-        DiscoveryPlan {
-            start: true,
-            stop: true,
-        }
+    DiscoveryPlan {
+        start: !already_discovering,
     }
 }
 
@@ -222,15 +230,23 @@ pub async fn list_devices(discovery: Option<u64>) -> Result<()> {
             bail!("the adapter is powered off");
         }
         let plan = discovery_plan(adapter.discovering().await?);
+        let mut started = false;
         if plan.start {
-            adapter.start_discovery().await?;
+            match adapter.start_discovery().await {
+                Ok(()) => started = true,
+                Err(e) if is_error_named(&e, "InProgress") => {
+                    // Another client won the race between our state read and
+                    // StartDiscovery. Leave its session alone and do not try
+                    // to stop it below.
+                }
+                Err(e) => return Err(e).context("StartDiscovery failed"),
+            }
         }
         println!("discovering for {secs}s…");
         tokio::time::sleep(Duration::from_secs(secs)).await;
-        if plan.stop
-            && adapter.discovering().await?
-            && let Err(e) = adapter.stop_discovery().await
-        {
+        // Always attempt cleanup once discovery was started, before any
+        // fallible state read, so a failure cannot leave discovery running.
+        if started && let Err(e) = adapter.stop_discovery().await {
             eprintln!("warning: failed to stop discovery: {e}");
         }
     }
@@ -283,7 +299,18 @@ pub async fn pair(mac: &str) -> Result<()> {
         return Ok(());
     }
     println!("pairing with {mac}… (confirm on the device if prompted)");
-    device.pair().await.context("pairing failed")?;
+    match tokio::time::timeout(PAIR_TIMEOUT, device.pair()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if is_error_named(&e, "AlreadyExists") => {
+            println!("{mac} is already paired");
+            return Ok(());
+        }
+        Ok(Err(e)) => return Err(e).context("pairing failed"),
+        Err(_) => bail!(
+            "pairing with {mac} timed out after {}s — confirm the prompt on the device and retry",
+            PAIR_TIMEOUT.as_secs()
+        ),
+    }
     println!("paired ✔");
     Ok(())
 }
@@ -293,20 +320,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_is_only_stopped_when_kalo_started_it() {
-        assert_eq!(
-            discovery_plan(true),
-            DiscoveryPlan {
-                start: false,
-                stop: false
-            }
-        );
-        assert_eq!(
-            discovery_plan(false),
-            DiscoveryPlan {
-                start: true,
-                stop: true
-            }
-        );
+    fn discovery_is_only_started_when_nobody_else_owns_it() {
+        assert_eq!(discovery_plan(true), DiscoveryPlan { start: false });
+        assert_eq!(discovery_plan(false), DiscoveryPlan { start: true });
+    }
+
+    #[test]
+    fn dbus_error_names_match_by_suffix() {
+        assert!(error_name_matches(
+            "org.bluez.Error.InProgress",
+            "InProgress"
+        ));
+        assert!(error_name_matches(
+            "org.freedesktop.DBus.Error.AlreadyExists",
+            "AlreadyExists"
+        ));
+        assert!(!error_name_matches("org.bluez.Error.Failed", "InProgress"));
+        assert!(!is_error_named(
+            &zbus::Error::Failure("not a method error".into()),
+            "InProgress"
+        ));
     }
 }

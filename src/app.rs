@@ -1,22 +1,19 @@
 //! Iced UI for the Kalo spike: devices, send with progress, receiver state, log.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use iced::widget::{button, column, container, progress_bar, row, rule, scrollable, space, text};
 use iced::{Alignment, Color, Element, Font, Length, Padding, Subscription, Task, Theme};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
-use tokio::time::MissedTickBehavior;
-use zbus::Connection;
 
-use crate::agent::{self, PendingTransfers, new_pending};
+use crate::agent::{self, PendingTransfers, ReceiverHandle, new_pending};
 use crate::bluez::{self, DeviceInfo};
 use crate::events::{
-    Event, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
+    Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
 };
 use crate::obex;
 use crate::paths;
@@ -25,15 +22,29 @@ use crate::paths;
 /// subscriptions from plain `fn` builders, so the state must be static.
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
 
-const AGENT_RETRY: Duration = Duration::from_secs(15);
-const DBUS_RETRY: Duration = Duration::from_secs(5);
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 struct EventBus {
-    tx: UnboundedSender<Event>,
-    rx_slot: Arc<Mutex<Option<UnboundedReceiver<Event>>>>,
+    sink: EventSink,
+    receiver: ReceiverHandle,
     pending: PendingTransfers,
     downloads: PathBuf,
+}
+
+impl EventBus {
+    /// Spawn the shared receiver supervisor exactly once. The subscription can
+    /// be re-created by iced, but the supervisor (and its event sink) must not
+    /// be duplicated.
+    fn ensure_receiver_started(&self) {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tokio::spawn(agent::run_receiver(
+            self.receiver.clone(),
+            self.pending.clone(),
+            self.downloads.clone(),
+            self.sink.clone(),
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,11 +89,24 @@ struct SendResultUi {
     message: String,
 }
 
+/// Everything that belongs to the one in-flight outgoing transfer. Keeping
+/// it in one struct makes invalid combinations (sending without an id or a
+/// cancel handle) unrepresentable.
+#[derive(Debug)]
+struct ActiveSend {
+    id: u64,
+    target: String,
+    cancel: Option<oneshot::Sender<()>>,
+    cancel_requested: bool,
+    progress: Option<SendProgressUi>,
+}
+
 struct App {
-    tx: UnboundedSender<Event>,
+    tx: EventSink,
     devices: Vec<DeviceInfo>,
     devices_request_id: u64,
     devices_loaded: bool,
+    devices_loading: bool,
     devices_error: Option<String>,
     /// Selected device address (stable across list refreshes; an index would
     /// go stale because `list_known_devices` re-sorts on every refresh).
@@ -90,15 +114,10 @@ struct App {
     file: Option<PathBuf>,
     picking_file: bool,
     log: Vec<String>,
-    /// The active send, if any. Using one optional ID instead of a separate
-    /// boolean eliminates the invalid "sending but no send" combinations.
-    active_send: Option<u64>,
+    /// The active send, if any.
+    active_send: Option<ActiveSend>,
     next_send_id: u64,
-    send_cancel: Option<oneshot::Sender<()>>,
-    cancel_requested: bool,
-    send_progress: Option<SendProgressUi>,
     send_result: Option<SendResultUi>,
-    active_target: Option<String>,
     incoming: Vec<IncomingUi>,
     receiver_state: ReceiverStatus,
 }
@@ -117,11 +136,11 @@ impl App {
 }
 
 pub fn run() -> iced::Result {
-    let (tx, rx) = unbounded_channel();
+    let sink = EventSink::new(2048);
     if EVENT_BUS
         .set(EventBus {
-            tx: tx.clone(),
-            rx_slot: Arc::new(Mutex::new(Some(rx))),
+            sink: sink.clone(),
+            receiver: ReceiverHandle::new(sink),
             pending: new_pending(),
             downloads: paths::downloads_dir(),
         })
@@ -135,10 +154,11 @@ pub fn run() -> iced::Result {
             let bus = EVENT_BUS.get().expect("event bus must be initialized");
             let initial_request_id = 1;
             let app = App {
-                tx: bus.tx.clone(),
+                tx: bus.sink.clone(),
                 devices: Vec::new(),
                 devices_request_id: initial_request_id,
                 devices_loaded: false,
+                devices_loading: true,
                 devices_error: None,
                 selected: None,
                 file: None,
@@ -146,13 +166,9 @@ pub fn run() -> iced::Result {
                 log: Vec::new(),
                 active_send: None,
                 next_send_id: 1,
-                send_cancel: None,
-                cancel_requested: false,
-                send_progress: None,
                 send_result: None,
-                active_target: None,
                 incoming: Vec::new(),
-                receiver_state: ReceiverStatus::Starting,
+                receiver_state: bus.receiver.status(),
             };
             let task = Task::perform(bluez::list_known_devices(), move |result| {
                 Message::DevicesLoaded {
@@ -180,6 +196,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             app.devices_loaded = true;
+            app.devices_loading = false;
             match result {
                 Ok(devices) => {
                     app.devices = devices;
@@ -193,6 +210,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::RefreshDevices => {
+            if app.devices_loading {
+                return Task::none();
+            }
+            app.devices_loading = true;
             app.devices_request_id += 1;
             let request_id = app.devices_request_id;
             Task::perform(bluez::list_known_devices(), move |result| {
@@ -241,8 +262,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SendClicked => {
-            if let Some(send_id) = app.active_send {
+            if let Some(send_id) = app.active_send.as_ref().map(|send| send.id) {
                 app.log(format!("send already in progress (id {send_id})"));
+                return Task::none();
+            }
+            if app.picking_file {
+                app.log("finish choosing a file before starting a send");
                 return Task::none();
             }
             let Some(device) = resolve_target(&app.devices, app.selected.as_deref()) else {
@@ -261,12 +286,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.next_send_id += 1;
             let (cancel_tx, cancel_rx) = oneshot::channel();
 
-            app.active_send = Some(send_id);
-            app.send_cancel = Some(cancel_tx);
-            app.cancel_requested = false;
-            app.send_progress = None;
+            app.active_send = Some(ActiveSend {
+                id: send_id,
+                target,
+                cancel: Some(cancel_tx),
+                cancel_requested: false,
+                progress: None,
+            });
             app.send_result = None;
-            app.active_target = Some(target);
 
             let tx = app.tx.clone();
             Task::perform(
@@ -289,31 +316,34 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::CancelSend => {
-            match app.send_cancel.take() {
-                Some(cancel) => match cancel.send(()) {
-                    Ok(()) => {
-                        app.cancel_requested = true;
-                        app.log("canceling send…");
+            let line = if let Some(active) = app.active_send.as_mut() {
+                if active.cancel_requested {
+                    "cancel already requested".to_string()
+                } else {
+                    match active.cancel.take() {
+                        Some(cancel) => match cancel.send(()) {
+                            Ok(()) => {
+                                active.cancel_requested = true;
+                                "canceling send…".to_string()
+                            }
+                            Err(_) => "send already finished".to_string(),
+                        },
+                        None => "no send to cancel".to_string(),
                     }
-                    Err(_) => app.log("send already finished"),
-                },
-                None => app.log("no send to cancel"),
-            }
+                }
+            } else {
+                "no send to cancel".to_string()
+            };
+            app.log(line);
             Task::none()
         }
         Message::SendFinished { send_id, result } => {
-            if app.active_send != Some(send_id) {
+            if app.active_send.as_ref().map(|send| send.id) != Some(send_id) {
                 return Task::none();
             }
-            let canceled = app.cancel_requested;
-            let target = app
-                .active_target
-                .take()
-                .unwrap_or_else(|| "the device".to_string());
-            app.active_send = None;
-            app.send_cancel = None;
-            app.cancel_requested = false;
-            app.send_progress = None;
+            let active = app.active_send.take().expect("active send was checked");
+            let canceled = active.cancel_requested;
+            let target = active.target;
 
             let (ok, message) = match result {
                 Ok(summary) => (true, summary),
@@ -337,13 +367,13 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             size,
             status,
         } => {
-            if app.active_send != Some(send_id) {
+            let Some(active) = app.active_send.as_mut().filter(|send| send.id == send_id) else {
                 return Task::none();
-            }
+            };
             let fraction = size
                 .filter(|s| *s > 0)
                 .map(|s| (transferred as f32 / s as f32).clamp(0.0, 1.0));
-            app.send_progress = Some(SendProgressUi {
+            active.progress = Some(SendProgressUi {
                 fraction,
                 detail: send_progress_summary(transferred, size, &status),
             });
@@ -452,148 +482,35 @@ fn subscription(_app: &App) -> Subscription<Message> {
                 let Some(bus) = EVENT_BUS.get() else {
                     return;
                 };
-                let Some(mut rx) = bus.rx_slot.lock().expect("rx slot").take() else {
-                    // The channel was already consumed (subscription re-created):
-                    // surface it instead of dying silently.
-                    let _ = out
-                        .send(Message::Event(Event::ReceiverState(
-                            ReceiverStatus::Off(
-                                "event pump restarted but its channel was already consumed — restart Kalo"
-                                    .into(),
-                            ),
-                        )))
-                        .await;
-                    return;
-                };
-
-                // Keep the receiver alive across transient session-bus
-                // failures instead of permanently consuming the channel.
-                let mut announced = false;
-                let conn = loop {
-                    match Connection::session().await {
-                        Ok(conn) => break conn,
-                        Err(e) => {
-                            if !announced {
-                                if out
-                                    .send(Message::Event(Event::ReceiverState(
-                                        ReceiverStatus::Off(format!(
-                                            "D-Bus session error: {e}; retrying"
-                                        )),
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                announced = true;
-                            }
-                            tokio::time::sleep(DBUS_RETRY).await;
-                        }
-                    }
-                };
-
-                let active = agent::new_active();
-                // obexd restarting drops our registration without calling
-                // Release; watch its bus owner so the retry loop takes the
-                // slot back instead of silently staying "active".
-                match agent::obexd_owner_changes(&conn).await {
-                    Ok(mut changes) => {
-                        let active = active.clone();
-                        let tx = bus.tx.clone();
-                        tokio::spawn(async move {
-                            while changes.next().await.is_some() {
-                                if active.load(Ordering::Relaxed) {
-                                    agent::mark_registration_lost(
-                                        &active,
-                                        &tx,
-                                        "obexd restarted; will retry registration",
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        let _ = bus
-                            .tx
-                            .send(Event::Log(format!("obexd owner watch unavailable: {e}")));
-                    }
-                }
-                let mut exported = match agent::export_agent(
-                    &conn,
-                    bus.pending.clone(),
-                    bus.tx.clone(),
-                    active.clone(),
-                )
-                .await
-                {
-                    Ok(()) => true,
-                    Err(e) => {
-                        if out
-                            .send(Message::Event(Event::ReceiverState(ReceiverStatus::Off(
-                                format!("agent export failed: {e}"),
-                            ))))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        false
-                    }
-                };
-                if exported
-                    && let Err(e) = agent::register_agent(&conn, active.clone(), &bus.tx).await
-                    && out
-                        .send(Message::Event(Event::ReceiverState(ReceiverStatus::Off(
-                            agent::registration_error(&e),
-                        ))))
-                        .await
-                        .is_err()
+                // A broadcast subscription can be re-created without
+                // consuming the bus, unlike the old one-shot receiver.
+                let mut events = bus.sink.subscribe();
+                let initial = bus.receiver.status();
+                if out
+                    .send(Message::Event(Event::ReceiverState(initial)))
+                    .await
+                    .is_err()
                 {
                     return;
                 }
-                if active.load(Ordering::Relaxed) {
-                    agent::sweep_stale_staging_once(&bus.tx);
-                }
-
-                let mut retry = tokio::time::interval(AGENT_RETRY);
-                retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                retry.tick().await; // consume the immediate first tick
+                bus.ensure_receiver_started();
 
                 loop {
-                    tokio::select! {
-                        event = rx.recv() => {
-                            match event {
-                                Some(event) => {
-                                    if out.send(Message::Event(event)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                None => break,
+                    match events.recv().await {
+                        Ok(event) => {
+                            if out.send(Message::Event(event)).await.is_err() {
+                                return;
                             }
                         }
-                        // Poll while the agent object exists, even if obexd
-                        // released it: in-flight transfers may still finish.
-                        _ = tokio::time::sleep(POLL_INTERVAL), if exported => {
-                            agent::poll_pending(&conn, &bus.pending, &bus.downloads, &bus.tx).await;
-                        }
-                        _ = retry.tick(), if !active.load(Ordering::Relaxed) => {
-                            if !exported {
-                                exported = agent::export_agent(
-                                    &conn,
-                                    bus.pending.clone(),
-                                    bus.tx.clone(),
-                                    active.clone(),
-                                )
-                                .await
-                                .is_ok();
-                            }
-                            if exported {
-                                let _ = agent::register_agent(&conn, active.clone(), &bus.tx).await;
-                                if active.load(Ordering::Relaxed) {
-                                    agent::sweep_stale_staging_once(&bus.tx);
-                                }
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            let note = Event::Log(format!(
+                                "UI event stream lagged: {dropped} events dropped; state may be stale"
+                            ));
+                            if out.send(Message::Event(note)).await.is_err() {
+                                return;
                             }
                         }
+                        Err(broadcast::error::RecvError::Closed) => return,
                     }
                 }
             },
@@ -646,10 +563,18 @@ fn view(app: &App) -> Element<'_, Message> {
                 .font(ui::MEDIUM)
                 .color(ui::TEXT_MUTED),
             space().width(Length::Fill),
-            button(text("Refresh").size(12).font(ui::MEDIUM))
-                .padding([5, 10])
-                .style(ui::secondary_button)
-                .on_press(Message::RefreshDevices),
+            button(
+                text(if app.devices_loading {
+                    "Refreshing…"
+                } else {
+                    "Refresh"
+                })
+                .size(12)
+                .font(ui::MEDIUM),
+            )
+            .padding([5, 10])
+            .style(ui::secondary_button)
+            .on_press_maybe((!app.devices_loading).then_some(Message::RefreshDevices)),
         ]
         .width(Length::Fill)
         .align_y(Alignment::Center),
@@ -1093,13 +1018,14 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
 }
 
 fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, Message> {
-    if let Some(progress) = &app.send_progress {
-        let target_label = app
-            .active_target
-            .as_deref()
-            .unwrap_or("the selected device");
+    if let Some(active) = &app.active_send {
+        let progress = active.progress.as_ref();
+        let fraction = progress.and_then(|progress| progress.fraction);
+        let detail = progress
+            .map(|progress| progress.detail.clone())
+            .unwrap_or_else(|| "Preparing transfer…".to_string());
         let mut top = row![
-            text(format!("Sending to {target_label}"))
+            text(format!("Sending to {}", active.target))
                 .size(14)
                 .font(ui::SEMIBOLD)
                 .color(ui::TEXT)
@@ -1107,7 +1033,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         ]
         .spacing(10)
         .align_y(Alignment::Center);
-        if let Some(fraction) = progress.fraction {
+        if let Some(fraction) = fraction {
             top = top.push(
                 text(format!("{:.0}%", fraction * 100.0))
                     .size(13)
@@ -1117,7 +1043,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         }
 
         let cancel = button(
-            text(if app.cancel_requested {
+            text(if active.cancel_requested {
                 "Canceling…"
             } else {
                 "Cancel"
@@ -1127,10 +1053,10 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         )
         .padding([7, 12])
         .style(ui::secondary_button)
-        .on_press_maybe((!app.cancel_requested).then_some(Message::CancelSend));
+        .on_press_maybe((!active.cancel_requested).then_some(Message::CancelSend));
 
         let bottom = row![
-            text(progress.detail.clone())
+            text(detail)
                 .size(12)
                 .color(ui::TEXT_SECONDARY)
                 .width(Length::Fill),
@@ -1140,7 +1066,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         .align_y(Alignment::Center);
 
         let mut block = column![top].spacing(8);
-        if let Some(fraction) = progress.fraction {
+        if let Some(fraction) = fraction {
             block = block.push(
                 progress_bar(0.0..=1.0, fraction)
                     .girth(Length::Fixed(6.0))
@@ -1150,7 +1076,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         return block.push(bottom).into();
     }
 
-    let can_send = target.is_some() && app.file.is_some();
+    let can_send = target.is_some() && app.file.is_some() && !app.picking_file;
     let guidance = match (target.is_some(), app.file.is_some()) {
         (false, false) => "Select a device and choose a file.",
         (false, true) => "Select a device to send this file.",
@@ -1430,12 +1356,12 @@ mod tests {
     }
 
     fn app() -> App {
-        let (tx, _rx) = unbounded_channel();
         App {
-            tx,
+            tx: EventSink::new(64),
             devices: vec![device("AA:BB", "phone")],
             devices_request_id: 1,
             devices_loaded: true,
+            devices_loading: false,
             devices_error: None,
             selected: Some("AA:BB".into()),
             file: Some(PathBuf::from("/tmp/kalo-test-file")),
@@ -1443,14 +1369,24 @@ mod tests {
             log: Vec::new(),
             active_send: None,
             next_send_id: 1,
-            send_cancel: None,
-            cancel_requested: false,
-            send_progress: None,
             send_result: None,
-            active_target: None,
             incoming: Vec::new(),
             receiver_state: ReceiverStatus::Starting,
         }
+    }
+
+    fn active_send(id: u64) -> ActiveSend {
+        ActiveSend {
+            id,
+            target: "phone (AA:BB)".into(),
+            cancel: None,
+            cancel_requested: false,
+            progress: None,
+        }
+    }
+
+    fn active_id(app: &App) -> Option<u64> {
+        app.active_send.as_ref().map(|send| send.id)
     }
 
     #[test]
@@ -1481,11 +1417,11 @@ mod tests {
     fn second_send_click_is_ignored() {
         let mut app = app();
         let _ = update(&mut app, Message::SendClicked);
-        assert_eq!(app.active_send, Some(1));
+        assert_eq!(active_id(&app), Some(1));
         assert_eq!(app.next_send_id, 2);
 
         let _ = update(&mut app, Message::SendClicked);
-        assert_eq!(app.active_send, Some(1));
+        assert_eq!(active_id(&app), Some(1));
         assert_eq!(app.next_send_id, 2);
         assert!(
             app.log
@@ -1495,9 +1431,67 @@ mod tests {
     }
 
     #[test]
+    fn send_waits_for_the_file_picker_to_finish() {
+        let mut app = app();
+        app.picking_file = true;
+        let _ = update(&mut app, Message::SendClicked);
+        assert!(app.active_send.is_none());
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("finish choosing a file"))
+        );
+    }
+
+    #[test]
+    fn cancel_is_available_before_progress_arrives() {
+        let mut app = app();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        app.active_send = Some(ActiveSend {
+            cancel: Some(cancel_tx),
+            ..active_send(1)
+        });
+
+        let _ = update(&mut app, Message::CancelSend);
+        assert!(matches!(cancel_rx.try_recv(), Ok(())));
+        assert!(
+            app.active_send
+                .as_ref()
+                .is_some_and(|send| send.cancel_requested)
+        );
+
+        let _ = update(&mut app, Message::CancelSend);
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("already requested"))
+        );
+    }
+
+    #[test]
+    fn refresh_is_ignored_while_a_load_is_in_flight() {
+        let mut app = app();
+        let _ = update(&mut app, Message::RefreshDevices);
+        assert!(app.devices_loading);
+        let request_id = app.devices_request_id;
+
+        let _ = update(&mut app, Message::RefreshDevices);
+        assert_eq!(app.devices_request_id, request_id);
+
+        let _ = update(
+            &mut app,
+            Message::DevicesLoaded {
+                request_id,
+                result: Ok(vec![]),
+            },
+        );
+        assert!(!app.devices_loading);
+    }
+
+    #[test]
     fn stale_finished_message_does_not_clear_active_send() {
         let mut app = app();
-        app.active_send = Some(2);
+        app.active_send = Some(active_send(2));
         let _ = update(
             &mut app,
             Message::SendFinished {
@@ -1505,7 +1499,7 @@ mod tests {
                 result: Ok("old".into()),
             },
         );
-        assert_eq!(app.active_send, Some(2));
+        assert_eq!(active_id(&app), Some(2));
 
         let _ = update(
             &mut app,
@@ -1514,14 +1508,14 @@ mod tests {
                 result: Ok("new".into()),
             },
         );
-        assert_eq!(app.active_send, None);
+        assert!(app.active_send.is_none());
         assert!(app.log.iter().any(|line| line.contains("new")));
     }
 
     #[test]
     fn stale_send_progress_is_ignored() {
         let mut app = app();
-        app.active_send = Some(2);
+        app.active_send = Some(active_send(2));
         let _ = handle_event(
             &mut app,
             Event::SendProgress {
@@ -1531,7 +1525,11 @@ mod tests {
                 status: crate::events::TransferStatus::Active,
             },
         );
-        assert!(app.send_progress.is_none());
+        assert!(
+            app.active_send
+                .as_ref()
+                .is_some_and(|send| send.progress.is_none())
+        );
 
         let _ = handle_event(
             &mut app,
@@ -1542,7 +1540,11 @@ mod tests {
                 status: crate::events::TransferStatus::Active,
             },
         );
-        assert!(app.send_progress.is_some());
+        assert!(
+            app.active_send
+                .as_ref()
+                .is_some_and(|send| send.progress.is_some())
+        );
     }
 
     #[test]
@@ -1629,8 +1631,7 @@ mod tests {
     #[test]
     fn finished_send_sets_inline_result_until_the_next_choice() {
         let mut app = app();
-        app.active_send = Some(1);
-        app.active_target = Some("phone (AA:BB)".into());
+        app.active_send = Some(active_send(1));
         let _ = update(
             &mut app,
             Message::SendFinished {
@@ -1660,7 +1661,7 @@ mod tests {
     #[test]
     fn send_progress_without_size_stays_indeterminate() {
         let mut app = app();
-        app.active_send = Some(1);
+        app.active_send = Some(active_send(1));
         let _ = handle_event(
             &mut app,
             Event::SendProgress {
@@ -1670,7 +1671,11 @@ mod tests {
                 status: crate::events::TransferStatus::Active,
             },
         );
-        let progress = app.send_progress.as_ref().expect("progress");
+        let progress = app
+            .active_send
+            .as_ref()
+            .and_then(|send| send.progress.as_ref())
+            .expect("progress");
         assert!(progress.fraction.is_none());
         assert_eq!(progress.detail, "5 B sent");
     }
