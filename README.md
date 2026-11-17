@@ -25,7 +25,7 @@ has not yet been validated on Windows hardware.
 - CLI commands for adapters, discovery, pairing, diagnostics and transfers.
 - A native Windows backend with the same UI, CLI and event contract as Linux.
 - Self-contained Ubuntu `.deb` and Arch Linux `kalo-git` package builds; no
-  background daemon to enable on Linux. Windows packaging is still pending.
+  background daemon to enable on Linux. Windows builds a portable ZIP.
 
 ## Platform support
 
@@ -33,7 +33,7 @@ has not yet been validated on Windows hardware.
 | --- | --- |
 | Ubuntu | Supported: build the native `.deb` with `packaging/ubuntu/build-deb.sh` |
 | Arch Linux | Supported: build `kalo-git` with `packaging/arch/PKGBUILD` (AUR publication pending) |
-| Windows | Experimental: native WinRT RFCOMM/OBEX backend. Builds, but has not been tested on Windows hardware yet; packaging is pending |
+| Windows | Experimental: native WinRT RFCOMM/OBEX backend with a portable ZIP build script. Builds, but has not been tested on Windows hardware yet |
 
 See [TODO.md](TODO.md) for the platform roadmap and other outstanding work.
 
@@ -101,6 +101,18 @@ The package declares BlueZ, obexd and the required GUI libraries, and installs
 the same desktop entry, icon and manual page as the Ubuntu build. See
 [packaging/arch/README.md](packaging/arch/README.md) for details. The package is
 not published to the AUR yet.
+
+## Install on Windows (experimental)
+
+Build a portable ZIP from a Windows checkout with the MSVC Rust toolchain:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-zip.ps1
+```
+
+The ZIP is written to `dist\kalo-<version>-<arch>.zip` and contains `kalo.exe`,
+this README and the license. Unpack it and run `kalo.exe`. There is no installer
+yet; see [packaging/windows/README.md](packaging/windows/README.md).
 
 ## Build and run
 
@@ -184,8 +196,8 @@ kalo send AA:BB:CC:DD:EE:FF path/to/file.pdf
   and per-device authorization are implemented.
 - **The Windows backend is experimental and untested on Windows hardware.** It
   compiles and mirrors the Linux behavior, but send, receive, pairing and radio
-  edge cases still need validation on real Windows 10/11 machines. There is no
-  Windows installer yet.
+  edge cases still need validation on real Windows 10/11 machines. Only a
+  portable ZIP is available; there is no Windows installer yet.
 - On Linux, only one OBEX agent can own the agent slot at a time.
 - On Windows, the app must be running to answer pushes; the OPP service is not
   registered as a background task.

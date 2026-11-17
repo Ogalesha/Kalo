@@ -25,7 +25,9 @@
 - [ ] Validate the Windows backend on real Windows 10/11 hardware: send,
       receive, pairing prompts, radio off/on, service conflicts and path
       handling. Remove the experimental label only after that.
-- [ ] Add Windows packaging (MSI or portable ZIP) and code signing.
+- [x] **Windows portable ZIP** — `packaging/windows/build-zip.ps1` builds
+      `dist\kalo-<version>-<arch>.zip` with the executable, README and license.
+- [ ] Add an MSI/WiX installer, Start-menu entry and code signing for Windows.
 
 ## Engineering
 
