@@ -2,7 +2,7 @@
 name = "kalo"
 version = "0.1.0"
 edition = "2024"
-description = "Bluetooth file transfer for Linux"
+description = "Cross-platform Bluetooth file transfer over OBEX Object Push"
 license = "MIT"
 repository = "https://github.com/Ogalesha/Kalo"
 
@@ -16,3 +16,19 @@ rfd = "0.15"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 zbus = "5"
+
+[target.'cfg(windows)'.dependencies]
+obex-protocol = "0.1"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Rfcomm",
+    "Devices_Enumeration",
+    "Devices_Radios",
+    "Networking",
+    "Networking_Sockets",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }

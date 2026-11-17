@@ -18,9 +18,14 @@
       `packaging/arch/`, shared desktop assets and correct BlueZ/obexd/portal
       dependencies.
 - [ ] Test `kalo-git` on a clean Arch install and publish it to the AUR.
-- [ ] **Windows** — the current architecture depends on BlueZ, obexd and D-Bus,
-      so Windows needs a separate Bluetooth/OBEX backend and packaging
-      (MSI or portable ZIP). Keep the UI and event contract shared.
+- [x] **Windows backend (experimental)** — native WinRT RFCOMM transport, OPP
+      sender with progress/cancel/watchdog, incoming OPP service advertisement
+      and streaming receiver, device listing/discovery/pairing, and the shared
+      `platform` facade, event contract and UI.
+- [ ] Validate the Windows backend on real Windows 10/11 hardware: send,
+      receive, pairing prompts, radio off/on, service conflicts and path
+      handling. Remove the experimental label only after that.
+- [ ] Add Windows packaging (MSI or portable ZIP) and code signing.
 
 ## Engineering
 
@@ -29,6 +34,7 @@
       a single receiver status source, stale `Release` isolation, shared
       receiver supervision, discovery cleanup, per-status stall policies,
       interval-based watchdogs, pairing timeouts and periodic staging recovery.
-- [ ] Add CI for `fmt`, `clippy`, tests and package builds.
+- [ ] Add CI for `fmt`, `clippy`, tests, Linux package builds and a Windows
+      cross-target `clippy` check.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
       adapters where the environment allows it.

@@ -8,6 +8,10 @@ use tokio::sync::broadcast;
 /// `org.bluez.obex.Transfer1.Status` as a closed set plus a forward-compatible
 /// escape hatch. BlueZ documents exactly five values; anything else is kept
 /// verbatim so it can be displayed and handled without guessing.
+///
+/// The Windows backend only emits the subset its native OBEX engine can
+/// report; the full vocabulary remains available to the shared renderers.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferStatus {
     Queued,
@@ -18,6 +22,7 @@ pub enum TransferStatus {
     Unknown(String),
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl TransferStatus {
     pub fn parse(raw: &str) -> Self {
         match raw {
@@ -61,7 +66,9 @@ impl fmt::Display for ReceiverStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Starting => f.write_str("starting…"),
-            Self::Active => f.write_str("receiver active — incoming files land in ~/Downloads"),
+            Self::Active => {
+                f.write_str("receiver active — incoming files land in your Downloads folder")
+            }
             Self::Off(reason) => write!(f, "receiver OFF — {reason}"),
         }
     }

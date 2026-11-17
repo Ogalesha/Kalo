@@ -1,21 +1,35 @@
-//! Kalo — file sharing over Bluetooth/Wi-Fi (Ubuntu spike).
+//! Kalo — file sharing over Bluetooth.
 //!
 //! Modules:
+//! - `platform` — platform facade (BlueZ/obexd on Linux, WinRT on Windows)
+//! - `receiver` — shared receiver status contract
+//! - `app`      — Iced UI (devices, send, receiver state, log)
+//! - `events`   — shared event bus between background work and the UI
+//! - `sanitize` — filename safety for untrusted names
+//! - `paths`    — platform filesystem locations
+//!
+//! Linux-only modules:
 //! - `bluez`    — system-bus BlueZ helpers (adapters, devices, discovery, pairing)
 //! - `obex`     — outgoing OPP transfers via obexd (`org.bluez.obex`)
-//! - `agent`    — OBEX agent: incoming pushes → staging → ~/Downloads
-//! - `app`      — Iced UI (devices, send, receiver state, log)
-//! - `events`   — shared event bus between D-Bus work and the UI
-//! - `sanitize` — filename safety for untrusted names
-//! - `paths`    — XDG locations
+//! - `agent`    — OBEX agent: incoming pushes → staging → Downloads
+//!
+//! Windows-only modules:
+//! - `win`      — WinRT RFCOMM OPP sender/receiver and device helpers
 
+#[cfg(not(windows))]
 mod agent;
 mod app;
+#[cfg(not(windows))]
 mod bluez;
 mod events;
+#[cfg(not(windows))]
 mod obex;
 mod paths;
+mod platform;
+mod receiver;
 mod sanitize;
+#[cfg(windows)]
+mod win;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -37,7 +51,7 @@ enum Cmd {
     Adapters,
     /// Show (or set) adapter connectable state — explicit user action
     Connectable {
-        /// "on", "off", or empty to just show
+        /// "on", "off", or empty to just show (Windows supports show only)
         state: Option<String>,
     },
     /// List Bluetooth devices; optionally discover for N seconds first
@@ -51,7 +65,7 @@ enum Cmd {
         /// Device MAC address, e.g. AA:BB:CC:DD:EE:FF
         mac: String,
     },
-    /// Check whether the OBEX agent slot is free (Blueman conflict?)
+    /// Check whether the receiver can start (agent slot / OPP service)
     AgentCheck,
     /// Send a file via Bluetooth OPP
     Send {
@@ -86,11 +100,11 @@ fn main() -> ExitCode {
 async fn cli_main(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Ui => unreachable!("handled above"),
-        Cmd::Adapters => bluez::list_adapters().await,
-        Cmd::Connectable { state } => bluez::connectable(state.as_deref()).await,
-        Cmd::Devices { discovery } => bluez::list_devices(discovery).await,
-        Cmd::Pair { mac } => bluez::pair(&mac).await,
-        Cmd::AgentCheck => agent::agent_check().await,
+        Cmd::Adapters => platform::list_adapters().await,
+        Cmd::Connectable { state } => platform::connectable(state.as_deref()).await,
+        Cmd::Devices { discovery } => platform::list_devices(discovery).await,
+        Cmd::Pair { mac } => platform::pair(&mac).await,
+        Cmd::AgentCheck => platform::agent_check().await,
         Cmd::Send { mac, file } => {
             let events = events::EventSink::new(256);
             let mut rx = events.subscribe();
@@ -113,7 +127,7 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
                     }
                 }
             });
-            let summary = obex::send(&mac, &file, &events, 0, None).await;
+            let summary = platform::send(&mac, &file, &events, 0, None).await;
             drop(events);
             let _ = printer.await;
             match summary {
@@ -124,6 +138,6 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
                 Err(e) => Err(e),
             }
         }
-        Cmd::Receive => agent::receive().await,
+        Cmd::Receive => platform::receive().await,
     }
 }

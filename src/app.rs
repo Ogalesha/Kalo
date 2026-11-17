@@ -10,13 +10,11 @@ use iced::{Alignment, Color, Element, Font, Length, Padding, Subscription, Task}
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 
-use crate::agent::{self, PendingTransfers, ReceiverHandle, new_pending};
-use crate::bluez::{self, DeviceInfo};
 use crate::events::{
     Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
 };
-use crate::obex;
 use crate::paths;
+use crate::platform::{self, DeviceInfo, PendingTransfers, ReceiverHandle, new_pending};
 
 /// Shared handles for the event-pump subscription. iced 0.14 builds
 /// subscriptions from plain `fn` builders, so the state must be static.
@@ -38,7 +36,7 @@ impl EventBus {
         if STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
-        tokio::spawn(agent::run_receiver(
+        tokio::spawn(platform::run_receiver(
             self.receiver.clone(),
             self.pending.clone(),
             self.downloads.clone(),
@@ -170,7 +168,7 @@ pub fn run() -> iced::Result {
                 incoming: Vec::new(),
                 receiver_state: bus.receiver.status(),
             };
-            let task = Task::perform(bluez::list_known_devices(), move |result| {
+            let task = Task::perform(platform::list_known_devices(), move |result| {
                 Message::DevicesLoaded {
                     request_id: initial_request_id,
                     result: result.map_err(|e| e.to_string()),
@@ -216,7 +214,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.devices_loading = true;
             app.devices_request_id += 1;
             let request_id = app.devices_request_id;
-            Task::perform(bluez::list_known_devices(), move |result| {
+            Task::perform(platform::list_known_devices(), move |result| {
                 Message::DevicesLoaded {
                     request_id,
                     result: result.map_err(|e| e.to_string()),
@@ -298,7 +296,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let tx = app.tx.clone();
             Task::perform(
                 async move {
-                    obex::send(&mac, &file, &tx, send_id, Some(cancel_rx))
+                    platform::send(&mac, &file, &tx, send_id, Some(cancel_rx))
                         .await
                         .map(|summary| {
                             format!(
