@@ -7,19 +7,31 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use zbus::Connection;
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::Connection;
 
-use crate::events::Event;
+use crate::events::{Event, TransferStatus};
 
 /// How often the transfer status is re-read as a safety net: D-Bus
 /// property-change signals are not replayed to late subscribers, so the
 /// loop must never rely on them alone.
 const STATUS_TICK: Duration = Duration::from_secs(2);
+
+/// How long a transfer may sit in each non-terminal state without observable
+/// progress before it is considered stalled. These are deliberately
+/// conservative; `suspended` is a legitimate state and gets the longest
+/// deadline. The user can still cancel explicitly.
+const QUEUED_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTIVE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+const SUSPENDED_TIMEOUT: Duration = Duration::from_secs(600);
+const UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const STATUS_ERROR_LIMIT: u32 = 3;
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[proxy(
     default_service = "org.bluez.obex",
@@ -55,6 +67,7 @@ trait Transfer {
     fn status(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn transferred(&self) -> zbus::Result<u64>;
+    fn cancel(&self) -> zbus::Result<()>;
 }
 
 /// Summary of a completed outgoing transfer.
@@ -66,15 +79,32 @@ pub struct SendSummary {
     pub mbps: f64,
 }
 
+impl SendSummary {
+    pub fn line(&self) -> String {
+        format!(
+            "sent {} bytes to {} in {:.1}s ({:.2} MB/s)",
+            self.bytes, self.mac, self.elapsed_secs, self.mbps
+        )
+    }
+}
+
 /// Send one file to `mac` via OPP, streaming progress into `events`.
-pub async fn send(mac: &str, file: &Path, events: &UnboundedSender<Event>) -> Result<SendSummary> {
+///
+/// `send_id` is echoed in every progress event so the UI can discard progress
+/// from a previous or concurrent send. `cancel` is optional; when it resolves,
+/// the OBEX transfer is cancelled and the session is torn down.
+pub async fn send(
+    mac: &str,
+    file: &Path,
+    events: &UnboundedSender<Event>,
+    send_id: u64,
+    cancel: Option<oneshot::Receiver<()>>,
+) -> Result<SendSummary> {
     let file = file.canonicalize().context("file not found")?;
     let conn = Connection::session().await?;
     let client = ClientProxy::new(&conn).await?;
 
-    events
-        .send(Event::Log(format!("opening OPP session to {mac}…")))
-        .ok();
+    let _ = events.send(Event::Log(format!("opening OPP session to {mac}…")));
     let mut args: HashMap<&str, Value<'_>> = HashMap::new();
     args.insert("Target", Value::new("opp"));
     let session = client
@@ -84,8 +114,10 @@ pub async fn send(mac: &str, file: &Path, events: &UnboundedSender<Event>) -> Re
 
     // From here on the session must always be torn down, including on
     // early failures (send_file, proxy setup, stream errors).
-    let outcome = push_to_session(&conn, &session, &file, events).await;
-    let _ = client.remove_session(session).await;
+    let outcome = push_to_session(&conn, &session, &file, events, send_id, cancel).await;
+    if let Err(e) = client.remove_session(session).await {
+        let _ = events.send(Event::Log(format!("remove OPP session failed: {e}")));
+    }
 
     let (bytes, elapsed_secs) = outcome?;
     Ok(SendSummary {
@@ -103,6 +135,8 @@ async fn push_to_session(
     session: &OwnedObjectPath,
     file: &Path,
     events: &UnboundedSender<Event>,
+    send_id: u64,
+    cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<(u64, f64)> {
     let started = Instant::now();
     let push = ObjectPushProxy::builder(conn)
@@ -111,7 +145,12 @@ async fn push_to_session(
         .await?;
 
     let (transfer, props) = push.send_file(file.to_string_lossy().as_ref()).await?;
-    let size = props.get("Size").and_then(|v| v.downcast_ref::<u64>().ok());
+    // `Size` is optional in the BlueZ API (absent when unknown). Fall back to
+    // the local file size so the UI can still render a meaningful fraction.
+    let size = props
+        .get("Size")
+        .and_then(|v| v.downcast_ref::<u64>().ok())
+        .or_else(|| std::fs::metadata(file).ok().map(|m| m.len()));
 
     let transfer_proxy = TransferProxy::builder(conn)
         .path(transfer.as_str())?
@@ -121,59 +160,174 @@ async fn push_to_session(
     // Property-change signals are not replayed to late subscribers: read the
     // current status once so an already-terminal transfer cannot hang the
     // loop below.
-    let mut status = transfer_proxy
-        .status()
-        .await
-        .context("transfer status unavailable")?;
+    let mut status = TransferStatus::parse(
+        &transfer_proxy
+            .status()
+            .await
+            .context("transfer status unavailable")?,
+    );
 
     let mut status_stream = transfer_proxy.receive_status_changed().await;
     let mut transferred_stream = transfer_proxy.receive_transferred_changed().await;
+    let mut cancel = cancel;
+    let mut status_since = Instant::now();
+    let mut last_progress_at = Instant::now();
+    let mut last_transferred = 0u64;
+    let mut status_errors = 0u32;
 
-    while !is_terminal(&status) {
+    while !status.is_terminal() {
         tokio::select! {
             Some(change) = status_stream.next() => {
-                status = change.get().await.unwrap_or_default();
-                let transferred = transfer_proxy.transferred().await.unwrap_or(0);
-                events
-                    .send(Event::SendProgress {
-                        transferred,
-                        size,
-                        status: status.clone(),
-                    })
-                    .ok();
+                match change.get().await {
+                    Ok(raw) => {
+                        status_errors = 0;
+                        let next = TransferStatus::parse(&raw);
+                        if next != status {
+                            status = next;
+                            status_since = Instant::now();
+                        }
+                        let transferred = transfer_proxy.transferred().await.unwrap_or(last_transferred);
+                        if transferred != last_transferred {
+                            last_transferred = transferred;
+                            last_progress_at = Instant::now();
+                        }
+                        let _ = events.send(Event::SendProgress {
+                            send_id,
+                            transferred,
+                            size,
+                            status: status.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = events.send(Event::Log(format!("transfer status signal failed: {e}")));
+                    }
+                }
             }
             Some(change) = transferred_stream.next() => {
-                let transferred = change.get().await.unwrap_or(0);
-                events
-                    .send(Event::SendProgress {
-                        transferred,
-                        size,
-                        status: status.clone(),
-                    })
-                    .ok();
+                let transferred = match change.get().await {
+                    Ok(transferred) => transferred,
+                    Err(_) => last_transferred,
+                };
+                if transferred != last_transferred {
+                    last_transferred = transferred;
+                    last_progress_at = Instant::now();
+                }
+                let _ = events.send(Event::SendProgress {
+                    send_id,
+                    transferred,
+                    size,
+                    status: status.clone(),
+                });
             }
-            // Safety net for missed property-change signals: re-read the
-            // status periodically so the loop cannot hang forever.
+            // Safety net for missed property-change signals and a place to
+            // enforce the stall watchdog.
             _ = tokio::time::sleep(STATUS_TICK) => {
-                status = transfer_proxy
-                    .status()
-                    .await
-                    .context("transfer object disappeared")?;
+                match transfer_proxy.status().await {
+                    Ok(raw) => {
+                        status_errors = 0;
+                        let next = TransferStatus::parse(&raw);
+                        if next != status {
+                            status = next;
+                            status_since = Instant::now();
+                        }
+                        let transferred = transfer_proxy
+                            .transferred()
+                            .await
+                            .unwrap_or(last_transferred);
+                        if transferred != last_transferred {
+                            last_transferred = transferred;
+                            last_progress_at = Instant::now();
+                        }
+                        if status.is_terminal() {
+                            let _ = events.send(Event::SendProgress {
+                                send_id,
+                                transferred,
+                                size,
+                                status: status.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        status_errors += 1;
+                        if status_errors >= STATUS_ERROR_LIMIT {
+                            bail!("transfer status unavailable after {status_errors} attempts: {e}");
+                        }
+                        let _ = events.send(Event::Log(format!(
+                            "transfer status read failed ({status_errors}/{STATUS_ERROR_LIMIT}): {e}"
+                        )));
+                    }
+                }
+
+                if let Some(reason) = stall_reason(
+                    &status,
+                    status_since.elapsed(),
+                    last_progress_at.elapsed(),
+                ) {
+                    let _ = events.send(Event::Log(reason.clone()));
+                    bail!(reason);
+                }
+            }
+            _ = wait_cancel(&mut cancel) => {
+                let _ = tokio::time::timeout(CANCEL_TIMEOUT, transfer_proxy.cancel()).await;
+                let _ = events.send(Event::Log("send canceled".into()));
+                bail!("send canceled");
             }
         }
     }
 
     let elapsed_secs = started.elapsed().as_secs_f64();
-    let bytes = transfer_proxy.transferred().await.unwrap_or(0);
-    if status == "error" {
-        anyhow::bail!("transfer failed (status=error)");
+    let transferred = transfer_proxy
+        .transferred()
+        .await
+        .unwrap_or(last_transferred);
+    // A completed transfer has sent the whole file. Prefer the known size so
+    // a transient final property read cannot report a 0-byte success.
+    let bytes = transferred.max(size.unwrap_or(0));
+    if status == TransferStatus::Error {
+        bail!("transfer failed (status=error)");
     }
     Ok((bytes, elapsed_secs))
 }
 
-/// Terminal `org.bluez.obex.Transfer1.Status` values (pure, unit-tested).
-fn is_terminal(status: &str) -> bool {
-    status == "complete" || status == "error"
+/// Resolve a cancel request. With no receiver this future never completes, so
+/// the `select!` branch stays disabled without an extra flag.
+async fn wait_cancel(cancel: &mut Option<oneshot::Receiver<()>>) {
+    match cancel {
+        Some(rx) => {
+            let _ = rx.await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Pure stall policy (unit-tested). `status_since` is the time spent in the
+/// current status; `progress_since` is the time since `Transferred` last
+/// changed.
+fn stall_reason(
+    status: &TransferStatus,
+    status_since: Duration,
+    progress_since: Duration,
+) -> Option<String> {
+    match status {
+        TransferStatus::Complete | TransferStatus::Error => None,
+        TransferStatus::Queued if status_since > QUEUED_TIMEOUT => Some(format!(
+            "transfer stayed queued for more than {}s",
+            QUEUED_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Active if progress_since > ACTIVE_STALL_TIMEOUT => Some(format!(
+            "transfer made no progress for more than {}s",
+            ACTIVE_STALL_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Suspended if status_since > SUSPENDED_TIMEOUT => Some(format!(
+            "transfer stayed suspended for more than {}s",
+            SUSPENDED_TIMEOUT.as_secs()
+        )),
+        TransferStatus::Unknown(raw) if status_since > UNKNOWN_TIMEOUT => Some(format!(
+            "transfer stuck in unknown status '{raw}' for more than {}s",
+            UNKNOWN_TIMEOUT.as_secs()
+        )),
+        _ => None,
+    }
 }
 
 fn mbps(bytes: u64, elapsed_secs: f64) -> f64 {
@@ -187,14 +341,70 @@ fn mbps(bytes: u64, elapsed_secs: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::send_progress_line;
 
     #[test]
     fn terminal_status_values() {
-        assert!(is_terminal("complete"));
-        assert!(is_terminal("error"));
-        assert!(!is_terminal("queued"));
-        assert!(!is_terminal("active"));
-        assert!(!is_terminal("suspended"));
-        assert!(!is_terminal(""));
+        assert!(TransferStatus::parse("complete").is_terminal());
+        assert!(TransferStatus::parse("error").is_terminal());
+        for status in ["queued", "active", "suspended", "", "cancelled"] {
+            assert!(!TransferStatus::parse(status).is_terminal(), "{status}");
+        }
+    }
+
+    #[test]
+    fn stall_policy_is_conservative() {
+        let ok = Duration::from_secs(0);
+        assert!(stall_reason(&TransferStatus::Complete, ok, ok).is_none());
+        assert!(stall_reason(&TransferStatus::Error, ok, ok).is_none());
+        assert!(stall_reason(&TransferStatus::Queued, Duration::from_secs(31), ok).is_some());
+        assert!(stall_reason(&TransferStatus::Queued, Duration::from_secs(29), ok).is_none());
+        assert!(
+            stall_reason(
+                &TransferStatus::Active,
+                Duration::from_secs(1),
+                Duration::from_secs(121)
+            )
+            .is_some()
+        );
+        assert!(
+            stall_reason(
+                &TransferStatus::Active,
+                Duration::from_secs(1),
+                Duration::from_secs(119)
+            )
+            .is_none()
+        );
+        assert!(stall_reason(&TransferStatus::Suspended, Duration::from_secs(601), ok).is_some());
+        assert!(
+            stall_reason(
+                &TransferStatus::Unknown("weird".into()),
+                Duration::from_secs(61),
+                ok
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn summary_line_is_shared_by_ui_and_cli() {
+        let summary = SendSummary {
+            mac: "AA:BB".into(),
+            bytes: 1024,
+            elapsed_secs: 2.0,
+            mbps: 0.5,
+        };
+        assert_eq!(
+            summary.line(),
+            "sent 1024 bytes to AA:BB in 2.0s (0.50 MB/s)"
+        );
+    }
+
+    #[test]
+    fn progress_line_is_shared_by_ui_and_cli() {
+        assert_eq!(
+            send_progress_line(1, Some(2), &TransferStatus::Active),
+            "send active: 1/2 bytes"
+        );
     }
 }

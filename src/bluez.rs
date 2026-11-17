@@ -1,12 +1,12 @@
 //! Read-mostly helpers over the system-bus BlueZ API (`org.bluez`).
 //!
-//! Nothing here mutates system configuration; the `connectable on/off` and
-//! `pair` commands are explicit user actions.
+//! Discovery, `connectable on/off` and `pair` are explicit user actions; the
+//! rest only reads state.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
@@ -20,15 +20,15 @@ pub struct DeviceInfo {
     pub connected: bool,
 }
 
+type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+
 #[proxy(
     default_service = "org.bluez",
     default_path = "/",
     interface = "org.freedesktop.DBus.ObjectManager"
 )]
 trait BluezObjects {
-    fn get_managed_objects(
-        &self,
-    ) -> zbus::Result<HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>>;
+    fn get_managed_objects(&self) -> zbus::Result<ManagedObjects>;
 }
 
 #[proxy(
@@ -79,6 +79,29 @@ fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Pick a powered adapter when possible, otherwise the first one in stable
+/// lexicographic order. This keeps the CLI working when the adapter is not
+/// `hci0` or when the first adapter is powered off.
+async fn adapter_path(conn: &zbus::Connection) -> Result<OwnedObjectPath> {
+    let om = BluezObjectsProxy::new(conn).await?;
+    let objects = om.get_managed_objects().await?;
+    let mut paths: Vec<(OwnedObjectPath, bool)> = objects
+        .into_iter()
+        .filter_map(|(path, interfaces)| {
+            let props = interfaces.get("org.bluez.Adapter1")?;
+            Some((path, prop_bool(props, "Powered")))
+        })
+        .collect();
+    paths.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let picked = paths
+        .iter()
+        .find(|(_, powered)| *powered)
+        .or_else(|| paths.first());
+    picked
+        .map(|(path, _)| path.clone())
+        .ok_or_else(|| anyhow!("no Bluetooth adapters found"))
+}
+
 /// All devices BlueZ currently knows about (paired, trusted or recently seen).
 pub async fn list_known_devices() -> Result<Vec<DeviceInfo>> {
     let conn = zbus::Connection::system().await?;
@@ -89,18 +112,18 @@ pub async fn list_known_devices() -> Result<Vec<DeviceInfo>> {
     for (_path, interfaces) in objects {
         if let Some(props) = interfaces.get("org.bluez.Device1") {
             devices.push(DeviceInfo {
-                address: prop_str(&props, "Address"),
+                address: prop_str(props, "Address"),
                 alias: {
-                    let alias = prop_str(&props, "Alias");
+                    let alias = prop_str(props, "Alias");
                     if alias.is_empty() {
-                        prop_str(&props, "Address")
+                        prop_str(props, "Address")
                     } else {
                         alias
                     }
                 },
-                paired: prop_bool(&props, "Paired"),
-                trusted: prop_bool(&props, "Trusted"),
-                connected: prop_bool(&props, "Connected"),
+                paired: prop_bool(props, "Paired"),
+                trusted: prop_bool(props, "Trusted"),
+                connected: prop_bool(props, "Connected"),
             });
         }
     }
@@ -138,7 +161,11 @@ pub async fn list_adapters() -> Result<()> {
 /// CLI: show or set the adapter `Connectable` property (explicit user action).
 pub async fn connectable(state: Option<&str>) -> Result<()> {
     let conn = zbus::Connection::system().await?;
-    let adapter = AdapterProxy::new(&conn).await?;
+    let path = adapter_path(&conn).await?;
+    let adapter = AdapterProxy::builder(&conn)
+        .path(path.as_str())?
+        .build()
+        .await?;
     match state {
         None | Some("status") => {
             println!("address     = {}", adapter.address().await?);
@@ -160,21 +187,51 @@ pub async fn connectable(state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a discovery window needs to start and stop discovery. A session
+/// that was already running belongs to another client and must be left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryPlan {
+    start: bool,
+    stop: bool,
+}
+
+fn discovery_plan(already_discovering: bool) -> DiscoveryPlan {
+    if already_discovering {
+        DiscoveryPlan {
+            start: false,
+            stop: false,
+        }
+    } else {
+        DiscoveryPlan {
+            start: true,
+            stop: true,
+        }
+    }
+}
+
 /// CLI: list devices, optionally after a discovery window.
 pub async fn list_devices(discovery: Option<u64>) -> Result<()> {
     if let Some(secs) = discovery {
         let conn = zbus::Connection::system().await?;
-        let adapter = AdapterProxy::new(&conn).await?;
+        let path = adapter_path(&conn).await?;
+        let adapter = AdapterProxy::builder(&conn)
+            .path(path.as_str())?
+            .build()
+            .await?;
         if !adapter.powered().await? {
             bail!("the adapter is powered off");
         }
-        if !adapter.discovering().await? {
+        let plan = discovery_plan(adapter.discovering().await?);
+        if plan.start {
             adapter.start_discovery().await?;
         }
         println!("discovering for {secs}s…");
         tokio::time::sleep(Duration::from_secs(secs)).await;
-        if adapter.discovering().await? {
-            let _ = adapter.stop_discovery().await;
+        if plan.stop
+            && adapter.discovering().await?
+            && let Err(e) = adapter.stop_discovery().await
+        {
+            eprintln!("warning: failed to stop discovery: {e}");
         }
     }
 
@@ -205,10 +262,10 @@ pub async fn pair(mac: &str) -> Result<()> {
     let want = mac.to_uppercase();
     let mut device_path: Option<String> = None;
     for (path, interfaces) in &objects {
-        if let Some(props) = interfaces.get("org.bluez.Device1") {
-            if prop_str(props, "Address").to_uppercase() == want {
-                device_path = Some(path.as_str().to_string());
-            }
+        if let Some(props) = interfaces.get("org.bluez.Device1")
+            && prop_str(props, "Address").to_uppercase() == want
+        {
+            device_path = Some(path.as_str().to_string());
         }
     }
     let Some(path) = device_path else {
@@ -229,4 +286,27 @@ pub async fn pair(mac: &str) -> Result<()> {
     device.pair().await.context("pairing failed")?;
     println!("paired ✔");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_is_only_stopped_when_kalo_started_it() {
+        assert_eq!(
+            discovery_plan(true),
+            DiscoveryPlan {
+                start: false,
+                stop: false
+            }
+        );
+        assert_eq!(
+            discovery_plan(false),
+            DiscoveryPlan {
+                start: true,
+                stop: true
+            }
+        );
+    }
 }

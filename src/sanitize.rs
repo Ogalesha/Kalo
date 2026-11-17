@@ -1,5 +1,7 @@
 //! Filename safety helpers for untrusted (remote-provided) file names.
 
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Sanitize an untrusted filename (e.g. the OPP `Name` header): strip path
@@ -48,17 +50,50 @@ pub fn unique_in_dir(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem}-{}", uuid::Uuid::new_v4().simple()))
 }
 
-/// Move a file, atomically when possible (rename), copy+delete otherwise.
-pub fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            std::fs::copy(src, dst)?;
-            std::fs::remove_file(src)?;
+/// Move a file without replacing an existing destination.
+///
+/// On the same filesystem a hard link is atomic and fails with `AlreadyExists`
+/// instead of overwriting. When hard links are unavailable (typically
+/// cross-device), copy into a freshly created destination and only then
+/// remove the source. A failed copy removes its partial destination.
+pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(src) {
+                let _ = std::fs::remove_file(dst);
+                return Err(e);
+            }
             Ok(())
         }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(e) if link_fallback(&e) => copy_no_replace(src, dst),
         Err(e) => Err(e),
     }
+}
+
+/// Errors that mean "hard links are not usable here" rather than "this move
+/// is invalid". The copy path still uses `create_new`, so it cannot overwrite.
+fn link_fallback(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::CrossesDevices
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::PermissionDenied
+    )
+}
+
+fn copy_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut input = File::open(src)?;
+    let mut output = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    if let Err(e) = io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+        let _ = std::fs::remove_file(dst);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::remove_file(src) {
+        let _ = std::fs::remove_file(dst);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -108,6 +143,22 @@ mod tests {
         move_file(&src, &dst).unwrap();
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_file_refuses_to_overwrite_existing_destination() {
+        let dir = std::env::temp_dir().join(format!("kalo-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"keep").unwrap();
+
+        let err = move_file(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"new");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

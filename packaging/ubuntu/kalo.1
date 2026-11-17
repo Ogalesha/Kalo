@@ -1,0 +1,53 @@
+.TH KALO 1 "November 2026" "Kalo" "User Commands"
+.SH NAME
+kalo \- send and receive files over Bluetooth
+.SH SYNOPSIS
+.B kalo
+[\fISUBCOMMAND\fR]
+.SH DESCRIPTION
+.B kalo
+is a small Bluetooth file-sharing application. With no subcommand it opens
+the graphical window. Files are sent and received with the Object Push
+Profile (OPP) through BlueZ and obexd; incoming files are saved to the user's
+Downloads directory.
+.PP
+The receiver registers an OBEX agent on the session bus. Only one agent can
+own that slot at a time (for example, Blueman's transfer service may hold it).
+.SH COMMANDS
+.TP
+.B ui
+Open the graphical application (the default).
+.TP
+.B adapters
+List Bluetooth adapters and their state.
+.TP
+.B connectable \fR[\fIon\fR|\fIoff\fR]
+Show or change the adapter's connectable state.
+.TP
+.B devices \fR[\fB\-\-discovery\fR \fISECONDS\fR]
+List devices known to BlueZ, optionally after a discovery window.
+.TP
+.B pair \fIMAC\fR
+Pair with a device by address.
+.TP
+.B agent\-check
+Check whether the OBEX agent slot is free and release it again.
+.TP
+.B send \fIMAC\fR \fIFILE\fR
+Send a file to a device over OPP.
+.TP
+.B receive
+Run the receiver in the foreground. Incoming pushes are accepted; this is the
+command-line equivalent of leaving the UI open.
+.SH ENVIRONMENT
+.BR XDG_CACHE_HOME ,
+.B HOME
+Locate obexd's staging directory. Received files are moved to the XDG
+Downloads directory.
+.SH SEE ALSO
+.BR bluetoothctl (1),
+.BR obexctl (1),
+.BR obexd (1)
+.SH BUGS
+Incoming pushes are currently accepted from every device; the trust store is
+not implemented yet.

@@ -99,25 +99,19 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
                         transferred,
                         size,
                         status,
+                        ..
                     } = event
                     {
-                        let line = match size {
-                            Some(size) => format!("{status}: {transferred}/{size} bytes"),
-                            None => format!("{status}: {transferred} bytes"),
-                        };
-                        println!("{line}");
+                        println!("{}", events::send_progress_line(transferred, size, &status));
                     }
                 }
             });
-            let summary = obex::send(&mac, &file, &tx).await;
+            let summary = obex::send(&mac, &file, &tx, 0, None).await;
             drop(tx);
             let _ = printer.await;
             match summary {
                 Ok(summary) => {
-                    println!(
-                        "✔ sent {} bytes to {} in {:.1}s ({:.2} MB/s)",
-                        summary.bytes, summary.mac, summary.elapsed_secs, summary.mbps
-                    );
+                    println!("✔ {}", summary.line());
                     Ok(())
                 }
                 Err(e) => Err(e),

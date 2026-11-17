@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kalo
+GenericName=Bluetooth File Transfer
+Comment=Send and receive files over Bluetooth
+Exec=kalo
+Icon=kalo
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=bluetooth;obex;opp;file;transfer;share;
+StartupNotify=true
