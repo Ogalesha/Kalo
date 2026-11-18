@@ -1,74 +1,98 @@
+<p align="center">
+  <img src="docs/kalo.png" alt="Kalo" width="160">
+</p>
+
 # Kalo
 
-Kalo is a Bluetooth file-transfer app for Linux and Windows. The name comes
-from Albanian: **kalo** means **to pass** — files pass from one device to
-another.
+**Direct Bluetooth file transfers for Linux. Experimental Windows support.**
 
-The current release is a Phase 0 implementation built with Rust and
-[iced](https://iced.rs/). It sends files over Bluetooth OPP/OBEX, receives
-incoming pushes into the user's Downloads folder, and exposes the same
-operations through a small CLI. Linux uses BlueZ and obexd; Windows uses WinRT
-RFCOMM with a built-in OBEX engine. The Windows backend is **experimental** and
-has not yet been validated on Windows hardware.
+Kalo is a native desktop app for sending and receiving files over Bluetooth. Choose a device, pick a file, and send it directly — without cables, an account, or a cloud upload. The name comes from Albanian: **kalo means “to pass”**, like a file passing from one device to another.
+
+Built with **Rust** and **[iced](https://iced.rs/)**, Kalo provides a desktop interface and a command-line interface (CLI). Transfers use **Bluetooth Object Push Profile (OPP/OBEX)**, so the other device must support that profile.
+
+> **Project status — early development (Phase 0).** Ubuntu and Arch Linux are the current Linux targets. A native Windows backend has been implemented, but **has not been validated on real Windows hardware**. GitHub Actions publishes the latest successful Ubuntu `.deb` and experimental Windows builds; Arch Linux packages are built locally from the included `PKGBUILD`.
+
+> **Incoming files and trust:** Kalo asks before accepting a file from a new sender. The desktop UI offers **Allow once**, **Always allow**, **Decline** and **Block**; allow and block decisions are remembered by Bluetooth address. You can also switch the receiver to **Trusted only** and manage remembered senders. The CLI receiver cannot show a prompt, so it rejects unknown senders. On Windows, senders whose Bluetooth address cannot be resolved are never remembered.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/kalo-dark.png" width="49%" alt="Kalo in the dark theme">
+  <img src="docs/screenshots/kalo-light.png" width="49%" alt="Kalo in the light theme">
+</p>
+
+<p align="center"><sub>Dark and light themes, shown with fictional demo data.</sub></p>
 
 ## Features
 
-- Desktop UI with paired-device selection, send progress, live incoming
-  transfers, receiver status and an activity log.
-- Outgoing OPP/OBEX transfers with explicit cancel (including during connection
-  setup) and a stall watchdog.
-- Linux receiver supervision: automatic agent re-registration after obexd or
-  session-bus restarts, plus periodic recovery of abandoned staging files.
-- Incoming pushes are staged, validated and moved into the Downloads folder.
-  Partial files are preserved on errors, cancellation and stalled transfers.
-- Safe handling of untrusted remote filenames.
-- CLI commands for adapters, discovery, pairing, diagnostics and transfers.
-- A native Windows backend with the same UI, CLI and event contract as Linux.
-- Self-contained Ubuntu `.deb` and Arch Linux `kalo-git` package builds; no
-  background daemon to enable on Linux. Windows builds a portable ZIP.
+- **Send files directly:** select a Bluetooth device known to your computer, choose a file, and start an OPP transfer.
+- **Approve incoming senders:** allow a file once, remember the sender, decline, or block. Choose **Trusted only** to reject unknown senders without prompting.
+- **See transfer progress:** follow outgoing transfers and incoming files in the desktop UI.
+- **Cancel a send:** interrupt an outgoing transfer, including during connection setup. Stalled transfers are detected.
+- **Choose where files go:** received files are written to a temporary staging area and moved to your save folder, which defaults to the platform Downloads folder. A completed transfer offers an **Open folder** action.
+- **Switch themes:** use the dark **Kalo Midnight** or light **Kalo Daylight** appearance; the preference is remembered.
+- **Keep Kalo in the panel:** on Linux, closing the window hides it to the status area when a StatusNotifierItem host is available.
+- **Track activity:** view transfer results, errors, and receiver status in the app.
+- **Use the CLI:** inspect adapters and devices, discover and pair, check receiver availability, and send or receive files from a terminal.
+
+Kalo does not use a hosted service for file transfer and does not require sign-in.
 
 ## Platform support
 
-| Platform | Status |
-| --- | --- |
-| Ubuntu | Supported: build the native `.deb` with `packaging/ubuntu/build-deb.sh` |
-| Arch Linux | Supported: build `kalo-git` with `packaging/arch/PKGBUILD` (AUR publication pending) |
-| Windows | Experimental: native WinRT RFCOMM/OBEX backend with a portable ZIP build script. Builds, but has not been tested on Windows hardware yet |
+| Platform | Current status | Packaging |
+| --- | --- | --- |
+| Ubuntu | Supported Linux target | Download the latest `.deb` or build it locally |
+| Arch Linux | Supported Linux target | Build `kalo-git` from the included `PKGBUILD`; not yet published to the AUR |
+| Windows 10/11 | **Experimental; not yet tested on physical Windows hardware** | Download the latest portable ZIP or `.exe`; no installer |
 
-See [TODO.md](TODO.md) for the platform roadmap and other outstanding work.
+## Requirements and compatibility
 
-## Requirements
+- A working Bluetooth adapter on the computer.
+- A recipient that supports **Bluetooth OPP (Object Push Profile)** to receive files. Bluetooth support alone does not guarantee file-transfer compatibility.
+- Pair the devices through your operating system's Bluetooth settings before sending, or use `kalo pair <MAC>` where supported. The desktop UI lists devices already **known to the operating system**; its **Refresh list** button reloads that list, rather than initiating a new discovery scan.
 
-Runtime, on Ubuntu:
+**Ubuntu runtime dependencies:**
 
 ```sh
 sudo apt install bluez bluez-obexd
 ```
 
-On Arch Linux:
+**Arch Linux runtime dependencies:**
 
 ```sh
 sudo pacman -S bluez bluez-obexd
 ```
 
-On Linux, Kalo talks to the system bus (`org.bluez`) and the session bus
-(`org.bluez.obex`). The file picker uses the XDG desktop portal, which is
-installed by default on Ubuntu desktop; on Arch, install
-`xdg-desktop-portal-gtk` (or another portal backend).
+On Linux, Kalo uses BlueZ and `obexd`, plus an XDG desktop portal for the file picker. Ubuntu Desktop typically provides a portal; on Arch, install `xdg-desktop-portal-gtk` or another compatible portal backend if needed. No **separate Kalo daemon** needs to be enabled.
 
-On Windows, runtime requirements are Windows 10 or 11 and a working Bluetooth
-adapter. Kalo uses WinRT directly, so BlueZ, obexd and D-Bus are not needed.
+The Linux status-area icon uses StatusNotifierItem. KDE Plasma, Cinnamon and XFCE provide a host out of the box; GNOME needs an extension such as **AppIndicator and KStatusNotifierItem Support**. Without a compatible host, Kalo closes normally instead of hiding to the tray.
 
-To build from source you also need a recent Rust toolchain (edition 2024;
-Rust 1.98 or newer is known to work) and the usual GUI build dependencies. On
-Arch, `base-devel`, `rust` and `cargo` are enough. On Windows, use the MSVC
-toolchain with Visual Studio Build Tools and the Windows SDK. The release
-packages recommend Vulkan; iced can fall back to software rendering, but a
-working GPU driver gives the best experience.
+On Windows, Kalo uses WinRT Bluetooth APIs and its own RFCOMM/OBEX implementation; BlueZ, `obexd`, and D-Bus are not required. This path is still experimental, and there is no notification-area icon on Windows yet.
 
-## Install on Ubuntu
+To compile from source, use a recent Rust toolchain (edition 2024; Rust 1.98 or newer is documented as working). Windows builds require the MSVC Rust toolchain, Visual Studio Build Tools, and the Windows SDK.
 
-Build the package from a checkout:
+## Install and launch
+
+### Download the latest build
+
+GitHub Actions publishes stable asset names, so these links always resolve to the newest successful build:
+
+- **Ubuntu `.deb`:** [kalo_amd64.deb](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo_amd64.deb)
+- **Windows portable ZIP (experimental):** [kalo-windows-x64.zip](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo-windows-x64.zip)
+- **Windows standalone executable (experimental):** [kalo-windows-x64.exe](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo-windows-x64.exe)
+
+All published builds are listed on the [releases page](https://github.com/Ogalesha/Kalo/releases).
+
+### Ubuntu
+
+Install the downloaded package:
+
+```sh
+sudo apt install ./kalo_amd64.deb
+kalo
+```
+
+Or build from the root of a local checkout:
 
 ```sh
 ./packaging/ubuntu/build-deb.sh
@@ -76,19 +100,13 @@ sudo apt install ./dist/kalo_0.1.0-1_amd64.deb
 kalo
 ```
 
-The `.deb` is built for the architecture and glibc of the machine that builds
-it. Build on the oldest Ubuntu release you need to support. See
-[packaging/ubuntu/README.md](packaging/ubuntu/README.md) for packaging details.
+The locally built `.deb` targets the architecture and glibc version of the build machine; it may not work on older Ubuntu releases. See [Ubuntu packaging notes](packaging/ubuntu/README.md).
 
-Remove Kalo with:
+Remove it with `sudo apt remove kalo`.
 
-```sh
-sudo apt remove kalo
-```
+### Arch Linux
 
-## Install on Arch Linux
-
-The Arch package builds the current `main` branch as `kalo-git`:
+From the root of a local checkout:
 
 ```sh
 sudo pacman -S --needed base-devel git rust cargo
@@ -97,71 +115,66 @@ makepkg -si
 kalo
 ```
 
-The package declares BlueZ, obexd and the required GUI libraries, and installs
-the same desktop entry, icon and manual page as the Ubuntu build. See
-[packaging/arch/README.md](packaging/arch/README.md) for details. The package is
-not published to the AUR yet.
+The package uses the current `main` branch. It is **not yet published to the AUR**. See [Arch packaging notes](packaging/arch/README.md).
 
-## Install on Windows (experimental)
+### Windows (experimental)
 
-Build a portable ZIP from a Windows checkout with the MSVC Rust toolchain:
+Download `kalo-windows-x64.zip`, unpack it, and run `kalo.exe`. You can also download the standalone `kalo-windows-x64.exe`. These builds are unsigned, so Windows SmartScreen may show a warning.
+
+To build from the root of a Windows checkout with the MSVC toolchain installed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\build-zip.ps1
 ```
 
-The ZIP is written to `dist\kalo-<version>-<arch>.zip` and contains `kalo.exe`,
-this README and the license. Unpack it and run `kalo.exe`. There is no installer
-yet; see [packaging/windows/README.md](packaging/windows/README.md).
+Unpack the generated `dist\kalo-<version>-<arch>.zip` and run `kalo.exe`. There is no Windows installer, notification-area icon, or background receiver service yet. See [Windows packaging notes](packaging/windows/README.md).
 
-## Build and run
-
-On Linux:
+### Run directly from source
 
 ```sh
 cargo build --release
-./target/release/kalo        # opens the UI
+./target/release/kalo
 ```
 
-On Windows (experimental, untested on hardware):
+On Windows, run `.\target\release\kalo.exe` instead. `kalo ui` explicitly opens the graphical interface on either supported build target.
 
-```powershell
-cargo build --release
-.\target\release\kalo.exe    # opens the UI
-```
+## How to use Kalo
 
-Run the UI explicitly with `kalo ui`.
+### Send a file
 
-## Usage
+1. Turn on Bluetooth and pair the destination device using your system settings.
+2. Make sure the destination can receive Bluetooth OPP file transfers.
+3. Open Kalo. Under **Choose a device**, select the destination; use **Refresh list** if you have just paired it.
+4. Under **Choose a file**, select the file to send.
+5. Select **Send to [device]**. Kalo shows progress and lets you cancel the outgoing transfer.
 
-1. Pair the other device in your system Bluetooth settings, or use the CLI
-   (see below).
-2. Open Kalo and select the device under **Device**.
-3. Choose a file and press **Send to …**.
-4. Incoming files appear under **Incoming** and are saved to the Downloads
-   folder (XDG on Linux, normally `~/Downloads`; the Known Folder on Windows).
+The recipient may need to accept the transfer, depending on its own Bluetooth software.
 
-On Linux, if the receiver reports that the OBEX agent slot is taken, another
-OBEX agent (such as Blueman's TransferService) owns it. Disable that agent or
-stop `blueman-applet`; Kalo retries registration automatically. On Windows the
-receiver advertises the OBEX Object Push RFCOMM service directly and retries if
-the radio is off or the service cannot be advertised.
+### Receive a file
 
-## CLI
+1. Open Kalo and check the receiver status at the top of the window. When it says **Ready to receive**, another compatible device can send a file to this computer.
+2. The first time a sender is seen, an approval card shows the sender, Bluetooth address, file name and size. Choose **Allow once**, **Always allow**, **Decline** or **Block**. If the address is unknown, only the one-time choices are offered.
+3. Watch progress under **Incoming files**. Completed files are saved to the folder shown under **Save to**; use **Open folder** to reveal the saved file or the destination folder.
+
+Use **Senders** to review remembered devices, remove a decision, or switch between **Ask** and **Trusted only**. **Trusted only** rejects unknown senders without showing a prompt. The CLI receiver has no prompt and rejects unknown senders; run the desktop app to approve new devices.
+
+**Important:** acceptance also depends on the operating system's Bluetooth stack. On Linux, a different program (such as Blueman's transfer service) may already own the OBEX agent registration. Close or disable the conflicting receiver; Kalo retries automatically. On Windows, Kalo must stay open to receive files.
+
+## Command-line interface
 
 ```text
 kalo                         Open the desktop UI
 kalo ui                      Open the desktop UI
 kalo adapters                List Bluetooth adapters and their state
-kalo connectable [on|off]    Show or set adapter connectable state (show only on Windows)
-kalo devices [--discovery N] List known devices, optionally after discovery
+kalo connectable [on|off]    Show or set adapter connectability (show-only on Windows)
+kalo devices [--discovery N] List known devices; optionally discover for N seconds
 kalo pair <MAC>              Pair with a device
 kalo agent-check             Check whether the receiver can start
 kalo send <MAC> <FILE>       Send a file via Bluetooth OPP
 kalo receive                 Run the receiver in the foreground
 ```
 
-Examples:
+For example:
 
 ```sh
 kalo devices --discovery 15
@@ -169,61 +182,46 @@ kalo pair AA:BB:CC:DD:EE:FF
 kalo send AA:BB:CC:DD:EE:FF path/to/file.pdf
 ```
 
-## How it works
+## How it works (technical overview)
 
-- **Linux backend:** outgoing transfers use `org.bluez.obex`; incoming pushes go
-  through a registered OBEX agent. The receiver is supervised and re-registers
-  after obexd or session-bus restarts.
-- **Windows backend:** outgoing transfers open an RFCOMM connection to the
-  remote Object Push service and drive OBEX with a built-in protocol engine;
-  incoming transfers advertise the same service through WinRT and stream each
-  push to disk. The backend is experimental and shares the Linux event contract.
-- **Transfers:** progress is streamed to the UI/CLI, cancellation interrupts
-  connection setup and active transfers, and a watchdog closes stalled sessions.
-- **Incoming files:** authorized pushes are written to a staging directory,
-  checked, then moved atomically into Downloads. Partial transfers are preserved
-  for manual recovery, and stalled or orphaned files are recovered periodically.
-- **Supervision:** one shared receiver supervisor handles start retries and
-  backend-specific restarts for both the UI and the CLI.
-- **Events:** background work publishes typed events to a broadcast bus shared
-  by the UI or the CLI, keeping progress rendering consistent between both and
-  allowing the UI subscription to be re-created safely.
+**Outgoing transfers:** Kalo selects a device and sends a file using Bluetooth OPP/OBEX. On Linux, it delegates the OBEX transfer to `obexd` through D-Bus; on Windows, its experimental backend connects to the remote OPP service using WinRT RFCOMM and a built-in OBEX engine. Progress, cancellation, and stall handling are reported to the UI or CLI.
 
-## Limitations
+**Incoming transfers:** Kalo starts a receiver when the UI runs (or when `kalo receive` is invoked). Before a transfer is accepted, the shared authorizer checks the persisted trust store. Unknown senders are announced to the UI and wait for a decision or a timeout; the CLI rejects them. Accepted transfers first go into a staging directory, where filenames are sanitized and transfer results are checked. Files are then moved into the configured save folder. When possible, partial files are recovered rather than silently discarded.
 
-- **Incoming authorization is accept-all** in this Phase 0 release, on every
-  platform. Do not run the receiver on an untrusted network until a trust store
-  and per-device authorization are implemented.
-- **The Windows backend is experimental and untested on Windows hardware.** It
-  compiles and mirrors the Linux behavior, but send, receive, pairing and radio
-  edge cases still need validation on real Windows 10/11 machines. Only a
-  portable ZIP is available; there is no Windows installer yet.
-- On Linux, only one OBEX agent can own the agent slot at a time.
-- On Windows, the app must be running to answer pushes; the OPP service is not
-  registered as a background task.
-- The current `.deb` targets the machine it was built on; cross-release glibc
-  compatibility is not guaranteed.
+**Trust storage:** decisions are keyed by normalized Bluetooth address and stored in Kalo's configuration directory (`$XDG_CONFIG_HOME/kalo/trust.json` on Linux, the roaming application data folder on Windows). Theme and save-folder preferences live in `settings.json` next to it. Name-only identities are never persisted.
+
+**Receiver reliability:** Linux uses an OBEX agent registered with `obexd`, with retries after service or session-bus interruptions. On Windows, Kalo advertises its own OPP service while the app is running. A shared event system keeps transfer and receiver status consistent between the UI and CLI.
+
+**Desktop integration:** the Linux status-area icon uses StatusNotifierItem and offers **Open Kalo** and **Quit Kalo**. Closing the window hides it when the tray is available, so the receiver keeps running in the background.
+
+## Known limitations
+
+- **There is no reciprocal trusted-PC handshake yet.** Remembering a sender on one computer does not automatically trust the other computer in return. Each side currently approves the other separately.
+- **Windows is experimental.** Sending, receiving, pairing, trust persistence and Bluetooth radio edge cases need tests on physical Windows 10/11 machines. Windows builds are unsigned and there is no notification-area icon yet.
+- **The GUI does not perform active discovery.** It refreshes the operating system's known-device list; the CLI supports timed discovery.
+- **On Linux, only one OBEX agent can occupy the registration slot at a time.** Other Bluetooth transfer tools can conflict with Kalo's receiver.
+- **The Linux tray depends on the desktop.** GNOME requires an AppIndicator extension; without a StatusNotifierItem host, Kalo cannot hide to the panel.
+- **Linux packages built locally are tied to the build machine.** Binary compatibility across different distributions, architectures, or older glibc versions is not guaranteed.
+- **File transfer requires OPP support on the peer.** Not all Bluetooth devices implement it.
 
 ## Development
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-From Linux, the Windows backend can be type-checked with:
+To type-check the Windows target from Linux, with the target and its prerequisites installed:
 
 ```sh
 cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 ```
 
-The shared code lives in `app` (iced UI), `events` (event bus), `receiver`
-(receiver status contract), `platform` (backend facade), `sanitize` (untrusted
-filename safety) and `paths` (download locations). Linux adds `bluez` (system
-bus), `obex` (outgoing transfers) and `agent` (incoming OBEX agent). Windows
-adds `win` (WinRT RFCOMM transport, OPP sender/receiver, device helpers).
+Shared modules cover the `iced` UI, platform interface, receiver status, event handling, filename safety, settings, trust decisions, and download paths. Linux-specific modules integrate with BlueZ and `obexd`; Windows-specific modules implement WinRT RFCOMM/OBEX operations.
+
+The [GitHub Actions workflow](.github/workflows/ci.yml) runs formatting, Clippy and tests on Linux and Windows, builds the Ubuntu `.deb` and the experimental Windows ZIP/EXE, and publishes them to the rolling latest release only after all builds succeed. The UI includes a debug-only demo mode (`KALO_DEMO=1`, with `KALO_DEMO_THEME=light` for the light appearance) used to capture the screenshots without exposing real devices.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Released under the [MIT License](LICENSE).
