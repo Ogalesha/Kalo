@@ -50,7 +50,7 @@
       a single receiver status source, stale `Release` isolation, shared
       receiver supervision, discovery cleanup, per-status stall policies,
       interval-based watchdogs, pairing timeouts and periodic staging recovery.
-- [ ] Add CI for `fmt`, `clippy`, tests, Linux package builds, a Windows
+- [x] Add CI for `fmt`, `clippy`, tests, Linux package builds, a Windows
       `clippy`/test job and rolling GitHub downloads for the latest successful
       `.deb`, Windows ZIP and Windows `.exe`.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
