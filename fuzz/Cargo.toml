@@ -1,0 +1,27 @@
+[package]
+name = "kalo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+obex-protocol = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "obex_parser"
+path = "fuzz_targets/obex_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filename"
+path = "fuzz_targets/filename.rs"
+test = false
+doc = false
+bench = false

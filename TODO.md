@@ -73,15 +73,26 @@
 - [x] **Filename sanitization.** Remove path separators and control
       characters; neutralize Windows alternate-data-stream characters, trailing
       dots/spaces and reserved device names.
-- [x] **Receive hardening.** Private staging, size and free-space checks,
+- [x] **Receive hardening.** Private staging, announced and actual size caps,
+      free-space checks on both the save and staging filesystems, periodic
+      re-checks while unknown-size transfers grow (every 64 MiB on Windows),
+      deletion of oversized staged data before it reaches the save folder,
       bounded concurrency, Windows incremental hashing, scan-before-save,
       deletion of blocked files, owner-only permissions on Unix, and
       Mark-of-the-Web on Windows.
 - [x] **No remote control and no automatic opening.** OPP only; no execution,
       preview, shell, or remote-control profile; received content stays inert.
-- [ ] Consider signed blocklist manifests or a second independent feed so a
-      compromised feed endpoint cannot silently weaken detection.
-- [ ] Add a fuzz target for the Windows OBEX parser and the filename sanitizer.
+- [x] **Independent blocklist endpoints and append-only cache.** Each feed file
+      is fetched from raw GitHub and jsDelivr, refreshed results merge the
+      hashes already cached (up to 500,000), a truncated refresh is rejected,
+      and parsing/downloads are bounded. A compromised endpoint can add false
+      positives but cannot silently remove a known hash. Signed manifests
+      remain an optional future strengthening.
+- [x] **Fuzz the Windows OBEX parser and filename sanitizer.** `fuzz/` contains
+      libFuzzer targets for `obex_protocol::transport::PacketStream` and
+      `sanitize::filename`; CI runs both for 60 seconds and uploads artifacts
+      on failure. Fuzzing already caught and fixed a truncation path that could
+      leave a trailing space after the 200-byte cap.
 
 ## Engineering
 

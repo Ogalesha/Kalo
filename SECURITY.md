@@ -68,10 +68,22 @@ privacy of transfer metadata.
   characters are removed; Windows-hostile characters (`: * ? " < > |`),
   trailing dots and spaces, and reserved DOS device names (`CON`, `PRN`, `AUX`,
   `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`) are neutralized so they cannot create an
-  NTFS alternate data stream or target a device.
-- Announced sizes are bounded, free space is checked before a push is accepted,
+  NTFS alternate data stream or target a device. The checks are applied again
+  after length truncation, so a cut cannot expose a trailing dot/space or a
+  device name.
+- The Windows OBEX packet parser and the filename sanitizer have libFuzzer
+  targets under `fuzz/`; CI runs both on every push so malformed peer input is
+  exercised continuously.
+- Announced sizes are bounded to the OPP 4 GB limit before a push is accepted,
   and incoming concurrency is capped at four transfers so a peer cannot exhaust
   file descriptors or memory.
+- Free space is checked on both the save and staging filesystems before a push
+  starts. Unknown-size transfers are re-checked while they grow, and the
+  Windows receiver re-checks every 64 MiB, so a peer cannot fill the disk by
+  lying about or omitting the length header.
+- The bytes actually written are compared with the announced size and the OPP
+  cap on every poll and again before saving. Oversized staged data is deleted
+  and never moved into the save folder.
 - Windows hashes each byte while it is written, avoiding a second read.
 - The staged file is hashed again and deleted instead of saved if it matches the
   malware blocklist. It is never auto-opened or executed.
@@ -88,15 +100,26 @@ privacy of transfer metadata.
   MIT-licensed [romainmarcoux/malicious-hash](https://github.com/romainmarcoux/malicious-hash)
   SHA-256 feeds. The feed's license text is kept in
   `assets/LICENSE-malicious-hash.txt`.
+- Each feed file is fetched from `raw.githubusercontent.com` first and from the
+  jsDelivr CDN second, so a single CDN outage cannot stop an update. Both are
+  mirrors of the same upstream repository: they add availability, not
+  independent integrity. Signed manifests remain future work.
 - The active list is cached at `malware-sha256.txt` in Kalo's private config
   directory. The cache merges the bundled hashes, so an offline first launch
   still blocks known samples.
+- A refresh is merged with the hashes already cached, up to 500,000 entries.
+  A compromised endpoint can add false positives, but it cannot silently
+  remove detection of a sample this machine has already learned. Hashes
+  already seen remain active until the memory cap is reached.
+- A refresh that returns fewer than 10,000 public hashes is treated as
+  truncated and rejected; the previous list stays active.
 - The cache is refreshed in the background when it is older than 24 hours. A
   refresh failure leaves the previous list active and never blocks a transfer.
 - Hashes are kept as a sorted `Vec<[u8; 32]>` and looked up by binary search.
   The full public list is a few megabytes; hashing uses a single 64 KiB buffer.
-- Feed responses are capped at 64 MiB and downloaded with a 60-second timeout.
-  A compromised endpoint cannot cause unbounded memory growth or block startup.
+- Feed responses are capped at 64 MiB, parsing is capped at 500,000 hashes, and
+  downloads use a 60-second timeout. A compromised endpoint cannot cause
+  unbounded memory growth or block startup.
 
 ### Configuration and data permissions
 

@@ -40,12 +40,18 @@ pub fn filename(input: &str) -> String {
     if is_windows_reserved(&name) {
         name.insert(0, '_');
     }
-    // Cap length (most filesystems allow 255 bytes per component).
+    // Cap length (most filesystems allow 255 bytes per component). Cutting
+    // the string can expose a trailing dot/space or leave a reserved name, so
+    // re-apply those checks to the truncated result.
     while name.len() > 200 {
         name.pop();
     }
+    let mut name = name.trim_end_matches(['.', ' ']).to_string();
     if name.is_empty() {
         name = "received-file".to_string();
+    }
+    if is_windows_reserved(&name) {
+        name.insert(0, '_');
     }
     name
 }
@@ -130,6 +136,25 @@ fn copy_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_cannot_reintroduce_trailing_dots_or_spaces() {
+        let input = format!("{} b", "a".repeat(199));
+        let name = filename(&input);
+        assert!(name.len() <= 200);
+        assert!(!name.ends_with(['.', ' ']));
+
+        let input = format!("{}.b", "a".repeat(199));
+        let name = filename(&input);
+        assert!(name.len() <= 200);
+        assert!(!name.ends_with(['.', ' ']));
+    }
+
+    #[test]
+    fn truncation_cannot_expose_a_windows_device_name() {
+        let input = format!("CON{}x", " ".repeat(197));
+        assert_eq!(filename(&input), "_CON");
+    }
 
     #[test]
     fn filename_strips_separators_and_control_chars() {

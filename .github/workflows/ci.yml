@@ -195,6 +195,38 @@ jobs:
           path: dist/kalo-macos-universal.zip
           if-no-files-found: error
 
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz the OBEX parser
+        run: cargo fuzz run obex_parser -- -max_total_time=60 -rss_limit_mb=2048
+
+      - name: Fuzz the filename sanitizer
+        run: cargo fuzz run filename -- -max_total_time=60 -rss_limit_mb=2048
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   arch:
     name: Arch Linux
     runs-on: ubuntu-24.04
@@ -250,7 +282,7 @@ jobs:
   release:
     name: Publish latest builds
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux, windows, macos, arch]
+    needs: [linux, windows, macos, arch, fuzz]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

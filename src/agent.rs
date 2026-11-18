@@ -256,6 +256,20 @@ impl AgentService {
         let staging_dir = PathBuf::from(&root).join(format!("kalo-{id}"));
         security::create_private_dir(&staging_dir)
             .with_context(|| format!("create staging dir {staging_dir:?}"))?;
+        // obexd may stage on a different filesystem than the save folder, so
+        // check that filesystem too before the sender starts writing.
+        if let Err(error) = security::ensure_free_space(&staging_dir, size) {
+            cleanup_staging(&staging_dir);
+            let reason = format!("not enough free space in the staging area: {error:#}");
+            self.events.send(Event::IncomingFailed {
+                id: id.clone(),
+                sender: sender.clone(),
+                name: safe_name.clone(),
+                error: reason.clone(),
+                staged_at: None,
+            });
+            bail!("{reason}");
+        }
         let dest = staging_dir.join(&safe_name);
 
         self.pending
@@ -286,9 +300,11 @@ impl AgentService {
         Ok(dest)
     }
 
-    /// Refuse work this machine cannot safely accept: more than the bounded
-    /// number of simultaneous pushes, or a transfer that cannot fit on disk.
+    /// Refuse work this machine cannot safely accept: an object beyond the
+    /// OPP cap, more than the bounded number of simultaneous pushes, or a
+    /// transfer that cannot fit on disk.
     fn accept_capacity(&self, size: Option<u64>) -> Result<()> {
+        security::check_announced_size(size)?;
         let active = self.pending.lock().expect("pending lock").len();
         if active >= security::MAX_CONCURRENT_INCOMING {
             bail!(
@@ -558,6 +574,27 @@ fn record_status(pending: &PendingTransfers, id: &str, status: &TransferStatus) 
     now.duration_since(p.status_since)
 }
 
+/// Delete staged bytes that already violate the size policy. obexd can write
+/// more than the sender announced (or more than the OPP cap) before the
+/// transfer completes, so every poll checks the file itself.
+fn reject_oversized_staged(p: &PendingTransfer, events: &EventSink) -> bool {
+    let Ok(metadata) = std::fs::metadata(&p.dest) else {
+        return false;
+    };
+    let Some(reason) = security::oversized_reason(metadata.len(), p.size) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&p.dest);
+    fail(
+        events,
+        p,
+        format!("{reason}; the oversized file was deleted"),
+        None,
+    );
+    cleanup_staging(&p.staging_dir);
+    true
+}
+
 /// True when a D-Bus error means the object really is gone rather than a
 /// transient bus failure.
 fn is_object_gone(e: &zbus::Error) -> bool {
@@ -698,6 +735,26 @@ pub async fn poll_pending(
     let mut finished: Vec<String> = Vec::new();
 
     for p in &list {
+        // A peer can lie about (or omit) the OBEX length header. Check what
+        // obexd actually wrote before doing any more D-Bus work.
+        if reject_oversized_staged(p, events) {
+            finished.push(p.id.clone());
+            continue;
+        }
+        // With no announced size the upfront check only reserved a small
+        // margin; keep watching the staging filesystem while it grows.
+        if p.size.is_none()
+            && let Err(error) = security::ensure_free_space(&p.staging_dir, None)
+        {
+            recover_failed_transfer(
+                p,
+                &downloads,
+                events,
+                &format!("not enough free disk space for the incoming file: {error:#}"),
+            );
+            finished.push(p.id.clone());
+            continue;
+        }
         let proxy = match TransferPropsProxy::builder(conn).path(p.path.as_str()) {
             Ok(builder) => match builder.build().await {
                 Ok(proxy) => proxy,
@@ -857,6 +914,19 @@ fn finish_transfer(
     let bytes = std::fs::metadata(&p.dest)
         .with_context(|| format!("read staged file {:?}", p.dest))?
         .len();
+    // Final gate: a fast sender can finish between two polls, so re-check the
+    // completed object before it enters the save folder.
+    if let Some(reason) = security::oversized_reason(bytes, p.size) {
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: format!("{reason}; the oversized file was deleted"),
+            staged_at: None,
+        });
+        return Ok(());
+    }
     let base = p
         .dest
         .file_name()
@@ -1343,6 +1413,82 @@ mod tests {
                 assert_eq!(name, "photo.jpg");
                 assert_eq!(bytes, 5);
                 assert!(!partial);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_staged_file_is_deleted() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.jpg");
+        std::fs::write(&dest, b"hello").unwrap();
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(dest.clone(), Some(4));
+
+        assert!(reject_oversized_staged(&p, &events));
+        assert!(!dest.exists(), "oversized staged bytes must be deleted");
+        assert!(!staging.exists(), "empty staging dir must be removed");
+        match rx.try_recv().unwrap() {
+            Event::IncomingFailed {
+                error, staged_at, ..
+            } => {
+                assert!(error.contains("announced"), "unexpected error: {error}");
+                assert!(error.contains("deleted"), "unexpected error: {error}");
+                assert_eq!(staged_at, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn staged_size_at_or_below_the_announcement_is_kept() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.jpg");
+        std::fs::write(&dest, b"hello").unwrap();
+        let (events, _rx) = event_sink();
+
+        assert!(!reject_oversized_staged(
+            &pending_transfer(dest.clone(), Some(5)),
+            &events
+        ));
+        assert!(dest.exists());
+        assert!(!reject_oversized_staged(
+            &pending_transfer(dest.clone(), None),
+            &events
+        ));
+        assert!(dest.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finalize_deletes_an_oversized_completed_file() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.jpg");
+        std::fs::write(&dest, b"hello").unwrap();
+        let downloads = dir.join("Downloads");
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(dest.clone(), Some(4));
+
+        // A sender can finish between two polls; finalization is the last
+        // gate before the save folder.
+        finalize_transfer(&p, &downloads, &events, false).unwrap();
+
+        assert!(!dest.exists());
+        assert!(!staging.exists());
+        assert!(!downloads.join("photo.jpg").exists());
+        match rx.try_recv().unwrap() {
+            Event::IncomingFailed { error, .. } => {
+                assert!(error.contains("announced"), "unexpected error: {error}");
+                assert!(error.contains("deleted"), "unexpected error: {error}");
             }
             other => panic!("unexpected event: {other:?}"),
         }

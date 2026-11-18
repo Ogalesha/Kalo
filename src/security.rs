@@ -4,7 +4,9 @@
 //! the content of a transfer, and every file that leaves or enters the app is
 //! checked against a SHA-256 malware blocklist. The blocklist is cached under
 //! the Kalo config directory and refreshed in the background from a public
-//! feed; refresh failures never block a transfer.
+//! feed served by two independent endpoints; refresh failures never block a
+//! transfer. Refreshes are merged with the hashes already cached, so a
+//! compromised endpoint cannot silently remove a known-bad digest.
 //!
 //! Hashing is streaming and uses one small buffer so checking a large file
 //! does not raise memory use. The cached hash list is kept as sorted
@@ -39,6 +41,13 @@ pub const MAX_FILE_BYTES: u64 = u32::MAX as u64;
 /// The public feed is about 7 MB; 64 MB leaves room for growth without
 /// allowing a compromised or misconfigured endpoint to exhaust memory.
 const MAX_BLOCKLIST_BYTES: u64 = 64 * 1024 * 1024;
+/// A sorted list of `[u8; 32]` hashes takes 32 bytes each. 500,000 hashes
+/// (16 MB) is several times the current public feed, and the cap keeps a
+/// compromised or runaway endpoint from growing memory without bound.
+const MAX_ACTIVE_HASHES: usize = 500_000;
+/// A refresh that returns fewer public hashes than this is treated as
+/// truncated and leaves the previous list active.
+const MIN_PUBLIC_HASHES: usize = 10_000;
 const BLOCKLIST_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const BLOCKLIST_RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,12 +55,33 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const FREE_SPACE_MARGIN: u64 = 16 * 1024 * 1024;
 const HASH_BUFFER: usize = 64 * 1024;
 
-/// Public SHA-256 feeds from the MIT-licensed romainmarcoux/malicious-hash
-/// project. Two files keep each response comfortably below typical proxy
-/// limits and are merged locally.
-const FEEDS: [&str; 2] = [
-    "https://raw.githubusercontent.com/romainmarcoux/malicious-hash/main/full-hash-sha256-aa.txt",
-    "https://raw.githubusercontent.com/romainmarcoux/malicious-hash/main/full-hash-sha256-ab.txt",
+/// One logical SHA-256 feed file from the MIT-licensed
+/// romainmarcoux/malicious-hash project. Two files keep each response
+/// comfortably below typical proxy limits; each file is served by two
+/// endpoints. The raw GitHub origin is tried first, then jsDelivr, which
+/// mirrors the same repository from a different CDN. A single CDN outage
+/// therefore cannot stop a refresh; the append-only merge below limits what a
+/// replacement list can remove.
+struct Feed {
+    name: &'static str,
+    urls: [&'static str; 2],
+}
+
+const FEEDS: [Feed; 2] = [
+    Feed {
+        name: "aa",
+        urls: [
+            "https://raw.githubusercontent.com/romainmarcoux/malicious-hash/main/full-hash-sha256-aa.txt",
+            "https://cdn.jsdelivr.net/gh/romainmarcoux/malicious-hash@main/full-hash-sha256-aa.txt",
+        ],
+    },
+    Feed {
+        name: "ab",
+        urls: [
+            "https://raw.githubusercontent.com/romainmarcoux/malicious-hash/main/full-hash-sha256-ab.txt",
+            "https://cdn.jsdelivr.net/gh/romainmarcoux/malicious-hash@main/full-hash-sha256-ab.txt",
+        ],
+    },
 ];
 
 /// Baseline shipped with the binary so the very first launch (and an offline
@@ -193,6 +223,9 @@ pub fn digest_hex(digest: [u8; 32]) -> String {
 /// temporary download buffer does not stay resident.
 fn parse_hashes(bytes: &[u8], out: &mut Vec<[u8; 32]>) {
     for line in bytes.split(|byte| *byte == b'\n') {
+        if out.len() >= MAX_ACTIVE_HASHES {
+            break;
+        }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
         if line.len() != 64 {
@@ -238,7 +271,6 @@ fn sort_and_dedup(hashes: &mut Vec<[u8; 32]>) {
 #[derive(Debug, Default)]
 struct Blocklist {
     hashes: Vec<[u8; 32]>,
-    cached: bool,
 }
 
 impl Blocklist {
@@ -270,20 +302,22 @@ pub fn init() {
         if let Err(error) = create_private_dir(&paths::config_dir()) {
             eprintln!("warning: cannot secure the Kalo config directory: {error:#}");
         }
+        let cache = cache_file();
+        let cache_size = fs::metadata(&cache).map(|metadata| metadata.len());
         let mut baseline = bundled_hashes();
-        let mut cached = false;
-        match fs::read(cache_file()) {
-            Ok(bytes) => {
-                parse_hashes(&bytes, &mut baseline);
-                cached = true;
+        match cache_size {
+            Ok(size) if size > MAX_BLOCKLIST_BYTES => {
+                eprintln!("warning: ignoring oversized malware hash cache");
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!("warning: cannot read malware hash cache: {error}"),
+            _ => match fs::read(&cache) {
+                Ok(bytes) => parse_hashes(&bytes, &mut baseline),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("warning: cannot read malware hash cache: {error}"),
+            },
         }
         sort_and_dedup(&mut baseline);
         if let Ok(mut list) = blocklist().write() {
             list.hashes = baseline;
-            list.cached = cached;
         }
         std::thread::Builder::new()
             .name("kalo-blocklist".into())
@@ -312,7 +346,8 @@ fn cache_is_stale() -> bool {
         .is_none_or(|age| age >= BLOCKLIST_MAX_AGE)
 }
 
-/// Download and merge both public feeds, then atomically replace the cache.
+/// Download and merge both public feeds and the previously active list, then
+/// atomically replace the cache.
 ///
 /// Returns the number of unique hashes in the new list. Network and parse
 /// failures leave the previous list active.
@@ -323,24 +358,35 @@ pub fn refresh() -> Result<usize> {
         .build()
         .new_agent();
 
+    let previous = match blocklist().read() {
+        Ok(list) => list.hashes.clone(),
+        Err(poisoned) => poisoned.into_inner().hashes.clone(),
+    };
+
+    let mut public = Vec::new();
+    for feed in &FEEDS {
+        let bytes = download_feed(&agent, feed)?;
+        let before = public.len();
+        parse_hashes(&bytes, &mut public);
+        if public.len() == before && before < MAX_ACTIVE_HASHES {
+            bail!("malware hash feed {} returned no usable hashes", feed.name);
+        }
+    }
+    sort_and_dedup(&mut public);
+    if public.len() < MIN_PUBLIC_HASHES {
+        bail!(
+            "public malware hash feeds returned only {} hashes; keeping the previous list",
+            public.len()
+        );
+    }
+
     let mut hashes = bundled_hashes();
-    for url in FEEDS {
-        let mut response = agent
-            .get(url)
-            .call()
-            .with_context(|| format!("download malware hash feed {url}"))?;
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_BLOCKLIST_BYTES)
-            .read_to_vec()
-            .with_context(|| format!("read malware hash feed {url}"))?;
-        parse_hashes(&bytes, &mut hashes);
-    }
+    hashes.extend_from_slice(&public);
     sort_and_dedup(&mut hashes);
-    if hashes.len() <= bundled_hashes().len() {
-        bail!("public malware hash feeds returned no usable hashes");
-    }
+    // Keep hashes learned earlier even after the upstream feed stops listing
+    // them. A compromised endpoint can add false positives, but it cannot
+    // silently remove detection of a sample this machine already knows.
+    merge_previous(&mut hashes, previous, MAX_ACTIVE_HASHES);
 
     let path = cache_file();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -377,9 +423,58 @@ pub fn refresh() -> Result<usize> {
     let count = hashes.len();
     if let Ok(mut list) = blocklist().write() {
         list.hashes = hashes;
-        list.cached = true;
     }
     Ok(count)
+}
+
+/// Fetch one logical feed, trying each endpoint in order. Returning the first
+/// successful response keeps a single CDN outage from disabling updates.
+fn download_feed(agent: &ureq::Agent, feed: &Feed) -> Result<Vec<u8>> {
+    let mut errors = Vec::new();
+    for url in feed.urls {
+        let result = (|| -> Result<Vec<u8>> {
+            let mut response = agent
+                .get(url)
+                .call()
+                .with_context(|| format!("download malware hash feed {url}"))?;
+            response
+                .body_mut()
+                .with_config()
+                .limit(MAX_BLOCKLIST_BYTES)
+                .read_to_vec()
+                .with_context(|| format!("read malware hash feed {url}"))
+        })();
+        match result {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => errors.push(format!("{url}: {error:#}")),
+        }
+    }
+    bail!(
+        "every endpoint for malware hash feed {} failed: {}",
+        feed.name,
+        errors.join("; ")
+    )
+}
+
+/// Add the previously active hashes to a fresh snapshot without exceeding
+/// `cap`. The fresh feed is kept in full first, so an update cannot evict the
+/// hashes it just supplied when the cap is reached; older hashes only fill the
+/// room that is left.
+fn merge_previous(hashes: &mut Vec<[u8; 32]>, mut previous: Vec<[u8; 32]>, cap: usize) {
+    sort_and_dedup(hashes);
+    sort_and_dedup(&mut previous);
+    if hashes.len() >= cap {
+        hashes.truncate(cap);
+        return;
+    }
+    let room = cap - hashes.len();
+    let extra = previous
+        .into_iter()
+        .filter(|digest| hashes.binary_search(digest).is_err())
+        .take(room)
+        .collect::<Vec<_>>();
+    hashes.extend(extra);
+    sort_and_dedup(hashes);
 }
 
 /// Create a directory that only the current user can access.
@@ -471,6 +566,45 @@ fn platform_available_space(path: &Path) -> Result<u64> {
     Ok(available)
 }
 
+/// Refuse a transfer whose announced length is already over the OPP cap.
+/// This runs before any staging state is created, so a peer cannot reserve a
+/// slot for a file that could never be saved.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn check_announced_size(size: Option<u64>) -> Result<()> {
+    if let Some(size) = size
+        && size > MAX_FILE_BYTES
+    {
+        bail!(
+            "the sender announced a file larger than the {} OPP limit",
+            crate::events::format_bytes(MAX_FILE_BYTES)
+        );
+    }
+    Ok(())
+}
+
+/// Compare the bytes actually written with the OPP cap and the announced
+/// size. A sender can misreport the length header or omit it, so the receiver
+/// must check the staged object itself instead of trusting the announcement.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn oversized_reason(bytes: u64, announced: Option<u64>) -> Option<String> {
+    if bytes > MAX_FILE_BYTES {
+        return Some(format!(
+            "received object exceeds the {} OPP limit",
+            crate::events::format_bytes(MAX_FILE_BYTES)
+        ));
+    }
+    if let Some(announced) = announced
+        && bytes > announced
+    {
+        return Some(format!(
+            "sender wrote {} bytes but announced {}",
+            crate::events::format_bytes(bytes),
+            crate::events::format_bytes(announced)
+        ));
+    }
+    None
+}
+
 /// Refuse a transfer that cannot possibly fit, before any bytes are written.
 /// Unknown sizes still require a small working margin.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -517,6 +651,21 @@ mod tests {
         assert!(hashes.windows(2).all(|pair| pair[0] < pair[1]));
         let eicar = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
         assert!(hashes.iter().any(|hash| digest_hex(*hash) == eicar));
+    }
+
+    #[test]
+    fn size_caps_cover_announced_and_actual_bytes() {
+        assert!(check_announced_size(None).is_ok());
+        assert!(check_announced_size(Some(0)).is_ok());
+        assert!(check_announced_size(Some(MAX_FILE_BYTES)).is_ok());
+        assert!(check_announced_size(Some(MAX_FILE_BYTES + 1)).is_err());
+
+        assert!(oversized_reason(0, None).is_none());
+        assert!(oversized_reason(MAX_FILE_BYTES, None).is_none());
+        assert!(oversized_reason(MAX_FILE_BYTES + 1, None).is_some());
+        assert!(oversized_reason(5, Some(5)).is_none());
+        assert!(oversized_reason(6, Some(5)).is_some());
+        assert!(oversized_reason(6, None).is_none());
     }
 
     #[test]
@@ -585,10 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn every_feed_has_two_https_endpoints() {
+        for feed in &FEEDS {
+            assert!(
+                feed.urls.iter().all(|url| url.starts_with("https://")),
+                "feed {} must use TLS",
+                feed.name
+            );
+            assert!(
+                feed.urls[0] != feed.urls[1],
+                "feed {} needs independent endpoints",
+                feed.name
+            );
+        }
+    }
+
+    #[test]
+    fn merge_previous_keeps_history_and_respects_the_cap() {
+        let mut hashes = vec![[1u8; 32], [2u8; 32]];
+        merge_previous(&mut hashes, vec![[2u8; 32], [3u8; 32]], 3);
+        assert_eq!(hashes, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+
+        let mut capped = vec![[1u8; 32], [2u8; 32]];
+        merge_previous(&mut capped, vec![[3u8; 32]], 2);
+        assert_eq!(capped, vec![[1u8; 32], [2u8; 32]]);
+
+        // The fresh snapshot wins the cap; old hashes only fill the room
+        // that is left, even when they sort before the fresh ones.
+        let mut fresh = vec![[3u8; 32], [4u8; 32]];
+        merge_previous(&mut fresh, vec![[1u8; 32], [2u8; 32]], 3);
+        assert_eq!(fresh, vec![[1u8; 32], [3u8; 32], [4u8; 32]]);
+    }
+
+    #[test]
     fn blocklist_lookup_uses_binary_search() {
         let list = Blocklist {
             hashes: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
-            ..Blocklist::default()
         };
         assert!(list.contains(&[2u8; 32]));
         assert!(!list.contains(&[4u8; 32]));

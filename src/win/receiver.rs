@@ -50,6 +50,10 @@ const STAGING_STALE_AGE: Duration = Duration::from_secs(30 * 60);
 const INCOMING_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Re-check free space every 64 MiB while a sender writes, so a long or
+/// unknown-size transfer cannot fill the disk between the upfront check and
+/// completion.
+const SPACE_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Foreground receiver used by `kalo receive`.
 pub async fn receive() -> Result<()> {
@@ -404,6 +408,27 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
                         break;
                     }
                     let id = Uuid::new_v4().simple().to_string();
+                    // Reject impossible transfers before prompting the user:
+                    // an oversized object or a full disk cannot be accepted
+                    // even when the sender is trusted.
+                    let capacity = security::check_announced_size(size)
+                        .and_then(|()| security::ensure_free_space(&context.save_dir.get(), size));
+                    if let Err(error) = capacity {
+                        let reason = format!("{error:#}");
+                        context.events.send(Event::IncomingFailed {
+                            id: id.clone(),
+                            sender: sender.name.clone(),
+                            name: safe_name.clone(),
+                            error: reason.clone(),
+                            staged_at: None,
+                        });
+                        context.events.send(Event::Log(format!(
+                            "incoming push from {} rejected: {reason}",
+                            sender.name
+                        )));
+                        let _ = stream.write_response(&Response::new(ResponseCode::Forbidden));
+                        break;
+                    }
                     if let Err(reason) = context.authorizer.authorize_blocking(
                         &id,
                         &sender.address,
@@ -531,6 +556,8 @@ struct Incoming {
     bytes: u64,
     started: Instant,
     last_emit: Instant,
+    /// Next byte count at which free space is checked again.
+    next_space_check: u64,
     /// Hashes while bytes are written, avoiding a second read at the end.
     hasher: security::Hasher,
 }
@@ -541,13 +568,14 @@ impl Incoming {
             return Ok(());
         }
         let next = self.bytes.saturating_add(body.len() as u64);
-        if next > security::MAX_FILE_BYTES {
-            bail!("received object exceeds the 4 GB OPP limit");
+        if let Some(reason) = security::oversized_reason(next, self.size) {
+            bail!("{reason}");
         }
-        if let Some(size) = self.size
-            && next > size
-        {
-            bail!("sender wrote more data than the announced size");
+        if next >= self.next_space_check {
+            let remaining = self.size.map(|size| size.saturating_sub(next));
+            security::ensure_free_space(&self.staging_dir, remaining)
+                .context("not enough free space to finish receiving")?;
+            self.next_space_check = next.saturating_add(SPACE_RECHECK_BYTES);
         }
         self.file
             .as_mut()
@@ -584,10 +612,15 @@ fn start_transfer(
 ) -> Result<Incoming> {
     // Refuse before writing: an announced transfer that cannot fit must not
     // consume the little free space that is left.
+    security::check_announced_size(size)?;
     security::ensure_free_space(&context.save_dir.get(), size)?;
     let staging_dir = staging_root().join(format!("kalo-{id}"));
     security::create_private_dir(&staging_dir)
         .with_context(|| format!("create staging directory {staging_dir:?}"))?;
+    if let Err(error) = security::ensure_free_space(&staging_dir, size) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error).context("not enough free space in the staging area");
+    }
     let dest = staging_dir.join(&safe_name);
     let file = OpenOptions::new()
         .create_new(true)
@@ -612,6 +645,7 @@ fn start_transfer(
         bytes: 0,
         started: Instant::now(),
         last_emit: Instant::now(),
+        next_space_check: SPACE_RECHECK_BYTES,
         hasher: security::Hasher::new(),
     })
 }

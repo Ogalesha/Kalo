@@ -26,7 +26,7 @@ Built with **Rust** and **[iced](https://iced.rs/)**, Kalo provides a desktop in
 ## Features
 
 - **Send one file, several files, or a folder:** pick individual files or a whole folder. Folders are scanned off the UI thread, hidden entries and symbolic links are skipped, and files are sent sequentially with one batch progress view.
-- **Block known malware:** a bundled baseline plus a public SHA-256 feed blocks malicious files on both send and receive. The feed is cached, refreshed in the background, and never blocks a transfer when the network is unavailable.
+- **Block known malware:** a bundled baseline plus a public SHA-256 feed blocks malicious files on both send and receive. The feed is served by two endpoints (raw GitHub and jsDelivr), cached append-only so a compromised endpoint cannot silently remove hashes already learned, refreshed in the background, and never blocks a transfer when the network is unavailable.
 - **Approve incoming senders:** allow a file once, remember the sender, decline, or block. Choose **Trusted only** to reject unknown senders without prompting.
 - **See transfer progress:** follow outgoing batches and incoming files in the desktop UI.
 - **Cancel a batch:** interrupt an outgoing transfer, including during connection setup. The remaining files in the batch stop as well.
@@ -219,10 +219,10 @@ kalo send AA:BB:CC:DD:EE:FF path/to/folder path/to/another-file.zip
 Kalo's goal is to be useful for file transfer without becoming a remote-access tool or a malware relay.
 
 - **Files only, in both directions.** Kalo implements Object Push, not dial-up networking, serial-port, HID, or remote-control profiles. It never executes or opens transferred content, and it exposes no command channel to a peer. The macOS receiver is Apple's Bluetooth Sharing, not a Kalo control service.
-- **Malware hash blocklist.** Outgoing files are hashed and refused if their SHA-256 digest is on the list. Incoming files are written to a private staging area, hashed, and deleted instead of saved when blocked. The list combines a bundled baseline with the MIT-licensed [romainmarcoux/malicious-hash](https://github.com/romainmarcoux/malicious-hash) feeds, cached under Kalo's config directory, refreshed at most daily in the background, and stored as sorted binary hashes for low memory use.
+- **Malware hash blocklist.** Outgoing files are hashed and refused if their SHA-256 digest is on the list. Incoming files are written to a private staging area, hashed, and deleted instead of saved when blocked. The list combines a bundled baseline with the MIT-licensed [romainmarcoux/malicious-hash](https://github.com/romainmarcoux/malicious-hash) feeds, fetched from raw GitHub and jsDelivr, cached under Kalo's config directory, refreshed at most daily in the background, and stored as sorted binary hashes for low memory use. Refreshes merge hashes already cached, so a compromised endpoint cannot silently remove a known detection.
 - **Sender approval.** Incoming pushes from unknown Bluetooth addresses wait for an explicit decision or are rejected. Decisions are keyed by normalized Bluetooth address; Windows identities that only have a name are never remembered.
-- **Hardened file handling.** Remote filenames are stripped of path separators, control characters, Windows alternate-data-stream characters, trailing dots/spaces, and reserved device names. Symlinks and special files are not sent. Received files keep owner-only permissions on Unix and get Mark-of-the-Web on Windows. Free space and transfer size are checked before a push is accepted.
-- **Bounded resource use.** Hashing streams with a 64 KiB buffer; incoming concurrency, file count, file size, feed size, and blocklist memory are capped. Refresh failures fall back to the last cached list and never block a transfer.
+- **Hardened file handling.** Remote filenames are stripped of path separators, control characters, Windows alternate-data-stream characters, trailing dots/spaces, and reserved device names. Symlinks and special files are not sent. Received files keep owner-only permissions on Unix and get Mark-of-the-Web on Windows. Announced and actual sizes are checked against the OPP 4 GB cap, free space is checked on both the save and staging filesystems, and oversized staged data is deleted instead of saved.
+- **Bounded resource use.** Hashing streams with a 64 KiB buffer; incoming concurrency, file count, file size, feed size, and blocklist memory are capped. Unknown-size transfers keep checking free space while they grow, and Windows re-checks every 64 MiB. Refresh failures fall back to the last cached list and never block a transfer.
 
 The complete threat model, guarantees, and non-goals are in [SECURITY.md](SECURITY.md).
 
@@ -263,6 +263,14 @@ To type-check the Windows target from Linux, with the target and its prerequisit
 
 ```sh
 cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
+
+The untrusted-input parsers have libFuzzer targets under `fuzz/`. They need a nightly toolchain and `cargo-fuzz`:
+
+```sh
+cargo +nightly install cargo-fuzz --locked
+cargo +nightly fuzz run obex_parser -- -max_total_time=60
+cargo +nightly fuzz run filename -- -max_total_time=60
 ```
 
 Shared modules cover the `iced` UI, platform interface, receiver status, event handling, settings, trust decisions, selection handling, cancellation, security policy, and download paths. Receiver filename sanitization is compiled on Linux and Windows, where Kalo hosts the incoming transfer. Linux-specific modules integrate with BlueZ and `obexd`; Windows-specific modules implement WinRT RFCOMM/OBEX operations; macOS-specific modules use IOBluetooth.
