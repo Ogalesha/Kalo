@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use zbus::Connection;
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::events::{Event, EventSink, TransferStatus};
+use crate::transfer::{Cancel, SendSummary};
 
 /// How often the transfer status is re-read as a safety net: D-Bus
 /// property-change signals are not replayed to late subscribers, so the
@@ -78,35 +78,17 @@ trait Transfer {
     fn cancel(&self) -> zbus::Result<()>;
 }
 
-/// Summary of a completed outgoing transfer.
-#[derive(Debug, Clone)]
-pub struct SendSummary {
-    pub mac: String,
-    pub bytes: u64,
-    pub elapsed_secs: f64,
-    pub mbps: f64,
-}
-
-impl SendSummary {
-    pub fn line(&self) -> String {
-        format!(
-            "sent {} bytes to {} in {:.1}s ({:.2} MB/s)",
-            self.bytes, self.mac, self.elapsed_secs, self.mbps
-        )
-    }
-}
-
 /// Send one file to `mac` via OPP, streaming progress into `events`.
 ///
 /// `send_id` is echoed in every progress event so the UI can discard progress
-/// from a previous or concurrent send. `cancel` is optional; when it resolves,
-/// the OBEX transfer is cancelled and the session is torn down.
+/// from a previous or concurrent send. `cancel` is shared by the whole batch;
+/// when it fires, the OBEX transfer is cancelled and the session torn down.
 pub async fn send(
     mac: &str,
     file: &Path,
     events: &EventSink,
     send_id: u64,
-    cancel: Option<oneshot::Receiver<()>>,
+    cancel: &Cancel,
 ) -> Result<SendSummary> {
     let file = file.canonicalize().context("file not found")?;
     let conn = Connection::session().await?;
@@ -116,10 +98,9 @@ pub async fn send(
     let mut args: HashMap<&str, Value<'_>> = HashMap::new();
     args.insert("Target", Value::new("opp"));
 
-    let mut cancel = cancel;
     let create = client.create_session(mac, args);
     tokio::pin!(create);
-    let session = match preflight_outcome(PREFLIGHT_TIMEOUT, &mut cancel, create.as_mut()).await {
+    let session = match preflight_outcome(PREFLIGHT_TIMEOUT, cancel, create.as_mut()).await {
         Preflight::Ready(result) => result
             .context("CreateSession failed (is the device paired, in range and reachable?)")?,
         Preflight::Canceled => {
@@ -149,12 +130,7 @@ pub async fn send(
     }
 
     let (bytes, elapsed_secs) = outcome?;
-    Ok(SendSummary {
-        mac: mac.to_string(),
-        bytes,
-        elapsed_secs,
-        mbps: mbps(bytes, elapsed_secs),
-    })
+    Ok(SendSummary::new(mac, bytes, elapsed_secs))
 }
 
 /// Push the file into an existing OPP session and wait until the transfer
@@ -165,7 +141,7 @@ async fn push_to_session(
     file: &Path,
     events: &EventSink,
     send_id: u64,
-    cancel: Option<oneshot::Receiver<()>>,
+    cancel: &Cancel,
 ) -> Result<(u64, f64)> {
     let started = Instant::now();
     let push = ObjectPushProxy::builder(conn)
@@ -173,12 +149,11 @@ async fn push_to_session(
         .build()
         .await?;
 
-    let mut cancel = cancel;
     let source = file.to_string_lossy();
     let send_file = push.send_file(source.as_ref());
     tokio::pin!(send_file);
     let (transfer, props) =
-        match preflight_outcome(PREFLIGHT_TIMEOUT, &mut cancel, send_file.as_mut()).await {
+        match preflight_outcome(PREFLIGHT_TIMEOUT, cancel, send_file.as_mut()).await {
             Preflight::Ready(result) => result.context("SendFile failed")?,
             Preflight::Canceled => {
                 // Cancel a transfer object that appears while we are backing
@@ -326,7 +301,7 @@ async fn push_to_session(
                     bail!(reason);
                 }
             }
-            _ = wait_cancel(&mut cancel) => {
+            _ = cancel.wait() => {
                 let _ = tokio::time::timeout(CANCEL_TIMEOUT, transfer_proxy.cancel()).await;
                 events.send(Event::Log("send canceled".into()));
                 bail!("send canceled");
@@ -358,7 +333,7 @@ enum Preflight<T> {
 
 async fn preflight_outcome<T, F>(
     deadline: Duration,
-    cancel: &mut Option<oneshot::Receiver<()>>,
+    cancel: &Cancel,
     call: Pin<&mut F>,
 ) -> Preflight<T>
 where
@@ -366,19 +341,8 @@ where
 {
     tokio::select! {
         result = call => Preflight::Ready(result),
-        _ = wait_cancel(cancel) => Preflight::Canceled,
+        _ = cancel.wait() => Preflight::Canceled,
         _ = tokio::time::sleep(deadline) => Preflight::TimedOut,
-    }
-}
-
-/// Resolve a cancel request. With no receiver this future never completes, so
-/// the `select!` branch stays disabled without an extra flag.
-async fn wait_cancel(cancel: &mut Option<oneshot::Receiver<()>>) {
-    match cancel {
-        Some(rx) => {
-            let _ = rx.await;
-        }
-        None => std::future::pending::<()>().await,
     }
 }
 
@@ -409,14 +373,6 @@ fn stall_reason(
             UNKNOWN_TIMEOUT.as_secs()
         )),
         _ => None,
-    }
-}
-
-fn mbps(bytes: u64, elapsed_secs: f64) -> f64 {
-    if elapsed_secs > 0.0 {
-        bytes as f64 / (1024.0 * 1024.0) / elapsed_secs
-    } else {
-        0.0
     }
 }
 
@@ -492,13 +448,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_interrupts_a_pending_preflight_call() {
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let mut cancel = Some(cancel_rx);
+        let (cancel_tx, cancel) = Cancel::new();
         let call = std::future::pending::<zbus::Result<()>>();
         tokio::pin!(call);
-        cancel_tx.send(()).unwrap();
+        cancel_tx.cancel();
 
-        match preflight_outcome(Duration::from_secs(60), &mut cancel, call.as_mut()).await {
+        match preflight_outcome(Duration::from_secs(60), &cancel, call.as_mut()).await {
             Preflight::Canceled => {}
             _ => panic!("cancel must win over a pending preflight call"),
         }
@@ -506,11 +461,11 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_calls_have_a_bounded_deadline() {
-        let mut cancel = None;
+        let (_handle, cancel) = Cancel::new();
         let call = std::future::pending::<zbus::Result<()>>();
         tokio::pin!(call);
 
-        match preflight_outcome(Duration::from_millis(10), &mut cancel, call.as_mut()).await {
+        match preflight_outcome(Duration::from_millis(10), &cancel, call.as_mut()).await {
             Preflight::TimedOut => {}
             _ => panic!("preflight must time out instead of hanging forever"),
         }

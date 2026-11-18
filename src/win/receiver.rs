@@ -5,7 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +30,7 @@ use super::{ComGuard, format_mac, hstring, run_blocking};
 use crate::events::{Event, EventSink};
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
+use crate::security;
 use crate::settings::{SaveDir, Settings};
 use crate::trust::{Authorizer, TrustStore};
 
@@ -178,6 +179,30 @@ struct ConnectionContext {
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    /// Bounded number of simultaneous incoming connections.
+    active: Arc<AtomicUsize>,
+}
+
+/// Releases one concurrency slot when the connection worker ends.
+struct IncomingSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl IncomingSlot {
+    fn acquire(active: Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < security::MAX_CONCURRENT_INCOMING).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self { active })
+    }
+}
+
+impl Drop for IncomingSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn start_advertising(
@@ -244,6 +269,7 @@ fn advertise(
         save_dir,
         events,
         authorizer,
+        active: Arc::new(AtomicUsize::new(0)),
     });
     let handler: ConnectionHandler = TypedEventHandler::new(
         move |_sender: windows::core::Ref<'_, StreamSocketListener>,
@@ -271,6 +297,13 @@ fn advertise(
 
 /// Serve one accepted RFCOMM connection until it disconnects or fails.
 fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
+    let Some(_slot) = IncomingSlot::acquire(context.active.clone()) else {
+        context.events.send(Event::Log(format!(
+            "rejected incoming connection: {} transfers are already active",
+            security::MAX_CONCURRENT_INCOMING
+        )));
+        return;
+    };
     let sender = remote_sender(&socket);
     if sender.stable {
         context.events.send(Event::Log(format!(
@@ -416,7 +449,7 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
                 if last_chunk {
                     let transfer = incoming.take().expect("incoming exists");
                     match finish_transfer(transfer, &context.save_dir.get(), &context.events) {
-                        Ok(()) => {
+                        Ok(SaveOutcome::Saved) => {
                             if let Err(error) =
                                 stream.write_response(&Response::new(ResponseCode::Success))
                             {
@@ -425,6 +458,10 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
                                 )));
                                 break;
                             }
+                        }
+                        Ok(SaveOutcome::Blocked) => {
+                            let _ = stream.write_response(&Response::new(ResponseCode::Forbidden));
+                            break;
                         }
                         Err(error) => {
                             context
@@ -494,6 +531,8 @@ struct Incoming {
     bytes: u64,
     started: Instant,
     last_emit: Instant,
+    /// Hashes while bytes are written, avoiding a second read at the end.
+    hasher: security::Hasher,
 }
 
 impl Incoming {
@@ -501,12 +540,22 @@ impl Incoming {
         if body.is_empty() {
             return Ok(());
         }
+        let next = self.bytes.saturating_add(body.len() as u64);
+        if next > security::MAX_FILE_BYTES {
+            bail!("received object exceeds the 4 GB OPP limit");
+        }
+        if let Some(size) = self.size
+            && next > size
+        {
+            bail!("sender wrote more data than the announced size");
+        }
         self.file
             .as_mut()
             .context("staging file is closed")?
             .write_all(body)
             .with_context(|| format!("write staged file {:?}", self.dest))?;
-        self.bytes += body.len() as u64;
+        self.hasher.update(body);
+        self.bytes = next;
         if self.last_emit.elapsed() >= PROGRESS_INTERVAL {
             self.last_emit = Instant::now();
             events.send(Event::IncomingProgress {
@@ -533,8 +582,11 @@ fn start_transfer(
     safe_name: String,
     size: Option<u64>,
 ) -> Result<Incoming> {
+    // Refuse before writing: an announced transfer that cannot fit must not
+    // consume the little free space that is left.
+    security::ensure_free_space(&context.save_dir.get(), size)?;
     let staging_dir = staging_root().join(format!("kalo-{id}"));
-    std::fs::create_dir_all(&staging_dir)
+    security::create_private_dir(&staging_dir)
         .with_context(|| format!("create staging directory {staging_dir:?}"))?;
     let dest = staging_dir.join(&safe_name);
     let file = OpenOptions::new()
@@ -560,18 +612,47 @@ fn start_transfer(
         bytes: 0,
         started: Instant::now(),
         last_emit: Instant::now(),
+        hasher: security::Hasher::new(),
     })
 }
 
+/// Outcome of a completed receive. A blocked file is deleted, not saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcome {
+    Saved,
+    Blocked,
+}
+
 /// Move a completed file into Downloads and report the transfer.
-fn finish_transfer(mut transfer: Incoming, downloads: &Path, events: &EventSink) -> Result<()> {
+fn finish_transfer(
+    mut transfer: Incoming,
+    downloads: &Path,
+    events: &EventSink,
+) -> Result<SaveOutcome> {
     transfer.close();
+    let digest = std::mem::take(&mut transfer.hasher).finish();
+    if security::is_blocked(digest) {
+        let _ = std::fs::remove_file(&transfer.dest);
+        events.send(Event::IncomingFailed {
+            id: transfer.id.clone(),
+            sender: transfer.sender.clone(),
+            name: transfer.name.clone(),
+            error: format!(
+                "blocked by the malware hash list (SHA-256 {}); the received file was deleted",
+                security::digest_hex(digest)
+            ),
+            staged_at: None,
+        });
+        let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+        return Ok(SaveOutcome::Blocked);
+    }
     let persisted = (|| -> Result<(PathBuf, u64)> {
         std::fs::create_dir_all(downloads)
             .with_context(|| format!("create Downloads directory {downloads:?}"))?;
         let bytes = std::fs::metadata(&transfer.dest)
             .with_context(|| format!("read staged file {:?}", transfer.dest))?
             .len();
+        security::ensure_free_space(downloads, Some(bytes))?;
         let name = sanitize::filename(
             transfer
                 .dest
@@ -618,6 +699,12 @@ fn finish_transfer(mut transfer: Incoming, downloads: &Path, events: &EventSink)
     } else {
         0.0
     };
+    if let Err(error) = security::harden_received_file(&final_path) {
+        events.send(Event::Log(format!(
+            "warning: cannot harden {}: {error:#}",
+            final_path.display()
+        )));
+    }
     events.send(Event::IncomingDone {
         id: transfer.id,
         sender: transfer.sender,
@@ -629,7 +716,7 @@ fn finish_transfer(mut transfer: Incoming, downloads: &Path, events: &EventSink)
         partial,
     });
     let _ = std::fs::remove_dir_all(&transfer.staging_dir);
-    Ok(())
+    Ok(SaveOutcome::Saved)
 }
 
 /// Keep a usable partial file in staging and tell the UI where it is.
@@ -776,6 +863,25 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         {
             continue;
         }
+        match security::scan_received_file(&entry.path()) {
+            Ok(scan) if scan.blocked => {
+                let _ = std::fs::remove_file(entry.path());
+                events.send(Event::Log(format!(
+                    "deleted a stale staged file that matches the malware hash list (SHA-256 {})",
+                    security::digest_hex(scan.digest)
+                )));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Never present an unverified file as recovered.
+                events.send(Event::Log(format!(
+                    "left a stale staged file unscanned at {:?}: {error:#}",
+                    entry.path()
+                )));
+                continue;
+            }
+        }
         if let Err(error) = std::fs::create_dir_all(downloads) {
             events.send(Event::Log(format!(
                 "cannot recover staged files into {downloads:?}: {error}"
@@ -787,6 +893,12 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         loop {
             match sanitize::move_file(&entry.path(), &dest) {
                 Ok(()) => {
+                    if let Err(error) = security::harden_received_file(&dest) {
+                        events.send(Event::Log(format!(
+                            "warning: cannot harden {}: {error:#}",
+                            dest.display()
+                        )));
+                    }
                     recovered += 1;
                     break;
                 }

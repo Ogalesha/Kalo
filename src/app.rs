@@ -6,17 +6,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::SinkExt;
-use iced::widget::{button, column, container, progress_bar, row, rule, scrollable, space, text};
-use iced::{Alignment, Color, Element, Font, Length, Padding, Subscription, Task};
+use iced::widget::{
+    button, column, container, image as image_widget, progress_bar, row, rule, scrollable, space,
+    text,
+};
+use iced::{Alignment, Color, ContentFit, Element, Font, Length, Padding, Subscription, Task};
 use tokio::sync::broadcast;
-use tokio::sync::oneshot;
 
 use crate::events::{
     Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
 };
 use crate::paths;
 use crate::platform::{self, DeviceInfo, PendingTransfers, ReceiverHandle, new_pending};
+use crate::selection::Selection;
 use crate::settings::{SaveDir, Settings, ThemeKind};
+use crate::transfer::{Cancel, CancelHandle, batch_position};
 use crate::trust::{Authorizer, IncomingPolicy, TrustStore};
 
 /// Shared handles for the event-pump subscription. iced 0.14 builds
@@ -60,8 +64,12 @@ pub enum Message {
     },
     RefreshDevices,
     PickDevice(String),
-    PickFile,
-    FilePicked(Option<PathBuf>),
+    PickFiles,
+    PickFolder,
+    /// Raw paths chosen in a file dialog. The folder walk runs off the UI
+    /// thread before the selection is accepted.
+    FilesPicked(Option<Vec<PathBuf>>),
+    SelectionCollected(Result<Selection, String>),
     SendClicked,
     CancelSend,
     SendFinished {
@@ -134,9 +142,14 @@ struct SavedUi {
 struct ActiveSend {
     id: u64,
     target: String,
-    cancel: Option<oneshot::Sender<()>>,
+    cancel: Option<CancelHandle>,
     cancel_requested: bool,
     progress: Option<SendProgressUi>,
+    /// 1-based position in the batch and the batch size.
+    index: usize,
+    total: usize,
+    /// File currently being sent, for the batch header.
+    current: String,
 }
 
 struct App {
@@ -149,8 +162,8 @@ struct App {
     /// Selected device address (stable across list refreshes; an index would
     /// go stale because `list_known_devices` re-sorts on every refresh).
     selected: Option<String>,
-    file: Option<PathBuf>,
-    picking_file: bool,
+    selection: Option<Selection>,
+    picking_selection: bool,
     log: Vec<String>,
     /// The active send, if any.
     active_send: Option<ActiveSend>,
@@ -331,8 +344,13 @@ pub fn run() -> iced::Result {
                 devices_loading: start.devices_loading,
                 devices_error: None,
                 selected: start.selected,
-                file: demo.then(|| PathBuf::from("/home/you/Documents/design-review.pdf")),
-                picking_file: false,
+                selection: demo.then(|| Selection {
+                    files: vec![PathBuf::from("/home/you/Documents/design-review.pdf")],
+                    total_bytes: 4_200_000,
+                    notes: Vec::new(),
+                    folders: 0,
+                }),
+                picking_selection: false,
                 log: start.log,
                 active_send: None,
                 next_send_id: 1,
@@ -442,32 +460,78 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.send_result = None;
             Task::none()
         }
-        Message::PickFile => {
-            if app.is_sending() || app.picking_file {
+        Message::PickFiles => {
+            if app.is_sending() || app.picking_selection {
                 return Task::none();
             }
-            app.picking_file = true;
+            app.picking_selection = true;
             Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
-                        .set_title("Choose a file to send")
-                        .pick_file()
+                        .set_title("Choose files to send")
+                        .pick_files()
                         .await
-                        .map(|handle| handle.path().to_path_buf())
+                        .map(|handles| {
+                            handles
+                                .into_iter()
+                                .map(|handle| handle.path().to_path_buf())
+                                .collect()
+                        })
                 },
-                Message::FilePicked,
+                Message::FilesPicked,
             )
         }
-        Message::FilePicked(file) => {
-            app.picking_file = false;
+        Message::PickFolder => {
+            if app.is_sending() || app.picking_selection {
+                return Task::none();
+            }
+            app.picking_selection = true;
+            Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Choose a folder to send")
+                        .pick_folder()
+                        .await
+                        .map(|handle| vec![handle.path().to_path_buf()])
+                },
+                Message::FilesPicked,
+            )
+        }
+        Message::FilesPicked(paths) => {
+            app.picking_selection = false;
             if app.is_sending() {
-                app.log("ignored a file selection that finished during a send");
+                app.log("ignored a selection that finished during a send");
                 return Task::none();
             }
             // Cancel leaves the previous selection intact.
-            if let Some(file) = file {
-                app.file = Some(file);
-                app.send_result = None;
+            let Some(paths) = paths else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || crate::selection::collect(&paths))
+                        .await
+                        .map_err(|error| format!("selection task failed: {error}"))?
+                        .map_err(|error| format!("{error:#}"))
+                },
+                Message::SelectionCollected,
+            )
+        }
+        Message::SelectionCollected(result) => {
+            match result {
+                Ok(selection) => {
+                    for note in &selection.notes {
+                        app.log(note.clone());
+                    }
+                    app.log(format!(
+                        "{} ready to send ({})",
+                        selection_summary(&selection),
+                        format_bytes(selection.total_bytes)
+                    ));
+                    app.selection = Some(selection);
+                    app.send_result = None;
+                }
+                Err(error) => app.log(format!("Couldn't prepare the selection: {error}")),
             }
             Task::none()
         }
@@ -476,47 +540,69 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.log(format!("send already in progress (id {send_id})"));
                 return Task::none();
             }
-            if app.picking_file {
-                app.log("finish choosing a file before starting a send");
+            if app.picking_selection {
+                app.log("finish choosing files before starting a send");
                 return Task::none();
             }
             let Some(device) = resolve_target(&app.devices, app.selected.as_deref()) else {
                 app.log("select a device first");
                 return Task::none();
             };
-            let Some(file) = app.file.clone() else {
-                app.log("pick a file first");
+            let Some(selection) = app.selection.clone() else {
+                app.log("choose files or a folder first");
                 return Task::none();
             };
             let mac = device.address.clone();
             let target = format!("{} ({})", device_name(device), device.address);
             let result_target = device_name(device).to_string();
-            let result_file = file_name(&file);
+            let files = selection.files;
+            let total = files.len();
+            let first_name = files
+                .first()
+                .map(|file| file_name(file))
+                .unwrap_or_default();
             let send_id = app.next_send_id;
             app.next_send_id += 1;
-            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let (cancel_handle, cancel) = Cancel::new();
 
             app.active_send = Some(ActiveSend {
                 id: send_id,
                 target,
-                cancel: Some(cancel_tx),
+                cancel: Some(cancel_handle),
                 cancel_requested: false,
                 progress: None,
+                index: 1,
+                total,
+                current: first_name,
             });
             app.send_result = None;
 
             let tx = app.tx.clone();
             Task::perform(
                 async move {
-                    platform::send(&mac, &file, &tx, send_id, Some(cancel_rx))
+                    platform::send(&mac, &files, &tx, send_id, cancel)
                         .await
                         .map(|summary| {
-                            format!(
-                                "Sent {result_file} to {result_target} · {} in {:.1}s ({:.1} MB/s)",
-                                format_bytes(summary.bytes),
-                                summary.elapsed_secs,
-                                summary.mbps
-                            )
+                            if summary.files == 1 {
+                                let name = files
+                                    .first()
+                                    .map(|file| file_name(file))
+                                    .unwrap_or_else(|| "file".to_string());
+                                format!(
+                                    "Sent {name} to {result_target} · {} in {:.1}s ({:.1} MB/s)",
+                                    format_bytes(summary.bytes),
+                                    summary.elapsed_secs,
+                                    summary.mbps
+                                )
+                            } else {
+                                format!(
+                                    "Sent {} files ({}) to {result_target} · {:.1}s ({:.1} MB/s)",
+                                    summary.files,
+                                    format_bytes(summary.bytes),
+                                    summary.elapsed_secs,
+                                    summary.mbps
+                                )
+                            }
                         })
                 },
                 move |result| Message::SendFinished {
@@ -531,13 +617,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     "cancel already requested".to_string()
                 } else {
                     match active.cancel.take() {
-                        Some(cancel) => match cancel.send(()) {
-                            Ok(()) => {
+                        Some(cancel) => {
+                            if cancel.cancel() {
                                 active.cancel_requested = true;
                                 "canceling send…".to_string()
+                            } else {
+                                "send already finished".to_string()
                             }
-                            Err(_) => "send already finished".to_string(),
-                        },
+                        }
                         None => "no send to cancel".to_string(),
                     }
                 }
@@ -686,6 +773,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 fn handle_event(app: &mut App, event: Event) -> Task<Message> {
     match event {
         Event::Log(line) => app.log(line),
+        Event::SendFileStarted {
+            send_id,
+            index,
+            total,
+            name,
+        } => {
+            let Some(active) = app.active_send.as_mut().filter(|send| send.id == send_id) else {
+                return Task::none();
+            };
+            active.index = index;
+            active.total = total;
+            active.current = name;
+            // A new file gets a fresh bar; keeping the previous file's
+            // fraction would look like the next file already made progress.
+            active.progress = None;
+        }
         Event::SendProgress {
             send_id,
             transferred,
@@ -1023,42 +1126,63 @@ fn view(app: &App) -> Element<'_, Message> {
     }
     device_section = device_section.push(device_list);
 
-    let file_title = app
-        .file
-        .as_deref()
-        .map(file_name)
-        .unwrap_or_else(|| "No file selected".to_string());
-    let mut file_info = column![
+    let (file_title, file_detail) = match app.selection.as_ref() {
+        Some(selection) if selection.file_count() == 1 => {
+            let path = &selection.files[0];
+            let detail = path
+                .parent()
+                .map(folder_label)
+                .filter(|folder| !folder.is_empty())
+                .map(|folder| format!("{folder} · {}", format_bytes(selection.total_bytes)))
+                .unwrap_or_else(|| format_bytes(selection.total_bytes));
+            (file_name(path), detail)
+        }
+        Some(selection) => {
+            let folder = selection
+                .files
+                .first()
+                .and_then(|file| file.parent())
+                .map(folder_label)
+                .filter(|folder| !folder.is_empty());
+            let detail = match folder {
+                Some(folder) => format!(
+                    "{} files from {folder} · {}",
+                    selection.file_count(),
+                    format_bytes(selection.total_bytes)
+                ),
+                None => format!(
+                    "{} files · {}",
+                    selection.file_count(),
+                    format_bytes(selection.total_bytes)
+                ),
+            };
+            (format!("{} files selected", selection.file_count()), detail)
+        }
+        None => (
+            "No files selected".to_string(),
+            "Pick one file, several files, or a whole folder.".to_string(),
+        ),
+    };
+    let has_selection = app.selection.is_some();
+    let file_info = column![
         text(file_title)
             .size(13.5)
-            .font(if app.file.is_some() {
+            .font(if has_selection {
                 ui::SEMIBOLD
             } else {
                 Font::DEFAULT
             })
-            .color(if app.file.is_some() {
+            .color(if has_selection {
                 p.text
             } else {
                 p.text_secondary
             }),
+        text(file_detail).size(11).color(p.text_muted),
     ]
     .spacing(2)
     .width(Length::Fill);
-    if let Some(path) = app.file.as_deref() {
-        file_info = file_info.push(
-            text(path.display().to_string())
-                .size(11)
-                .color(p.text_muted),
-        );
-    }
 
-    let file_button_label = if app.picking_file {
-        "Choosing…"
-    } else if app.file.is_some() {
-        "Change…"
-    } else {
-        "Choose file…"
-    };
+    let choosing = app.picking_selection;
     let file_zone = container(
         row![
             container(text("↥").size(18).font(ui::BOLD).color(p.accent_text))
@@ -1067,10 +1191,21 @@ fn view(app: &App) -> Element<'_, Message> {
                 .center(38)
                 .style(ui::icon_tile),
             file_info,
-            button(text(file_button_label).size(12).font(ui::MEDIUM))
-                .padding([7, 11])
+            column![
+                button(
+                    text(if choosing { "Choosing…" } else { "Files…" })
+                        .size(12)
+                        .font(ui::MEDIUM)
+                )
+                .padding([5, 10])
                 .style(ui::secondary_button)
-                .on_press_maybe((!is_sending && !app.picking_file).then_some(Message::PickFile)),
+                .on_press_maybe((!is_sending && !choosing).then_some(Message::PickFiles)),
+                button(text("Folder…").size(12).font(ui::MEDIUM))
+                    .padding([5, 10])
+                    .style(ui::secondary_button)
+                    .on_press_maybe((!is_sending && !choosing).then_some(Message::PickFolder)),
+            ]
+            .spacing(4),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
@@ -1079,16 +1214,14 @@ fn view(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(ui::inset);
 
-    let file_section = column![step_label("2", "Choose a file", p), file_zone,].spacing(9);
+    let file_section =
+        column![step_label("2", "Choose files or a folder", p), file_zone,].spacing(9);
 
     let send_panel = container(
         column![
             column![
-                text("Send a file")
-                    .size(20)
-                    .font(ui::SEMIBOLD)
-                    .color(p.text),
-                text("Select a Bluetooth device and a file to send.")
+                text("Send files").size(20).font(ui::SEMIBOLD).color(p.text),
+                text("Select a Bluetooth device, then send files or a folder.")
                     .size(12)
                     .color(p.text_secondary),
             ]
@@ -1277,13 +1410,30 @@ fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn brand_mark<'a>(p: &ui::Palette) -> Element<'a, Message> {
-    container(text("K").size(19).font(ui::BOLD).color(p.on_accent))
-        .width(40)
-        .height(40)
-        .center(40)
-        .style(ui::brand)
-        .into()
+fn brand_mark<'a>(_p: &ui::Palette) -> Element<'a, Message> {
+    // The in-app mark is the shipped 256 px icon, so the window, tray, desktop
+    // entry and app all show the same artwork. The gradient tile behind it
+    // keeps the white "K" readable in the light theme.
+    static MARK: OnceLock<image_widget::Handle> = OnceLock::new();
+    let mark = MARK
+        .get_or_init(|| {
+            image_widget::Handle::from_bytes(
+                include_bytes!("../packaging/common/icons/hicolor/256x256/apps/kalo.png")
+                    .as_slice(),
+            )
+        })
+        .clone();
+    container(
+        image_widget(mark)
+            .width(Length::Fixed(26.0))
+            .height(Length::Fixed(26.0))
+            .content_fit(ContentFit::Contain),
+    )
+    .width(40)
+    .height(40)
+    .center(40)
+    .style(ui::brand)
+    .into()
 }
 
 fn chip<'a>(label: &'a str, p: &ui::Palette) -> Element<'a, Message> {
@@ -1930,7 +2080,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         let fraction = progress.and_then(|progress| progress.fraction);
         let detail = progress
             .map(|progress| progress.detail.clone())
-            .unwrap_or_else(|| "Preparing transfer…".to_string());
+            .unwrap_or_else(|| "Starting…".to_string());
         let mut top = row![
             text(format!("Sending to {}", active.target))
                 .size(13.5)
@@ -1972,7 +2122,10 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         .spacing(12)
         .align_y(Alignment::Center);
 
-        let mut block = column![top].spacing(8);
+        let current = text(batch_position(active.index, active.total, &active.current))
+            .size(11.5)
+            .color(p.text_secondary);
+        let mut block = column![top, current].spacing(8);
         if let Some(fraction) = fraction {
             block = block.push(
                 progress_bar(0.0..=1.0, fraction)
@@ -1987,19 +2140,34 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
             .into();
     }
 
-    let can_send = target.is_some() && app.file.is_some() && !app.picking_file;
-    let guidance = match (target.is_some(), app.file.is_some()) {
-        (false, false) => "Select a device and choose a file.",
-        (false, true) => "Select a device to send this file.",
-        (true, false) => "Choose a file to send.",
-        (true, true) => "Ready to send.",
+    let selected = app
+        .selection
+        .as_ref()
+        .map(Selection::file_count)
+        .unwrap_or(0);
+    let can_send = target.is_some() && selected > 0 && !app.picking_selection;
+    let guidance = match (target.is_some(), selected) {
+        (false, 0) => "Select a device and choose files.".to_string(),
+        (false, _) => "Select a device to send this selection.".to_string(),
+        (true, 0) => "Choose files or a folder to send.".to_string(),
+        (true, 1) => "Ready to send 1 file.".to_string(),
+        (true, count) => format!("Ready to send {count} files."),
     };
     let send_label = target
-        .map(|device| format!("Send to {}", device_name(device)))
-        .unwrap_or_else(|| "Send file".to_string());
+        .map(|device| {
+            if selected > 1 {
+                format!("Send {selected} files to {}", device_name(device))
+            } else {
+                format!("Send to {}", device_name(device))
+            }
+        })
+        .unwrap_or_else(|| "Send files".to_string());
 
     let mut block = column![
-        container(text(guidance).size(11.5).color(p.text_muted)).height(Length::Fixed(17.0)),
+        container(text(guidance).size(11.5).color(p.text_muted))
+            .width(Length::Fill)
+            .height(Length::Fixed(18.0))
+            .align_y(Alignment::Center),
         button(
             row![
                 text(send_label).size(14).font(ui::SEMIBOLD),
@@ -2059,6 +2227,13 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn selection_summary(selection: &Selection) -> String {
+    match selection.file_count() {
+        1 => file_name(&selection.files[0]),
+        count => format!("{count} files"),
+    }
 }
 
 /// Resolve the selected device by address (pure helper, unit-tested):
@@ -2758,8 +2933,13 @@ mod tests {
             devices_loading: false,
             devices_error: None,
             selected: Some("AA:BB".into()),
-            file: Some(PathBuf::from("/tmp/kalo-test-file")),
-            picking_file: false,
+            selection: Some(Selection {
+                files: vec![PathBuf::from("/tmp/kalo-test-file")],
+                total_bytes: 16,
+                notes: Vec::new(),
+                folders: 0,
+            }),
+            picking_selection: false,
             log: Vec::new(),
             active_send: None,
             next_send_id: 1,
@@ -2786,6 +2966,9 @@ mod tests {
             cancel: None,
             cancel_requested: false,
             progress: None,
+            index: 1,
+            total: 1,
+            current: "kalo-test-file".into(),
         }
     }
 
@@ -2837,27 +3020,27 @@ mod tests {
     #[test]
     fn send_waits_for_the_file_picker_to_finish() {
         let mut app = app();
-        app.picking_file = true;
+        app.picking_selection = true;
         let _ = update(&mut app, Message::SendClicked);
         assert!(app.active_send.is_none());
         assert!(
             app.log
                 .iter()
-                .any(|line| line.contains("finish choosing a file"))
+                .any(|line| line.contains("finish choosing files"))
         );
     }
 
     #[test]
     fn cancel_is_available_before_progress_arrives() {
         let mut app = app();
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let (cancel_handle, cancel) = Cancel::new();
         app.active_send = Some(ActiveSend {
-            cancel: Some(cancel_tx),
+            cancel: Some(cancel_handle),
             ..active_send(1)
         });
 
         let _ = update(&mut app, Message::CancelSend);
-        assert!(matches!(cancel_rx.try_recv(), Ok(())));
+        assert!(cancel.is_cancelled());
         assert!(
             app.active_send
                 .as_ref()
@@ -2952,13 +3135,60 @@ mod tests {
     }
 
     #[test]
-    fn picker_cancel_preserves_existing_file() {
+    fn batch_start_resets_progress_and_updates_position() {
         let mut app = app();
-        let previous = app.file.clone();
-        app.picking_file = true;
-        let _ = update(&mut app, Message::FilePicked(None));
-        assert_eq!(app.file, previous);
-        assert!(!app.picking_file);
+        app.active_send = Some(active_send(1));
+        let _ = handle_event(
+            &mut app,
+            Event::SendProgress {
+                send_id: 1,
+                transferred: 5,
+                size: Some(10),
+                status: crate::events::TransferStatus::Active,
+            },
+        );
+        let _ = handle_event(
+            &mut app,
+            Event::SendFileStarted {
+                send_id: 1,
+                index: 2,
+                total: 3,
+                name: "second.pdf".into(),
+            },
+        );
+        let active = app.active_send.as_ref().expect("active send");
+        assert!(active.progress.is_none());
+        assert_eq!(active.index, 2);
+        assert_eq!(active.total, 3);
+        assert_eq!(active.current, "second.pdf");
+    }
+
+    #[test]
+    fn selection_summary_names_single_files_and_counts_batches() {
+        let one = Selection {
+            files: vec![PathBuf::from("/tmp/report.pdf")],
+            total_bytes: 10,
+            notes: Vec::new(),
+            folders: 0,
+        };
+        assert_eq!(selection_summary(&one), "report.pdf");
+        let many = Selection {
+            files: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+            total_bytes: 20,
+            notes: Vec::new(),
+            folders: 0,
+        };
+        assert_eq!(selection_summary(&many), "2 files");
+    }
+
+    #[test]
+    fn picker_cancel_preserves_existing_selection() {
+        let mut app = app();
+        let previous = app.selection.clone();
+        app.picking_selection = true;
+        let _ = update(&mut app, Message::FilesPicked(None));
+        assert_eq!(app.selection, previous);
+        assert!(!app.picking_selection);
     }
 
     #[test]
@@ -3050,7 +3280,12 @@ mod tests {
 
         let _ = update(
             &mut app,
-            Message::FilePicked(Some(PathBuf::from("/tmp/next"))),
+            Message::SelectionCollected(Ok(Selection {
+                files: vec![PathBuf::from("/tmp/next")],
+                total_bytes: 4,
+                notes: Vec::new(),
+                folders: 0,
+            })),
         );
         assert!(app.send_result.is_none());
 

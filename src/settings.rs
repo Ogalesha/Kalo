@@ -111,7 +111,7 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    crate::security::create_private_dir(parent)
         .with_context(|| format!("create config directory {}", parent.display()))?;
 
     let bytes = serde_json::to_vec_pretty(value).context("serialize config")?;
@@ -119,6 +119,7 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let write = (|| -> Result<()> {
         let mut file = std::fs::File::create(&temporary)
             .with_context(|| format!("create {}", temporary.display()))?;
+        crate::security::restrict_file_permissions(&temporary)?;
         file.write_all(&bytes)
             .with_context(|| format!("write {}", temporary.display()))?;
         file.sync_all()

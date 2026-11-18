@@ -12,6 +12,10 @@
 - [x] Save-location preference and an "Open folder" action after a transfer.
 - [x] Brand icon and Linux status-area icon, working in horizontal and vertical
       panels through StatusNotifierItem.
+- [x] **Single file, multiple files and folder sending.** The window can pick
+      either files or a folder tree; folders are flattened, hidden entries and
+      symlinks are skipped, the selection is capped and sorted, and the batch
+      shares progress and cancellation.
 - [ ] **Two-way trusted peers.** Once two computers trust each other, transfers
       should need no approval in either direction. Today each receiver can
       remember a sender, but there is no reciprocal trust handshake yet.
@@ -46,6 +50,38 @@
       license.
 - [ ] Add an MSI/WiX installer, Start-menu entry and code signing for Windows.
 - [ ] Add a Windows notification-area icon equivalent to the Linux tray.
+- [x] **macOS sender and device backend** — IOBluetooth OPP sender with
+      progress, cancellation and stall handling; paired/recent device listing;
+      optional inquiry; pairing; adapter state; CLI support.
+- [x] **macOS app bundle** — `packaging/macos/build-app.sh` builds a universal
+      `Kalo.app` with the Bluetooth usage description, generated `.icns` and
+      ad-hoc signature, and CI uploads `kalo-macos-universal.zip`.
+- [ ] Validate the macOS backend on Apple hardware: Bluetooth permission
+      prompt, pairing, send to a phone/PC, radio off/on, and codesigning.
+- [ ] **macOS receiver.** Apple exposes no public OPP server API. Continue
+      pointing users to Bluetooth Sharing unless a supported API appears.
+
+## Security
+
+- [x] **Malware hash blocklist.** Bundle a baseline, merge the MIT-licensed
+      `romainmarcoux/malicious-hash` SHA-256 feeds, cache under the private
+      config directory, refresh daily in the background, and scan on both send
+      and receive.
+- [x] **Sender authorization.** Ask by default, remember allow/block decisions
+      by Bluetooth address, provide a Trusted-only policy, and reject unknown
+      senders in the CLI.
+- [x] **Filename sanitization.** Remove path separators and control
+      characters; neutralize Windows alternate-data-stream characters, trailing
+      dots/spaces and reserved device names.
+- [x] **Receive hardening.** Private staging, size and free-space checks,
+      bounded concurrency, Windows incremental hashing, scan-before-save,
+      deletion of blocked files, owner-only permissions on Unix, and
+      Mark-of-the-Web on Windows.
+- [x] **No remote control and no automatic opening.** OPP only; no execution,
+      preview, shell, or remote-control profile; received content stays inert.
+- [ ] Consider signed blocklist manifests or a second independent feed so a
+      compromised feed endpoint cannot silently weaken detection.
+- [ ] Add a fuzz target for the Windows OBEX parser and the filename sanitizer.
 
 ## Engineering
 
@@ -59,5 +95,8 @@
       `.deb`, Arch `kalo-git` package, Windows ZIP and Windows `.exe`. The
       Windows executable is smoke-tested with `--version` and `--help`, and the
       Arch package is installed and smoke-tested in an Arch container.
+- [x] Add a macOS CI job that runs Clippy and tests, builds the universal app
+      bundle, smoke-tests it, and publishes `kalo-macos-universal.zip` with
+      checksums.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
       adapters where the environment allows it.

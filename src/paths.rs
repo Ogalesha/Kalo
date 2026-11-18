@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// Directory for Kalo's settings and trust store.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -13,6 +13,17 @@ pub fn config_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("kalo")
+}
+
+/// macOS keeps user configuration in Application Support, not in `~/.config`.
+#[cfg(target_os = "macos")]
+pub fn config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library")
+        .join("Application Support")
+        .join("Kalo")
 }
 
 #[cfg(windows)]
@@ -50,8 +61,10 @@ pub fn trust_file() -> PathBuf {
 /// default Downloads folder works on a fresh account.
 pub fn open_folder(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("create folder {}", path.display()))?;
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     let mut command = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
     #[cfg(windows)]
     let mut command = std::process::Command::new("explorer");
     command
@@ -64,9 +77,10 @@ pub fn open_folder(path: &Path) -> Result<()> {
 /// The user's Downloads directory.
 ///
 /// Linux uses the XDG user directory (falling back to `$HOME/Downloads`).
-/// Windows asks the shell for the real Known Folder, so redirected or
-/// localized Downloads folders are honored.
-#[cfg(not(windows))]
+/// macOS uses the conventional `~/Downloads`. Windows asks the shell for the
+/// real Known Folder, so redirected or localized Downloads folders are
+/// honored.
+#[cfg(target_os = "linux")]
 pub fn downloads_dir() -> PathBuf {
     if let Ok(out) = std::process::Command::new("xdg-user-dir")
         .arg("DOWNLOAD")
@@ -80,6 +94,14 @@ pub fn downloads_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join("Downloads")
+}
+
+#[cfg(target_os = "macos")]
+pub fn downloads_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Downloads")
 }
 
 #[cfg(windows)]

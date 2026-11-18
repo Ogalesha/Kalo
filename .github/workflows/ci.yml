@@ -105,6 +105,43 @@ jobs:
           path: target/release/kalo.exe
           if-no-files-found: error
 
+  macos:
+    name: macOS
+    runs-on: macos-14
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build the application bundle
+        run: ./packaging/macos/build-app.sh
+
+      - name: Smoke-test the app
+        run: |
+          ./dist/Kalo.app/Contents/MacOS/kalo --version
+          ./dist/Kalo.app/Contents/MacOS/kalo --help
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/kalo-macos-universal.zip
+          if-no-files-found: error
+
   arch:
     name: Arch Linux
     runs-on: ubuntu-24.04
@@ -160,7 +197,7 @@ jobs:
   release:
     name: Publish latest builds
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux, windows, arch]
+    needs: [linux, windows, macos, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -168,7 +205,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "{linux-deb,windows-zip,windows-exe,arch-package}"
+          pattern: "{linux-deb,windows-zip,windows-exe,macos-app,arch-package}"
           merge-multiple: true
           path: artifacts
 
@@ -178,9 +215,10 @@ jobs:
           cp artifacts/*.deb release/kalo_amd64.deb
           cp artifacts/*.zip release/kalo-windows-x64.zip
           cp artifacts/kalo.exe release/kalo-windows-x64.exe
+          cp artifacts/kalo-macos-universal.zip release/kalo-macos-universal.zip
           cp artifacts/kalo-git-[0-9]*.pkg.tar.zst release/kalo-git-x86_64.pkg.tar.zst
           cd release
-          sha256sum kalo_amd64.deb kalo-windows-x64.zip kalo-windows-x64.exe kalo-git-x86_64.pkg.tar.zst > SHA256SUMS.txt
+          sha256sum kalo_amd64.deb kalo-windows-x64.zip kalo-windows-x64.exe kalo-macos-universal.zip kalo-git-x86_64.pkg.tar.zst > SHA256SUMS.txt
           ls -lh
 
       - name: Publish the rolling latest release
@@ -193,10 +231,12 @@ jobs:
 
             - Ubuntu: `kalo_amd64.deb`
             - Arch Linux: `kalo-git-x86_64.pkg.tar.zst`
+            - macOS 11+ (universal, ad-hoc signed): `kalo-macos-universal.zip`
             - Windows (experimental, untested on hardware): `kalo-windows-x64.zip`, `kalo-windows-x64.exe`
 
-            Built from commit `${{ github.sha }}` by GitHub Actions. Windows builds are
-            experimental and unsigned. See `SHA256SUMS.txt` for checksums.
+            Built from commit `${{ github.sha }}` by GitHub Actions. macOS and Windows
+            builds are not signed with a Developer ID or Authenticode certificate. See
+            `SHA256SUMS.txt` for checksums.
           files: release/*
           draft: false
           prerelease: false

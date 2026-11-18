@@ -78,6 +78,14 @@ impl fmt::Display for ReceiverStatus {
 pub enum Event {
     /// Generic log line.
     Log(String),
+    /// A file from the outgoing batch is about to be sent. The UI resets the
+    /// progress bar and shows the position in the queue. `index` is 1-based.
+    SendFileStarted {
+        send_id: u64,
+        index: usize,
+        total: usize,
+        name: String,
+    },
     /// Progress of an outgoing OPP transfer. `send_id` correlates it with the
     /// send task that produced it.
     SendProgress {

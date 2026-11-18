@@ -22,6 +22,7 @@ use crate::events::{Event, EventSink, TransferStatus};
 use crate::paths;
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
+use crate::security;
 use crate::settings::{SaveDir, Settings};
 use crate::trust::{Authorizer, TrustStore};
 
@@ -154,6 +155,7 @@ pub struct AgentService {
     handle: ReceiverHandle,
     registration: u64,
     authorizer: Authorizer,
+    save_dir: SaveDir,
 }
 
 #[interface(name = "org.bluez.obex.Agent1")]
@@ -222,6 +224,17 @@ impl AgentService {
         let size = t.size().await.ok();
 
         let id = Uuid::new_v4().simple().to_string();
+        if let Err(error) = self.accept_capacity(size) {
+            let reason = format!("{error:#}");
+            self.events.send(Event::IncomingFailed {
+                id: id.clone(),
+                sender: sender.clone(),
+                name: safe_name.clone(),
+                error: reason.clone(),
+                staged_at: None,
+            });
+            bail!("{reason}");
+        }
         if let Err(reason) = self
             .authorizer
             .authorize(&id, &sender, &sender, &safe_name, size)
@@ -237,9 +250,11 @@ impl AgentService {
             bail!("incoming push was not authorized");
         }
 
-        // Stage inside obexd's root (it may refuse to write outside it).
+        // Stage inside obexd's root (it may refuse to write outside it). The
+        // directory is private to this account: incoming content must never be
+        // readable by other local users while it waits for its scan.
         let staging_dir = PathBuf::from(&root).join(format!("kalo-{id}"));
-        std::fs::create_dir_all(&staging_dir)
+        security::create_private_dir(&staging_dir)
             .with_context(|| format!("create staging dir {staging_dir:?}"))?;
         let dest = staging_dir.join(&safe_name);
 
@@ -269,6 +284,19 @@ impl AgentService {
             size,
         });
         Ok(dest)
+    }
+
+    /// Refuse work this machine cannot safely accept: more than the bounded
+    /// number of simultaneous pushes, or a transfer that cannot fit on disk.
+    fn accept_capacity(&self, size: Option<u64>) -> Result<()> {
+        let active = self.pending.lock().expect("pending lock").len();
+        if active >= security::MAX_CONCURRENT_INCOMING {
+            bail!(
+                "too many simultaneous incoming transfers (limit {})",
+                security::MAX_CONCURRENT_INCOMING
+            );
+        }
+        security::ensure_free_space(&self.save_dir.get(), size)
     }
 }
 
@@ -376,6 +404,26 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         if !file_type.is_file() {
             continue;
         }
+        match security::scan_received_file(&entry.path()) {
+            Ok(scan) if scan.blocked => {
+                let _ = std::fs::remove_file(entry.path());
+                events.send(Event::Log(format!(
+                    "deleted a stale staged file that matches the malware hash list (SHA-256 {})",
+                    security::digest_hex(scan.digest)
+                )));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Keep the file staged: it was never verified, so it must not
+                // be presented as a successfully received file.
+                events.send(Event::Log(format!(
+                    "left a stale staged file unscanned at {:?}: {error:#}",
+                    entry.path()
+                )));
+                continue;
+            }
+        }
         if let Err(e) = std::fs::create_dir_all(downloads) {
             events.send(Event::Log(format!(
                 "cannot recover staged files into {downloads:?}: {e}"
@@ -387,6 +435,12 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         loop {
             match sanitize::move_file(&entry.path(), &dest) {
                 Ok(()) => {
+                    if let Err(error) = security::harden_received_file(&dest) {
+                        events.send(Event::Log(format!(
+                            "warning: cannot harden {}: {error:#}",
+                            dest.display()
+                        )));
+                    }
                     recovered += 1;
                     break;
                 }
@@ -810,6 +864,27 @@ fn finish_transfer(
         .unwrap_or_else(|| "received-file".into());
     let name = sanitize::filename(&base);
 
+    // Verify the finished object before it enters the user's save folder. A
+    // blocked file is deleted from staging and never shown as saved; a scan
+    // failure keeps the private staged copy for manual recovery instead of
+    // pretending the file is safe.
+    let scan = security::scan_received_file(&p.dest)?;
+    if scan.blocked {
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: format!(
+                "blocked by the malware hash list (SHA-256 {}); the received file was deleted",
+                security::digest_hex(scan.digest)
+            ),
+            staged_at: None,
+        });
+        return Ok(());
+    }
+    security::ensure_free_space(downloads, Some(bytes))?;
+
     // Retry the numbered name if another writer wins the race between
     // `unique_in_dir` and the no-overwrite move.
     let mut final_path = sanitize::unique_in_dir(downloads, &name);
@@ -821,6 +896,12 @@ fn finish_transfer(
             }
             Err(e) => return Err(e).context("move into Downloads"),
         }
+    }
+    if let Err(error) = security::harden_received_file(&final_path) {
+        events.send(Event::Log(format!(
+            "warning: cannot harden {}: {error:#}",
+            final_path.display()
+        )));
     }
 
     let partial = match p.size {
@@ -850,23 +931,7 @@ fn registration_path(id: u64) -> String {
     format!("{AGENT_PATH}/{id}")
 }
 
-async fn export_agent(
-    conn: &Connection,
-    path: &str,
-    pending: PendingTransfers,
-    events: EventSink,
-    handle: ReceiverHandle,
-    registration: u64,
-    authorizer: Authorizer,
-) -> Result<()> {
-    let service = AgentService {
-        conn: conn.clone(),
-        pending,
-        events,
-        handle,
-        registration,
-        authorizer,
-    };
+async fn export_agent(conn: &Connection, path: &str, service: AgentService) -> Result<()> {
     conn.object_server()
         .at(path, service)
         .await
@@ -882,20 +947,21 @@ async fn register_receiver(
     pending: PendingTransfers,
     events: EventSink,
     authorizer: Authorizer,
+    save_dir: SaveDir,
 ) -> Result<String> {
     let registration = handle.begin_registration();
     let path = registration_path(registration);
 
-    export_agent(
-        conn,
-        &path,
+    let service = AgentService {
+        conn: conn.clone(),
         pending,
-        events.clone(),
-        handle.clone(),
+        events: events.clone(),
+        handle: handle.clone(),
         registration,
         authorizer,
-    )
-    .await?;
+        save_dir,
+    };
+    export_agent(conn, &path, service).await?;
 
     let manager = match AgentManagerProxy::new(conn).await {
         Ok(manager) => manager,
@@ -1011,6 +1077,7 @@ async fn receiver_session(
         pending.clone(),
         events.clone(),
         authorizer.clone(),
+        save_dir.clone(),
     )
     .await
     {
@@ -1084,6 +1151,7 @@ async fn receiver_session(
                     pending.clone(),
                     events.clone(),
                     authorizer.clone(),
+                    save_dir.clone(),
                 )
                 .await
                 {
@@ -1126,7 +1194,16 @@ pub async fn agent_check() -> Result<()> {
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
     let authorizer = Authorizer::new(TrustStore::in_memory(), events.clone(), false);
-    let path = register_receiver(&conn, handle, new_pending(), events.clone(), authorizer).await?;
+    let check_save = SaveDir::new(paths::downloads_dir());
+    let path = register_receiver(
+        &conn,
+        handle,
+        new_pending(),
+        events.clone(),
+        authorizer,
+        check_save,
+    )
+    .await?;
     let manager = AgentManagerProxy::new(&conn).await?;
     manager.unregister_agent(opath(&path)?).await?;
     let _ = conn

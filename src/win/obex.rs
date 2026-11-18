@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use obex_protocol::client::Client;
 use obex_protocol::header::Header;
-use tokio::sync::oneshot;
 use windows::Networking::Sockets::StreamSocket;
 
 use super::rfcomm::RfcommStream;
 use super::{ComGuard, format_mac, parse_mac, run_blocking};
 use crate::events::{Event, EventSink, TransferStatus};
+use crate::transfer::{Cancel, SendSummary};
 
 /// OBEX Object Push service class: `F9EC7BC4-953C-11D2-984E-525400DC9E09`.
 const OPP_TARGET: [u8; 16] = [
@@ -25,24 +25,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVE_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Summary of a completed outgoing transfer.
-#[derive(Debug, Clone)]
-pub struct SendSummary {
-    pub mac: String,
-    pub bytes: u64,
-    pub elapsed_secs: f64,
-    pub mbps: f64,
-}
-
-impl SendSummary {
-    pub fn line(&self) -> String {
-        format!(
-            "sent {} bytes to {} in {:.1}s ({:.2} MB/s)",
-            self.bytes, self.mac, self.elapsed_secs, self.mbps
-        )
-    }
-}
 
 /// Send one file to `mac` via OPP, streaming progress into `events`.
 ///
@@ -54,7 +36,7 @@ pub async fn send(
     file: &Path,
     events: &EventSink,
     send_id: u64,
-    cancel: Option<oneshot::Receiver<()>>,
+    cancel: &Cancel,
 ) -> Result<SendSummary> {
     let file = file.canonicalize().context("file not found")?;
     let metadata = std::fs::metadata(&file).context("read the file")?;
@@ -75,18 +57,18 @@ pub async fn send(
 
     let canceled = Arc::new(AtomicBool::new(false));
     let socket_slot: Arc<Mutex<Option<StreamSocket>>> = Arc::new(Mutex::new(None));
-    if let Some(cancel) = cancel {
+    {
+        let cancel = cancel.clone();
         let canceled = canceled.clone();
         let socket_slot = socket_slot.clone();
         tokio::spawn(async move {
-            if cancel.await.is_ok() {
-                canceled.store(true, Ordering::SeqCst);
-                // Closing from this worker still counts as a WinRT call, so
-                // make sure the thread has a COM apartment before calling it.
-                let _com = ComGuard::new().ok();
-                if let Some(socket) = socket_slot.lock().expect("send socket lock").as_ref() {
-                    let _ = socket.Close();
-                }
+            cancel.wait().await;
+            canceled.store(true, Ordering::SeqCst);
+            // Closing from this worker still counts as a WinRT call, so make
+            // sure the thread has a COM apartment before calling it.
+            let _com = ComGuard::new().ok();
+            if let Some(socket) = socket_slot.lock().expect("send socket lock").as_ref() {
+                let _ = socket.Close();
             }
         });
     }
@@ -208,12 +190,7 @@ impl SendJob {
                     size: Some(self.size),
                     status: TransferStatus::Complete,
                 });
-                Ok(SendSummary {
-                    mac: self.target,
-                    bytes: self.size,
-                    elapsed_secs,
-                    mbps: mbps(self.size, elapsed_secs),
-                })
+                Ok(SendSummary::new(&self.target, self.size, elapsed_secs))
             }
             Err(error) => {
                 let sent = transferred.load(Ordering::SeqCst);
@@ -301,13 +278,5 @@ impl Read for ProgressReader {
             });
         }
         Ok(read)
-    }
-}
-
-fn mbps(bytes: u64, elapsed_secs: f64) -> f64 {
-    if elapsed_secs > 0.0 {
-        bytes as f64 / (1024.0 * 1024.0) / elapsed_secs
-    } else {
-        0.0
     }
 }
