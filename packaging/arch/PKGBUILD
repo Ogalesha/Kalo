@@ -34,7 +34,11 @@ optdepends=(
 )
 provides=('kalo')
 conflicts=('kalo')
-options=('!debug')
+# ring 0.17.14 (through rustls/ureq) inherits makepkg's -flto=auto CFLAGS.
+# GCC 16 then emits slim LTO objects that the final Rust link cannot resolve
+# without -flto on the link line, which breaks the build. Disable makepkg LTO
+# for this package; Cargo's own release profile is unaffected.
+options=('!debug' '!lto')
 source=("$pkgname::git+$url.git#branch=main")
 sha256sums=('SKIP')
 
