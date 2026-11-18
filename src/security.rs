@@ -4,9 +4,10 @@
 //! the content of a transfer, and every file that leaves or enters the app is
 //! checked against a SHA-256 malware blocklist. The blocklist is cached under
 //! the Kalo config directory and refreshed in the background from a public
-//! feed served by two independent endpoints; refresh failures never block a
-//! transfer. Refreshes are merged with the hashes already cached, so a
-//! compromised endpoint cannot silently remove a known-bad digest.
+//! feed served by raw GitHub with jsDelivr as a fallback; refresh failures
+//! never block a transfer. Refreshes are merged with the hashes already
+//! cached, so a compromised endpoint cannot silently remove a known-bad
+//! digest. The two mirrors add availability, not independent integrity.
 //!
 //! Hashing is streaming and uses one small buffer so checking a large file
 //! does not raise memory use. The cached hash list is kept as sorted
@@ -743,7 +744,7 @@ mod tests {
             );
             assert!(
                 feed.urls[0] != feed.urls[1],
-                "feed {} needs independent endpoints",
+                "feed {} needs two distinct endpoints",
                 feed.name
             );
         }

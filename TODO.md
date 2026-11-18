@@ -82,7 +82,7 @@
       Mark-of-the-Web on Windows.
 - [x] **No remote control and no automatic opening.** OPP only; no execution,
       preview, shell, or remote-control profile; received content stays inert.
-- [x] **Independent blocklist endpoints and append-only cache.** Each feed file
+- [x] **Two blocklist endpoints and an append-only cache.** Each feed file
       is fetched from raw GitHub and jsDelivr, refreshed results merge the
       hashes already cached (up to 500,000), a truncated refresh is rejected,
       and parsing/downloads are bounded. A compromised endpoint can add false
