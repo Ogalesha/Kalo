@@ -44,8 +44,10 @@ trap 'rm -rf "$STAGE"' EXIT
 install -Dm755 target/release/kalo "$STAGE/usr/bin/kalo"
 install -Dm644 packaging/common/kalo.desktop \
   "$STAGE/usr/share/applications/kalo.desktop"
-install -Dm644 packaging/common/kalo.svg \
-  "$STAGE/usr/share/icons/hicolor/scalable/apps/kalo.svg"
+for size in 16 24 32 48 64 128 256 512; do
+  install -Dm644 "packaging/common/icons/hicolor/${size}x${size}/apps/kalo.png" \
+    "$STAGE/usr/share/icons/hicolor/${size}x${size}/apps/kalo.png"
+done
 install -Dm644 packaging/ubuntu/copyright \
   "$STAGE/usr/share/doc/$PKG/copyright"
 install -Dm644 packaging/common/kalo.1 "$STAGE/usr/share/man/man1/kalo.1"
@@ -78,8 +80,9 @@ Depends: libc6, libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libwayla
 Recommends: bluez, bluez-obexd, xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-kde, libvulkan1
 Description: Bluetooth file sharing for Ubuntu
  Kalo sends and receives files over Bluetooth OPP/OBEX. It provides a
- desktop UI, a receiver agent that saves incoming files to ~/Downloads,
- and CLI commands for discovering devices, pairing, and transfers.
+ desktop UI, a sender approval prompt with persisted trust decisions, a
+ receiver agent that saves incoming files to a configurable folder, and CLI
+ commands for discovering devices, pairing, and transfers.
 EOF
 
 dpkg-deb --root-owner-group -Zxz --build "$STAGE" "$DEB" >/dev/null

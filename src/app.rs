@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures_util::SinkExt;
 use iced::widget::{button, column, container, progress_bar, row, rule, scrollable, space, text};
@@ -15,6 +16,8 @@ use crate::events::{
 };
 use crate::paths;
 use crate::platform::{self, DeviceInfo, PendingTransfers, ReceiverHandle, new_pending};
+use crate::settings::{SaveDir, Settings, ThemeKind};
+use crate::trust::{Authorizer, IncomingPolicy, TrustStore};
 
 /// Shared handles for the event-pump subscription. iced 0.14 builds
 /// subscriptions from plain `fn` builders, so the state must be static.
@@ -24,7 +27,10 @@ struct EventBus {
     sink: EventSink,
     receiver: ReceiverHandle,
     pending: PendingTransfers,
-    downloads: PathBuf,
+    save_dir: SaveDir,
+    authorizer: Authorizer,
+    /// Screenshot mode: never touch Bluetooth or the user's config.
+    demo: bool,
 }
 
 impl EventBus {
@@ -33,14 +39,15 @@ impl EventBus {
     /// be duplicated.
     fn ensure_receiver_started(&self) {
         static STARTED: AtomicBool = AtomicBool::new(false);
-        if STARTED.swap(true, Ordering::SeqCst) {
+        if self.demo || STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
         tokio::spawn(platform::run_receiver(
             self.receiver.clone(),
             self.pending.clone(),
-            self.downloads.clone(),
+            self.save_dir.clone(),
             self.sink.clone(),
+            self.authorizer.clone(),
         ));
     }
 }
@@ -61,6 +68,22 @@ pub enum Message {
         send_id: u64,
         result: Result<String, String>,
     },
+    ToggleTheme,
+    PickSaveFolder,
+    SaveFolderPicked(Option<PathBuf>),
+    OpenPath(PathBuf),
+    AuthorizationResponse {
+        id: String,
+        allow: bool,
+        remember: bool,
+    },
+    RemoveTrustedSender(String),
+    SetIncomingPolicy(IncomingPolicy),
+    ToggleTrustList,
+    PollTray,
+    TrayShow,
+    TrayQuit,
+    WindowCloseRequested(iced::window::Id),
     Event(Event),
 }
 
@@ -85,6 +108,23 @@ struct SendProgressUi {
 struct SendResultUi {
     ok: bool,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthPromptUi {
+    id: String,
+    sender: String,
+    address: String,
+    name: String,
+    size: Option<u64>,
+    stable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SavedUi {
+    name: String,
+    path: PathBuf,
+    partial: bool,
 }
 
 /// Everything that belongs to the one in-flight outgoing transfer. Keeping
@@ -118,6 +158,16 @@ struct App {
     send_result: Option<SendResultUi>,
     incoming: Vec<IncomingUi>,
     receiver_state: ReceiverStatus,
+    settings: Settings,
+    trust: TrustStore,
+    authorizer: Authorizer,
+    save_dir: SaveDir,
+    picking_folder: bool,
+    pending_authorizations: Vec<AuthPromptUi>,
+    last_saved: Option<SavedUi>,
+    show_trust: bool,
+    demo: bool,
+    tray_ready: bool,
 }
 
 impl App {
@@ -131,16 +181,130 @@ impl App {
     fn is_sending(&self) -> bool {
         self.active_send.is_some()
     }
+
+    fn persist_settings(&mut self) {
+        if self.demo {
+            return;
+        }
+        if let Err(error) = self.settings.save() {
+            self.log(format!("Couldn't save settings: {error:#}"));
+        }
+    }
+}
+
+struct Startup {
+    devices: Vec<DeviceInfo>,
+    selected: Option<String>,
+    devices_loaded: bool,
+    devices_loading: bool,
+    log: Vec<String>,
+    incoming: Vec<IncomingUi>,
+    receiver_state: ReceiverStatus,
+}
+
+fn demo_enabled() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("KALO_DEMO").is_some()
+}
+
+fn demo_settings() -> Settings {
+    let theme = match std::env::var("KALO_DEMO_THEME").as_deref() {
+        Ok("light") => ThemeKind::Light,
+        _ => ThemeKind::Dark,
+    };
+    Settings {
+        theme,
+        save_dir: Some(PathBuf::from("/home/you/Downloads")),
+    }
+}
+
+fn startup(bus: &EventBus, demo: bool, mut log: Vec<String>) -> Startup {
+    if demo {
+        log.extend([
+            "Sent design-review.pdf to Studio laptop · 4.2 MB in 1.4s (3.0 MB/s)".to_string(),
+            "Saved sunset.jpg from Pixel 8 → Downloads/sunset.jpg · 2.4 MB in 0.9s (2.7 MB/s)"
+                .to_string(),
+            "Incoming from Kitchen speaker: voice-memo.opus — waiting for approval".to_string(),
+        ]);
+        return Startup {
+            devices: vec![
+                DeviceInfo {
+                    address: "AA:BB:CC:11:22:33".into(),
+                    alias: "Pixel 8".into(),
+                    paired: true,
+                    trusted: true,
+                    connected: true,
+                },
+                DeviceInfo {
+                    address: "AA:BB:CC:44:55:66".into(),
+                    alias: "Studio laptop".into(),
+                    paired: true,
+                    trusted: true,
+                    connected: false,
+                },
+                DeviceInfo {
+                    address: "AA:BB:CC:77:88:99".into(),
+                    alias: "Kitchen speaker".into(),
+                    paired: false,
+                    trusted: false,
+                    connected: false,
+                },
+            ],
+            selected: Some("AA:BB:CC:11:22:33".into()),
+            devices_loaded: true,
+            devices_loading: false,
+            log,
+            incoming: vec![IncomingUi {
+                id: "demo-incoming".into(),
+                sender: "Pixel 8".into(),
+                name: "weekend-photo.jpg".into(),
+                transferred: 1_800_000,
+                size: Some(3_400_000),
+            }],
+            receiver_state: ReceiverStatus::Active,
+        };
+    }
+
+    Startup {
+        devices: Vec::new(),
+        selected: None,
+        devices_loaded: false,
+        devices_loading: true,
+        log,
+        incoming: Vec::new(),
+        receiver_state: bus.receiver.status(),
+    }
 }
 
 pub fn run() -> iced::Result {
     let sink = EventSink::new(2048);
+    let demo = demo_enabled();
+    let tray_ready = if demo { false } else { crate::tray::start() };
+    let (settings, settings_note) = if demo {
+        (demo_settings(), None)
+    } else {
+        Settings::load()
+    };
+    let (trust, trust_note) = if demo {
+        (TrustStore::demo(), None)
+    } else {
+        TrustStore::load()
+    };
+    let save_dir = SaveDir::new(
+        settings
+            .save_dir
+            .clone()
+            .unwrap_or_else(paths::downloads_dir),
+    );
+    let authorizer = Authorizer::new(trust.clone(), sink.clone(), true);
+    let receiver = ReceiverHandle::new(sink.clone());
     if EVENT_BUS
         .set(EventBus {
             sink: sink.clone(),
-            receiver: ReceiverHandle::new(sink),
+            receiver: receiver.clone(),
             pending: new_pending(),
-            downloads: paths::downloads_dir(),
+            save_dir: save_dir.clone(),
+            authorizer: authorizer.clone(),
+            demo,
         })
         .is_err()
     {
@@ -148,43 +312,91 @@ pub fn run() -> iced::Result {
     }
 
     iced::application(
-        || {
+        move || {
             let bus = EVENT_BUS.get().expect("event bus must be initialized");
             let initial_request_id = 1;
+            let mut log = Vec::new();
+            if let Some(note) = settings_note.clone() {
+                log.push(note);
+            }
+            if let Some(note) = trust_note.clone() {
+                log.push(note);
+            }
+            let start = startup(bus, demo, log);
             let app = App {
                 tx: bus.sink.clone(),
-                devices: Vec::new(),
+                devices: start.devices,
                 devices_request_id: initial_request_id,
-                devices_loaded: false,
-                devices_loading: true,
+                devices_loaded: start.devices_loaded,
+                devices_loading: start.devices_loading,
                 devices_error: None,
-                selected: None,
-                file: None,
+                selected: start.selected,
+                file: demo.then(|| PathBuf::from("/home/you/Documents/design-review.pdf")),
                 picking_file: false,
-                log: Vec::new(),
+                log: start.log,
                 active_send: None,
                 next_send_id: 1,
                 send_result: None,
-                incoming: Vec::new(),
-                receiver_state: bus.receiver.status(),
+                incoming: start.incoming,
+                receiver_state: start.receiver_state,
+                settings: settings.clone(),
+                trust: trust.clone(),
+                authorizer: authorizer.clone(),
+                save_dir: save_dir.clone(),
+                picking_folder: false,
+                pending_authorizations: if demo {
+                    vec![AuthPromptUi {
+                        id: "demo-authorization".into(),
+                        sender: "Kitchen speaker".into(),
+                        address: "AA:BB:CC:77:88:99".into(),
+                        name: "voice-memo.opus".into(),
+                        size: Some(1_200_000),
+                        stable: true,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                last_saved: None,
+                show_trust: false,
+                demo,
+                tray_ready,
             };
-            let task = Task::perform(platform::list_known_devices(), move |result| {
-                Message::DevicesLoaded {
-                    request_id: initial_request_id,
-                    result: result.map_err(|e| e.to_string()),
-                }
-            });
+            let task = if demo {
+                Task::none()
+            } else {
+                Task::perform(platform::list_known_devices(), move |result| {
+                    Message::DevicesLoaded {
+                        request_id: initial_request_id,
+                        result: result.map_err(|e| e.to_string()),
+                    }
+                })
+            };
             (app, task)
         },
         update,
         view,
     )
     .title("Kalo")
-    .theme(|_: &App| ui::theme())
-    .window_size((980.0, 710.0))
-    .centered()
+    .theme(|app: &App| ui::theme(app.settings.theme))
+    .window(iced::window::Settings {
+        size: iced::Size::new(980.0, 710.0),
+        position: iced::window::Position::Centered,
+        icon: window_icon(),
+        ..Default::default()
+    })
+    .exit_on_close_request(!tray_ready)
     .subscription(subscription)
     .run()
+}
+
+fn window_icon() -> Option<iced::window::Icon> {
+    let image = image::load_from_memory(include_bytes!(
+        "../packaging/common/icons/hicolor/256x256/apps/kalo.png"
+    ))
+    .ok()?
+    .to_rgba8();
+    let (width, height) = image.dimensions();
+    iced::window::icon::from_rgba(image.into_vec(), width, height).ok()
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -352,6 +564,121 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.send_result = Some(SendResultUi { ok, message });
             Task::none()
         }
+        Message::ToggleTheme => {
+            app.settings.theme = app.settings.theme.toggled();
+            let label = match app.settings.theme {
+                ThemeKind::Dark => "Dark",
+                ThemeKind::Light => "Light",
+            };
+            app.persist_settings();
+            app.log(format!("{label} theme enabled"));
+            Task::none()
+        }
+        Message::PickSaveFolder => {
+            if app.picking_folder {
+                return Task::none();
+            }
+            app.picking_folder = true;
+            let current = app.save_dir.get();
+            Task::perform(
+                async move {
+                    let mut dialog = rfd::AsyncFileDialog::new()
+                        .set_title("Choose where incoming files are saved");
+                    if current.is_dir() {
+                        dialog = dialog.set_directory(current);
+                    }
+                    dialog
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::SaveFolderPicked,
+            )
+        }
+        Message::SaveFolderPicked(folder) => {
+            app.picking_folder = false;
+            if let Some(folder) = folder {
+                app.save_dir.set(folder.clone());
+                app.settings.save_dir = Some(folder.clone());
+                app.persist_settings();
+                app.last_saved = None;
+                app.log(format!("Incoming files now save to {}", folder.display()));
+            }
+            Task::none()
+        }
+        Message::OpenPath(path) => {
+            if let Err(error) = paths::open_folder(&path) {
+                app.log(format!("Couldn't open {}: {error:#}", path.display()));
+            }
+            Task::none()
+        }
+        Message::AuthorizationResponse {
+            id,
+            allow,
+            remember,
+        } => {
+            let sender = app
+                .pending_authorizations
+                .iter()
+                .find(|prompt| prompt.id == id)
+                .map(|prompt| prompt.sender.clone())
+                .unwrap_or_else(|| "the sender".to_string());
+            if app.authorizer.respond(&id, allow, remember) {
+                app.log(format!(
+                    "{} incoming file from {sender}",
+                    if allow { "Allowed" } else { "Declined" }
+                ));
+            } else {
+                app.log("that approval request is no longer pending");
+            }
+            app.pending_authorizations.retain(|prompt| prompt.id != id);
+            Task::none()
+        }
+        Message::RemoveTrustedSender(address) => {
+            match app.trust.remove(&address) {
+                Ok(()) => app.log(format!("Removed {address} from trusted senders")),
+                Err(error) => app.log(format!("Couldn't update trusted senders: {error:#}")),
+            }
+            Task::none()
+        }
+        Message::SetIncomingPolicy(policy) => {
+            if app.trust.policy() == policy {
+                return Task::none();
+            }
+            match app.trust.set_policy(policy) {
+                Ok(()) => app.log(match policy {
+                    IncomingPolicy::Ask => "New senders will be approved in Kalo",
+                    IncomingPolicy::TrustedOnly => {
+                        "New senders will be blocked; only trusted senders can send"
+                    }
+                }),
+                Err(error) => app.log(format!("Couldn't save the incoming policy: {error:#}")),
+            }
+            Task::none()
+        }
+        Message::ToggleTrustList => {
+            app.show_trust = !app.show_trust;
+            Task::none()
+        }
+        Message::PollTray => {
+            let tasks: Vec<Task<Message>> = crate::tray::poll()
+                .into_iter()
+                .map(|action| match action {
+                    crate::tray::TrayAction::Show => Task::done(Message::TrayShow),
+                    crate::tray::TrayAction::Quit => Task::done(Message::TrayQuit),
+                })
+                .collect();
+            Task::batch(tasks)
+        }
+        Message::TrayShow => show_window(),
+        Message::TrayQuit => iced::exit(),
+        Message::WindowCloseRequested(id) => {
+            if app.tray_ready {
+                iced::window::set_mode(id, iced::window::Mode::Hidden)
+            } else {
+                iced::exit()
+            }
+        }
         Message::Event(event) => handle_event(app, event),
     }
 }
@@ -375,6 +702,39 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
                 fraction,
                 detail: send_progress_summary(transferred, size, &status),
             });
+        }
+        Event::IncomingAuthorization {
+            id,
+            sender,
+            address,
+            name,
+            size,
+            stable,
+        } => {
+            let sender = sender_name(&app.devices, &address, &sender);
+            let size_note = size
+                .map(|size| format!(" ({})", format_bytes(size)))
+                .unwrap_or_default();
+            app.log(format!(
+                "Incoming from {sender}{size_note}: waiting for approval"
+            ));
+            let prompt = AuthPromptUi {
+                id: id.clone(),
+                sender,
+                address,
+                name,
+                size,
+                stable,
+            };
+            if let Some(existing) = app
+                .pending_authorizations
+                .iter_mut()
+                .find(|prompt| prompt.id == id)
+            {
+                *existing = prompt;
+            } else {
+                app.pending_authorizations.push(prompt);
+            }
         }
         Event::IncomingStarted {
             id,
@@ -430,6 +790,12 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             partial,
         } => {
             app.incoming.retain(|item| item.id != id);
+            app.pending_authorizations.retain(|prompt| prompt.id != id);
+            app.last_saved = Some(SavedUi {
+                name: name.clone(),
+                path: saved_to.clone(),
+                partial,
+            });
             if partial {
                 app.log(format!(
                     "Recovered partial {name} from {sender} → {} · {} in {elapsed_secs:.1}s ({mbps:.1} MB/s)",
@@ -452,6 +818,7 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             staged_at,
         } => {
             app.incoming.retain(|item| item.id != id);
+            app.pending_authorizations.retain(|prompt| prompt.id != id);
             app.log(format!("Incoming failed from {sender} ({name}): {error}"));
             if let Some(path) = staged_at {
                 app.log(format!("  staged file kept at {}", path.display()));
@@ -461,7 +828,7 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             let line = match &state {
                 ReceiverStatus::Starting => "Receiver starting…".to_string(),
                 ReceiverStatus::Active => {
-                    "Receiver ready. Incoming files save to Downloads.".to_string()
+                    "Receiver ready. Incoming files save to your save folder.".to_string()
                 }
                 ReceiverStatus::Off(reason) => format!("Receiver unavailable: {reason}"),
             };
@@ -472,8 +839,21 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
     Task::none()
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
-    Subscription::run(|| {
+fn show_window() -> Task<Message> {
+    iced::window::latest().and_then(|id| {
+        Task::batch([
+            iced::window::set_mode(id, iced::window::Mode::Windowed),
+            iced::window::gain_focus(id),
+        ])
+    })
+}
+
+fn subscription(app: &App) -> Subscription<Message> {
+    let close_requests = iced::window::close_requests().map(Message::WindowCloseRequested);
+    if app.demo {
+        return close_requests;
+    }
+    let events = Subscription::run(|| {
         iced::stream::channel(
             100,
             |mut out: futures::channel::mpsc::Sender<Message>| async move {
@@ -513,52 +893,75 @@ fn subscription(_app: &App) -> Subscription<Message> {
                 }
             },
         )
-    })
+    });
+    Subscription::batch([
+        events,
+        close_requests,
+        iced::time::every(Duration::from_millis(300)).map(|_| Message::PollTray),
+    ])
 }
 
 fn view(app: &App) -> Element<'_, Message> {
+    let p = ui::palette(app.settings.theme);
     let is_sending = app.is_sending();
     let target = resolve_target(&app.devices, app.selected.as_deref());
 
+    let theme_button = button(
+        text(match app.settings.theme {
+            ThemeKind::Dark => "☀ Light",
+            ThemeKind::Light => "☾ Dark",
+        })
+        .size(11.5)
+        .font(ui::MEDIUM),
+    )
+    .padding([6, 11])
+    .style(ui::secondary_button)
+    .on_press(Message::ToggleTheme);
+
     let header = row![
         row![
-            brand_mark(),
+            brand_mark(p),
             column![
-                text("Kalo").size(22).font(ui::BOLD).color(ui::TEXT),
+                text("Kalo").size(22).font(ui::BOLD).color(p.text),
                 text("Bluetooth file transfer")
                     .size(11.5)
-                    .color(ui::TEXT_MUTED),
+                    .color(p.text_muted),
             ]
             .spacing(0),
         ]
         .spacing(11)
         .align_y(Alignment::Center),
         space().width(Length::Fill),
-        receiver_summary(&app.receiver_state),
+        theme_button,
+        receiver_summary(&app.receiver_state, &app.save_dir.get(), p),
     ]
+    .spacing(10)
     .width(Length::Fill)
     .align_y(Alignment::Center);
 
     let hero = container(
         row![
             column![
-                text("Pass a file. No cables.")
+                text("Send files over Bluetooth.")
                     .size(30)
                     .font(ui::BOLD)
-                    .color(ui::TEXT),
-                text("Send directly to the devices around you. Nothing goes through the cloud.")
-                    .size(13)
-                    .color(ui::TEXT_SECONDARY),
+                    .color(p.text),
+                text(
+                    "Choose a compatible device, pick a file, and send it directly. \
+                     No cloud upload or account required."
+                )
+                .size(13)
+                .color(p.text_secondary),
                 row![
-                    chip("Local transfer"),
-                    chip("No sign-in"),
-                    chip("Saves to Downloads"),
+                    chip("Direct Bluetooth", p),
+                    chip("No sign-in", p),
+                    chip("You choose the folder", p),
                 ]
                 .spacing(8),
             ]
             .spacing(9)
             .width(Length::Fill),
-            transfer_orb(),
+            transfer_orb(p),
         ]
         .spacing(24)
         .align_y(Alignment::Center),
@@ -575,12 +978,12 @@ fn view(app: &App) -> Element<'_, Message> {
                 .selected
                 .as_deref()
                 .is_some_and(|address| address.eq_ignore_ascii_case(&device.address));
-            device_button(device, selected, !is_sending)
+            device_button(device, selected, !is_sending, p)
         })
         .collect();
 
     let device_list: Element<'_, Message> = if app.devices.is_empty() {
-        device_empty_state(app.devices_loaded, app.devices_error.as_deref())
+        device_empty_state(app.devices_loaded, app.devices_error.as_deref(), p)
     } else {
         scrollable(column(device_rows).spacing(8).width(Length::Fill))
             .height(Length::Fill)
@@ -589,13 +992,13 @@ fn view(app: &App) -> Element<'_, Message> {
 
     let mut device_section = column![
         row![
-            step_label("1", "Choose a device"),
+            step_label("1", "Choose a device", p),
             space().width(Length::Fill),
             button(
                 text(if app.devices_loading {
                     "Refreshing…"
                 } else {
-                    "Refresh"
+                    "Refresh list"
                 })
                 .size(11.5)
                 .font(ui::MEDIUM),
@@ -615,7 +1018,7 @@ fn view(app: &App) -> Element<'_, Message> {
         device_section = device_section.push(
             text(format!("Couldn't refresh: {error}"))
                 .size(11.5)
-                .color(ui::DANGER_TEXT),
+                .color(p.danger_text),
         );
     }
     device_section = device_section.push(device_list);
@@ -624,7 +1027,7 @@ fn view(app: &App) -> Element<'_, Message> {
         .file
         .as_deref()
         .map(file_name)
-        .unwrap_or_else(|| "No file chosen".to_string());
+        .unwrap_or_else(|| "No file selected".to_string());
     let mut file_info = column![
         text(file_title)
             .size(13.5)
@@ -634,9 +1037,9 @@ fn view(app: &App) -> Element<'_, Message> {
                 Font::DEFAULT
             })
             .color(if app.file.is_some() {
-                ui::TEXT
+                p.text
             } else {
-                ui::TEXT_SECONDARY
+                p.text_secondary
             }),
     ]
     .spacing(2)
@@ -645,7 +1048,7 @@ fn view(app: &App) -> Element<'_, Message> {
         file_info = file_info.push(
             text(path.display().to_string())
                 .size(11)
-                .color(ui::TEXT_MUTED),
+                .color(p.text_muted),
         );
     }
 
@@ -658,7 +1061,7 @@ fn view(app: &App) -> Element<'_, Message> {
     };
     let file_zone = container(
         row![
-            container(text("↥").size(18).font(ui::BOLD).color(ui::ACCENT_TEXT))
+            container(text("↥").size(18).font(ui::BOLD).color(p.accent_text))
                 .width(38)
                 .height(38)
                 .center(38)
@@ -676,7 +1079,7 @@ fn view(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(ui::inset);
 
-    let file_section = column![step_label("2", "Pick a file"), file_zone,].spacing(9);
+    let file_section = column![step_label("2", "Choose a file", p), file_zone,].spacing(9);
 
     let send_panel = container(
         column![
@@ -684,10 +1087,10 @@ fn view(app: &App) -> Element<'_, Message> {
                 text("Send a file")
                     .size(20)
                     .font(ui::SEMIBOLD)
-                    .color(ui::TEXT),
-                text("Choose a device and a file, then send.")
+                    .color(p.text),
+                text("Select a Bluetooth device and a file to send.")
                     .size(12)
-                    .color(ui::TEXT_SECONDARY),
+                    .color(p.text_secondary),
             ]
             .spacing(3),
             device_section,
@@ -703,52 +1106,88 @@ fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(ui::panel);
 
-    let mut incoming_header = row![text("Incoming").size(19).font(ui::SEMIBOLD).color(ui::TEXT),]
-        .spacing(8)
-        .align_y(Alignment::Center);
+    let mut incoming_header = row![
+        text("Incoming files")
+            .size(19)
+            .font(ui::SEMIBOLD)
+            .color(p.text),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
     if !app.incoming.is_empty() {
-        incoming_header = incoming_header.push(space().width(Length::Fill)).push(
+        incoming_header = incoming_header.push(
             text(format!("{} active", app.incoming.len()))
                 .size(10.5)
                 .font(ui::BOLD)
-                .color(ui::ACCENT_TEXT),
+                .color(p.accent_text),
         );
     }
+    incoming_header = incoming_header.push(space().width(Length::Fill)).push(
+        button(
+            text(if app.show_trust {
+                "Hide senders"
+            } else {
+                "Senders"
+            })
+            .size(10.5)
+            .font(ui::MEDIUM),
+        )
+        .padding([5, 9])
+        .style(ui::policy_button(app.show_trust))
+        .on_press(Message::ToggleTrustList),
+    );
 
     let mut incoming_body = column![].spacing(9).width(Length::Fill);
+    for prompt in &app.pending_authorizations {
+        incoming_body = incoming_body.push(auth_prompt(prompt, p));
+    }
     if let ReceiverStatus::Off(reason) = &app.receiver_state {
-        incoming_body = incoming_body.push(receiver_notice(reason));
+        incoming_body = incoming_body.push(receiver_notice(reason, p));
     }
     if app.incoming.is_empty() {
         if !matches!(app.receiver_state, ReceiverStatus::Off(_)) {
-            incoming_body = incoming_body.push(incoming_empty(&app.receiver_state));
+            incoming_body =
+                incoming_body.push(incoming_empty(&app.receiver_state, &app.save_dir.get(), p));
         }
     } else {
+        let height = (app.incoming.len() as f32 * 58.0).clamp(58.0, 150.0);
         incoming_body = incoming_body.push(
             scrollable(
                 column(
                     app.incoming
                         .iter()
-                        .map(incoming_row)
+                        .map(|item| incoming_row(item, p))
                         .collect::<Vec<Element<'_, Message>>>(),
                 )
                 .spacing(8)
                 .width(Length::Fill),
             )
-            .height(Length::Fixed(150.0)),
+            .height(Length::Fixed(height)),
         );
+    }
+    if let Some(saved) = &app.last_saved {
+        incoming_body = incoming_body.push(saved_banner(saved, p));
+    }
+    incoming_body = incoming_body.push(save_folder_row(&app.save_dir.get(), app.picking_folder, p));
+    if app.show_trust {
+        incoming_body = incoming_body.push(trust_panel(
+            app.trust.entries(),
+            app.trust.policy(),
+            &app.devices,
+            p,
+        ));
     }
 
     let activity: Element<'_, Message> = if app.log.is_empty() {
         container(
             column![
-                text("No activity yet")
+                text("No transfer activity yet")
                     .size(13)
                     .font(ui::MEDIUM)
-                    .color(ui::TEXT),
-                text("Sent and received files will be listed here.")
+                    .color(p.text),
+                text("Transfer updates, receiver status, and errors appear here.")
                     .size(11.5)
-                    .color(ui::TEXT_SECONDARY),
+                    .color(p.text_secondary),
             ]
             .spacing(3),
         )
@@ -766,11 +1205,11 @@ fn view(app: &App) -> Element<'_, Message> {
                     container(space())
                         .width(5)
                         .height(5)
-                        .style(ui::dot(ui::ACCENT)),
+                        .style(ui::dot(p.accent)),
                     text(line.clone())
                         .size(11.5)
                         .line_height(1.4)
-                        .color(ui::TEXT_SECONDARY)
+                        .color(p.text_secondary)
                         .width(Length::Fill),
                 ]
                 .spacing(9)
@@ -785,11 +1224,14 @@ fn view(app: &App) -> Element<'_, Message> {
 
     let activity_block = column![
         row![
-            text("Activity").size(19).font(ui::SEMIBOLD).color(ui::TEXT),
+            text("Transfer activity")
+                .size(19)
+                .font(ui::SEMIBOLD)
+                .color(p.text),
             space().width(Length::Fill),
             text(format!("{} entries", app.log.len()))
                 .size(10.5)
-                .color(ui::TEXT_MUTED),
+                .color(p.text_muted),
         ]
         .align_y(Alignment::Center),
         activity,
@@ -835,8 +1277,8 @@ fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn brand_mark<'a>() -> Element<'a, Message> {
-    container(text("K").size(19).font(ui::BOLD).color(ui::ON_ACCENT))
+fn brand_mark<'a>(p: &ui::Palette) -> Element<'a, Message> {
+    container(text("K").size(19).font(ui::BOLD).color(p.on_accent))
         .width(40)
         .height(40)
         .center(40)
@@ -844,21 +1286,21 @@ fn brand_mark<'a>() -> Element<'a, Message> {
         .into()
 }
 
-fn chip<'a>(label: &'a str) -> Element<'a, Message> {
+fn chip<'a>(label: &'a str, p: &ui::Palette) -> Element<'a, Message> {
     container(
         text(label)
             .size(10.5)
             .font(ui::MEDIUM)
-            .color(ui::TEXT_SECONDARY),
+            .color(p.text_secondary),
     )
     .padding([4, 9])
     .style(ui::chip)
     .into()
 }
 
-fn step_label<'a>(step: &'a str, label: &'a str) -> Element<'a, Message> {
+fn step_label<'a>(step: &'a str, label: &'a str, p: &ui::Palette) -> Element<'a, Message> {
     row![
-        container(text(step).size(10).font(ui::BOLD).color(ui::ON_ACCENT))
+        container(text(step).size(10).font(ui::BOLD).color(p.on_accent))
             .width(20)
             .height(20)
             .center(20)
@@ -866,7 +1308,7 @@ fn step_label<'a>(step: &'a str, label: &'a str) -> Element<'a, Message> {
         text(label)
             .size(12.5)
             .font(ui::SEMIBOLD)
-            .color(ui::TEXT_SECONDARY),
+            .color(p.text_secondary),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -875,10 +1317,10 @@ fn step_label<'a>(step: &'a str, label: &'a str) -> Element<'a, Message> {
 
 /// A quiet orbit graphic for the hero: rings read as "nearby devices" without
 /// adding another moving part to the interface.
-fn transfer_orb<'a>() -> Element<'a, Message> {
+fn transfer_orb<'a>(p: &ui::Palette) -> Element<'a, Message> {
     container(
         container(
-            container(text("⇄").size(25).font(ui::BOLD).color(ui::ACCENT_TEXT))
+            container(text("⇄").size(25).font(ui::BOLD).color(p.accent_text))
                 .width(54)
                 .height(54)
                 .center(54)
@@ -896,34 +1338,38 @@ fn transfer_orb<'a>() -> Element<'a, Message> {
     .into()
 }
 
-fn receiver_summary(state: &ReceiverStatus) -> Element<'_, Message> {
+fn receiver_summary(
+    state: &ReceiverStatus,
+    save_dir: &Path,
+    p: &ui::Palette,
+) -> Element<'static, Message> {
     let (label, detail, dot, tint, text_color) = match state {
         ReceiverStatus::Starting => (
-            "Starting receiver",
-            "Incoming files will be ready shortly",
-            ui::WARNING,
-            ui::WARNING_TINT,
-            ui::WARNING_TEXT,
+            "Starting Bluetooth receiver",
+            "Incoming files will be ready shortly".to_string(),
+            p.warning,
+            p.warning_tint,
+            p.warning_text,
         ),
         ReceiverStatus::Active => (
-            "Receiver on",
-            "Files save to Downloads",
-            ui::SUCCESS,
-            ui::SUCCESS_TINT,
-            ui::SUCCESS_TEXT,
+            "Ready to receive",
+            format!("Files save to {}", folder_label(save_dir)),
+            p.success,
+            p.success_tint,
+            p.success_text,
         ),
         ReceiverStatus::Off(_) => (
-            "Receiver off",
-            "Incoming files are unavailable",
-            ui::DANGER,
-            ui::DANGER_TINT,
-            ui::DANGER_TEXT,
+            "Receiving unavailable",
+            "Incoming files are unavailable".to_string(),
+            p.danger,
+            p.danger_tint,
+            p.danger_text,
         ),
     };
     let detail_color = if matches!(state, ReceiverStatus::Off(_)) {
-        ui::DANGER_TEXT
+        p.danger_text
     } else {
-        ui::TEXT_MUTED
+        p.text_muted
     };
 
     container(
@@ -943,43 +1389,47 @@ fn receiver_summary(state: &ReceiverStatus) -> Element<'_, Message> {
     .into()
 }
 
-fn device_button(device: &DeviceInfo, selected: bool, enabled: bool) -> Element<'_, Message> {
+fn device_button<'a>(
+    device: &'a DeviceInfo,
+    selected: bool,
+    enabled: bool,
+    p: &ui::Palette,
+) -> Element<'a, Message> {
     let mut meta = row![
         text(&device.address)
             .size(11)
             .font(ui::MONO)
-            .color(ui::TEXT_MUTED),
+            .color(p.text_muted),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
     if device.connected {
-        meta = meta.push(badge("Connected", ui::SUCCESS_TINT, ui::SUCCESS_TEXT));
+        meta = meta.push(badge("Connected", p.success_tint, p.success_text));
     }
     if !device.paired {
-        meta = meta.push(badge("Not paired", ui::WARNING_TINT, ui::WARNING_TEXT));
+        meta = meta.push(badge("Not paired", p.warning_tint, p.warning_text));
     }
 
-    let avatar = container(text(device_initial(device)).size(14).font(ui::BOLD).color(
-        if selected {
-            ui::ON_ACCENT
-        } else {
-            ui::ACCENT_TEXT
-        },
-    ))
+    let avatar = container(
+        text(device_initial(device))
+            .size(14)
+            .font(ui::BOLD)
+            .color(if selected { p.on_accent } else { p.accent_text }),
+    )
     .width(34)
     .height(34)
     .center(34)
     .style(ui::avatar(selected));
 
     let trailing: Element<'_, Message> = if selected {
-        container(text("✓").size(11).font(ui::BOLD).color(ui::ON_ACCENT))
+        container(text("✓").size(11).font(ui::BOLD).color(p.on_accent))
             .width(21)
             .height(21)
             .center(21)
-            .style(ui::fill(ui::ACCENT, 999.0))
+            .style(ui::fill(p.accent, 999.0))
             .into()
     } else {
-        text("Select").size(11).color(ui::TEXT_MUTED).into()
+        text("Select").size(11).color(p.text_muted).into()
     };
 
     let content = row![
@@ -988,11 +1438,7 @@ fn device_button(device: &DeviceInfo, selected: bool, enabled: bool) -> Element<
             text(device_name(device))
                 .size(13.5)
                 .font(ui::SEMIBOLD)
-                .color(if enabled {
-                    ui::TEXT
-                } else {
-                    ui::TEXT_SECONDARY
-                }),
+                .color(if enabled { p.text } else { p.text_secondary }),
             meta,
         ]
         .spacing(2)
@@ -1026,41 +1472,45 @@ fn badge(label: &str, background: Color, text_color: Color) -> Element<'_, Messa
         .into()
 }
 
-fn device_empty_state(loaded: bool, error: Option<&str>) -> Element<'_, Message> {
+fn device_empty_state<'a>(
+    loaded: bool,
+    error: Option<&'a str>,
+    p: &ui::Palette,
+) -> Element<'a, Message> {
     let content: Element<'_, Message> = if !loaded {
         column![
-            text("Looking for paired devices…")
+            text("Loading Bluetooth devices…")
                 .size(13)
                 .font(ui::MEDIUM)
-                .color(ui::TEXT),
+                .color(p.text),
             text("This usually takes a moment.")
                 .size(11.5)
-                .color(ui::TEXT_SECONDARY),
+                .color(p.text_secondary),
         ]
         .spacing(4)
         .into()
     } else if let Some(error) = error {
         column![
-            text("Couldn't load paired devices")
+            text("Couldn't load Bluetooth devices")
                 .size(13)
                 .font(ui::MEDIUM)
-                .color(ui::DANGER_TEXT),
-            text(error).size(11.5).color(ui::TEXT_SECONDARY),
-            text("Choose Refresh to try again.")
+                .color(p.danger_text),
+            text(error).size(11.5).color(p.text_secondary),
+            text("Choose Refresh list to try again.")
                 .size(11)
-                .color(ui::TEXT_MUTED),
+                .color(p.text_muted),
         ]
         .spacing(3)
         .into()
     } else {
         column![
-            text("No paired devices")
+            text("No known Bluetooth devices")
                 .size(13)
                 .font(ui::MEDIUM)
-                .color(ui::TEXT),
-            text("Pair one in your Bluetooth settings, then choose Refresh.")
+                .color(p.text),
+            text("Pair a device in your system's Bluetooth settings, then refresh this list.")
                 .size(11.5)
-                .color(ui::TEXT_SECONDARY),
+                .color(p.text_secondary),
         ]
         .spacing(4)
         .into()
@@ -1073,17 +1523,20 @@ fn device_empty_state(loaded: bool, error: Option<&str>) -> Element<'_, Message>
         .into()
 }
 
-fn receiver_notice(reason: &str) -> Element<'_, Message> {
+fn receiver_notice<'a>(reason: &'a str, p: &ui::Palette) -> Element<'a, Message> {
     container(
         column![
-            text("Incoming files are unavailable")
+            text("Receiving unavailable")
                 .size(12)
                 .font(ui::SEMIBOLD)
-                .color(ui::DANGER_TEXT),
-            text(reason).size(11).color(ui::TEXT_SECONDARY),
-            text("Kalo retries automatically. Restart it if this persists.")
-                .size(11)
-                .color(ui::TEXT_MUTED),
+                .color(p.danger_text),
+            text(reason).size(11).color(p.text_secondary),
+            text(
+                "Kalo will retry automatically. If this continues, check Bluetooth services \
+                 or other transfer apps."
+            )
+            .size(11)
+            .color(p.text_muted),
         ]
         .spacing(3),
     )
@@ -1093,25 +1546,31 @@ fn receiver_notice(reason: &str) -> Element<'_, Message> {
     .into()
 }
 
-fn incoming_empty(state: &ReceiverStatus) -> Element<'_, Message> {
+fn incoming_empty<'a>(
+    state: &ReceiverStatus,
+    save_dir: &Path,
+    p: &ui::Palette,
+) -> Element<'a, Message> {
     let detail = match state {
         ReceiverStatus::Starting => "The receiver is starting. Incoming files will appear here.",
-        _ => "Files sent to this computer appear here.",
+        _ => "Incoming transfers appear here.",
     };
+    let save_note = format!("Saving to {}", folder_label(save_dir));
 
     container(
         row![
-            container(text("↓").size(16).font(ui::BOLD).color(ui::TEXT_MUTED))
+            container(text("↓").size(16).font(ui::BOLD).color(p.text_muted))
                 .width(34)
                 .height(34)
                 .center(34)
                 .style(ui::icon_tile_muted),
             column![
-                text("Nothing incoming")
+                text("No incoming transfers")
                     .size(12.5)
                     .font(ui::MEDIUM)
-                    .color(ui::TEXT),
-                text(detail).size(11).color(ui::TEXT_SECONDARY),
+                    .color(p.text),
+                text(detail).size(11).color(p.text_secondary),
+                text(save_note).size(10.5).color(p.text_muted),
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -1125,7 +1584,7 @@ fn incoming_empty(state: &ReceiverStatus) -> Element<'_, Message> {
     .into()
 }
 
-fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
+fn incoming_row<'a>(item: &'a IncomingUi, p: &ui::Palette) -> Element<'a, Message> {
     let fraction = transfer_fraction(item.transferred, item.size);
     let percent = fraction.map(|fraction| format!("{:.0}%", fraction * 100.0));
     let from = if item.sender.is_empty() {
@@ -1151,7 +1610,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
         text(name)
             .size(13)
             .font(ui::MEDIUM)
-            .color(ui::TEXT)
+            .color(p.text)
             .width(Length::Fill),
     ]
     .spacing(10)
@@ -1161,7 +1620,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
             text(percent)
                 .size(11.5)
                 .font(ui::SEMIBOLD)
-                .color(ui::ACCENT_TEXT),
+                .color(p.accent_text),
         );
     }
 
@@ -1169,7 +1628,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
         title,
         text(format!("{from} · {amount}"))
             .size(11)
-            .color(ui::TEXT_SECONDARY)
+            .color(p.text_secondary)
             .width(Length::Fill),
     ]
     .spacing(4);
@@ -1183,7 +1642,7 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
 
     container(
         row![
-            container(text("↓").size(14).font(ui::BOLD).color(ui::ACCENT_TEXT))
+            container(text("↓").size(14).font(ui::BOLD).color(p.accent_text))
                 .width(32)
                 .height(32)
                 .center(32)
@@ -1199,7 +1658,273 @@ fn incoming_row(item: &IncomingUi) -> Element<'_, Message> {
     .into()
 }
 
+fn auth_prompt(prompt: &AuthPromptUi, p: &ui::Palette) -> Element<'static, Message> {
+    let id = prompt.id.clone();
+    let size = prompt
+        .size
+        .map(|size| format!(" · {}", format_bytes(size)))
+        .unwrap_or_default();
+    let meta = if prompt.stable {
+        if prompt.sender.eq_ignore_ascii_case(&prompt.address) {
+            format!("Bluetooth device {}{size}", prompt.address)
+        } else {
+            format!("{} · {}{size}", prompt.sender, prompt.address)
+        }
+    } else {
+        format!("{} · Bluetooth address unavailable{size}", prompt.sender)
+    };
+
+    let allow = button(text("Allow once").size(10.5).font(ui::MEDIUM))
+        .padding([5, 8])
+        .style(ui::primary_button)
+        .on_press(Message::AuthorizationResponse {
+            id: id.clone(),
+            allow: true,
+            remember: false,
+        });
+    let decline = button(text("Decline").size(10.5).font(ui::MEDIUM))
+        .padding([5, 8])
+        .style(ui::secondary_button)
+        .on_press(Message::AuthorizationResponse {
+            id: id.clone(),
+            allow: false,
+            remember: false,
+        });
+    let mut actions = row![allow, decline].spacing(6);
+    if prompt.stable {
+        actions = actions
+            .push(
+                button(text("Always allow").size(10.5).font(ui::MEDIUM))
+                    .padding([5, 8])
+                    .style(ui::secondary_button)
+                    .on_press(Message::AuthorizationResponse {
+                        id: id.clone(),
+                        allow: true,
+                        remember: true,
+                    }),
+            )
+            .push(
+                button(text("Block").size(10.5).font(ui::MEDIUM))
+                    .padding([5, 8])
+                    .style(ui::danger_button)
+                    .on_press(Message::AuthorizationResponse {
+                        id,
+                        allow: false,
+                        remember: true,
+                    }),
+            );
+    }
+
+    container(
+        column![
+            row![
+                container(text("?").size(14).font(ui::BOLD).color(p.warning_text))
+                    .width(30)
+                    .height(30)
+                    .center(30)
+                    .style(ui::warning_tile),
+                column![
+                    text(format!("Approve {}?", prompt.name))
+                        .size(12.5)
+                        .font(ui::SEMIBOLD)
+                        .color(p.text),
+                    text(meta).size(10.5).color(p.text_muted),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+            actions,
+        ]
+        .spacing(9),
+    )
+    .padding(11)
+    .width(Length::Fill)
+    .style(ui::prompt)
+    .into()
+}
+
+fn saved_banner(saved: &SavedUi, p: &ui::Palette) -> Element<'static, Message> {
+    let folder = saved
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| saved.path.clone());
+    let title = if saved.partial {
+        format!("Partial file kept: {}", saved.name)
+    } else {
+        format!("Saved {}", saved.name)
+    };
+    let detail = match saved.path.parent() {
+        Some(parent) => folder_label(parent),
+        None => folder.display().to_string(),
+    };
+
+    container(
+        row![
+            container(text("✓").size(12).font(ui::BOLD).color(p.success_text))
+                .width(26)
+                .height(26)
+                .center(26)
+                .style(ui::success_tile),
+            column![
+                text(title)
+                    .size(11.5)
+                    .font(ui::MEDIUM)
+                    .color(p.success_text),
+                text(detail).size(10).color(p.text_muted),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            button(text("Open folder").size(10.5).font(ui::MEDIUM))
+                .padding([5, 9])
+                .style(ui::secondary_button)
+                .on_press(Message::OpenPath(folder)),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+    )
+    .padding([7, 9])
+    .width(Length::Fill)
+    .style(ui::success_panel)
+    .into()
+}
+
+fn save_folder_row<'a>(save_dir: &Path, picking: bool, p: &ui::Palette) -> Element<'a, Message> {
+    container(
+        row![
+            text("Save to").size(10.5).color(p.text_muted),
+            text(short_path(save_dir))
+                .size(10.5)
+                .font(ui::MONO)
+                .color(p.text_secondary)
+                .width(Length::Fill),
+            button(
+                text(if picking { "Choosing…" } else { "Change…" })
+                    .size(10.5)
+                    .font(ui::MEDIUM)
+            )
+            .padding([4, 8])
+            .style(ui::secondary_button)
+            .on_press_maybe((!picking).then_some(Message::PickSaveFolder)),
+            button(text("Open").size(10.5).font(ui::MEDIUM))
+                .padding([4, 8])
+                .style(ui::secondary_button)
+                .on_press(Message::OpenPath(save_dir.to_path_buf())),
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center),
+    )
+    .padding([6, 9])
+    .width(Length::Fill)
+    .style(ui::inset)
+    .into()
+}
+
+fn trust_panel(
+    entries: Vec<(String, crate::trust::TrustEntry)>,
+    policy: IncomingPolicy,
+    devices: &[DeviceInfo],
+    p: &ui::Palette,
+) -> Element<'static, Message> {
+    let mut list = column![].spacing(5);
+    if entries.is_empty() {
+        list = list.push(
+            text("No trusted or blocked senders yet.")
+                .size(10.5)
+                .color(p.text_muted),
+        );
+    }
+    for (address, entry) in entries {
+        let (label, tint, color) = match entry.decision {
+            crate::trust::TrustDecision::Allow => ("Allowed", p.success_tint, p.success_text),
+            crate::trust::TrustDecision::Block => ("Blocked", p.danger_tint, p.danger_text),
+        };
+        let name = sender_name(devices, &address, &entry.name);
+        let mut details = column![text(name.clone()).size(11).font(ui::MEDIUM).color(p.text)]
+            .spacing(1)
+            .width(Length::Fill);
+        if !name.eq_ignore_ascii_case(&address) {
+            details = details.push(
+                text(address.clone())
+                    .size(10)
+                    .font(ui::MONO)
+                    .color(p.text_muted),
+            );
+        }
+        list = list.push(
+            row![
+                details,
+                badge(label, tint, color),
+                button(text("Remove").size(10).font(ui::MEDIUM))
+                    .padding([3, 7])
+                    .style(ui::secondary_button)
+                    .on_press(Message::RemoveTrustedSender(address)),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    container(
+        column![
+            row![
+                text("Incoming senders")
+                    .size(11)
+                    .font(ui::SEMIBOLD)
+                    .color(p.text),
+                space().width(Length::Fill),
+                button(text("Ask").size(10).font(ui::MEDIUM))
+                    .padding([3, 8])
+                    .style(ui::policy_button(policy == IncomingPolicy::Ask))
+                    .on_press(Message::SetIncomingPolicy(IncomingPolicy::Ask)),
+                button(text("Trusted only").size(10).font(ui::MEDIUM))
+                    .padding([3, 8])
+                    .style(ui::policy_button(policy == IncomingPolicy::TrustedOnly))
+                    .on_press(Message::SetIncomingPolicy(IncomingPolicy::TrustedOnly)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(
+                "New senders can be approved in Kalo. Block and allow decisions are remembered \
+                 by Bluetooth address."
+            )
+            .size(10)
+            .color(p.text_muted),
+            list,
+        ]
+        .spacing(7),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(ui::inset)
+    .into()
+}
+
+fn folder_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Keep long save folders readable in the compact footer row.
+fn short_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    let mut parts: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if text.chars().count() <= 42 || parts.len() <= 2 {
+        return text;
+    }
+    let tail = parts.split_off(parts.len() - 2);
+    format!("…/{}/{}", tail[0], tail[1])
+}
+
 fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, Message> {
+    let p = ui::palette(app.settings.theme);
     if let Some(active) = &app.active_send {
         let progress = active.progress.as_ref();
         let fraction = progress.and_then(|progress| progress.fraction);
@@ -1210,7 +1935,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
             text(format!("Sending to {}", active.target))
                 .size(13.5)
                 .font(ui::SEMIBOLD)
-                .color(ui::TEXT)
+                .color(p.text)
                 .width(Length::Fill),
         ]
         .spacing(10)
@@ -1220,7 +1945,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
                 text(format!("{:.0}%", fraction * 100.0))
                     .size(12.5)
                     .font(ui::BOLD)
-                    .color(ui::ACCENT_TEXT),
+                    .color(p.accent_text),
             );
         }
 
@@ -1240,7 +1965,7 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         let bottom = row![
             text(detail)
                 .size(11.5)
-                .color(ui::TEXT_SECONDARY)
+                .color(p.text_secondary)
                 .width(Length::Fill),
             cancel,
         ]
@@ -1267,14 +1992,14 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
         (false, false) => "Select a device and choose a file.",
         (false, true) => "Select a device to send this file.",
         (true, false) => "Choose a file to send.",
-        (true, true) => "Ready when you are.",
+        (true, true) => "Ready to send.",
     };
     let send_label = target
         .map(|device| format!("Send to {}", device_name(device)))
         .unwrap_or_else(|| "Send file".to_string());
 
     let mut block = column![
-        container(text(guidance).size(11.5).color(ui::TEXT_MUTED)).height(Length::Fixed(17.0)),
+        container(text(guidance).size(11.5).color(p.text_muted)).height(Length::Fixed(17.0)),
         button(
             row![
                 text(send_label).size(14).font(ui::SEMIBOLD),
@@ -1291,9 +2016,9 @@ fn send_action<'a>(app: &'a App, target: Option<&'a DeviceInfo>) -> Element<'a, 
     .spacing(8);
     if let Some(result) = &app.send_result {
         let color = if result.ok {
-            ui::SUCCESS_TEXT
+            p.success_text
         } else {
-            ui::DANGER_TEXT
+            p.danger_text
         };
         block = block.push(
             row![
@@ -1318,6 +2043,18 @@ fn device_name(device: &DeviceInfo) -> &str {
     }
 }
 
+/// Prefer the friendly name from the loaded device list. Linux authorization
+/// events carry only the Bluetooth address, so this keeps prompts and the
+/// trust list readable without another backend lookup.
+fn sender_name(devices: &[DeviceInfo], address: &str, fallback: &str) -> String {
+    devices
+        .iter()
+        .find(|device| !address.is_empty() && device.address.eq_ignore_ascii_case(address))
+        .map(|device| device_name(device).to_string())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1334,48 +2071,167 @@ fn resolve_target<'a>(devices: &'a [DeviceInfo], selected: Option<&str>) -> Opti
         .find(|d| d.address.eq_ignore_ascii_case(address))
 }
 
-/// Visual system for Kalo's midnight surface. A single dark palette keeps
-/// contrast and state meaning predictable while giving the product a distinct
-/// identity.
+/// Visual system for Kalo. Two palettes share one layout and one set of
+/// semantic colors, so a theme switch never changes meaning.
 mod ui {
     use std::f32::consts::FRAC_PI_4;
 
     use iced::font::Weight;
     use iced::gradient;
+    use iced::theme::Base;
     use iced::widget::{button, container, progress_bar, rule};
     use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
-    pub const CANVAS: Color = Color::from_rgb8(0x07, 0x0A, 0x0F);
-    pub const SURFACE: Color = Color::from_rgb8(0x0D, 0x12, 0x19);
-    pub const SURFACE_ALT: Color = Color::from_rgb8(0x11, 0x18, 0x23);
-    pub const BORDER: Color = Color::from_rgb8(0x1D, 0x27, 0x35);
-    pub const BORDER_STRONG: Color = Color::from_rgb8(0x2B, 0x3B, 0x4F);
-    pub const TEXT: Color = Color::from_rgb8(0xF3, 0xF7, 0xFB);
-    pub const TEXT_SECONDARY: Color = Color::from_rgb8(0xA6, 0xB3, 0xC4);
-    pub const TEXT_MUTED: Color = Color::from_rgb8(0x76, 0x85, 0x9A);
-    pub const ACCENT: Color = Color::from_rgb8(0x5E, 0xEA, 0xD4);
-    pub const ACCENT_BLUE: Color = Color::from_rgb8(0x60, 0xA5, 0xFA);
-    pub const ACCENT_HOVER: Color = Color::from_rgb8(0x7F, 0xF3, 0xE1);
-    pub const ACCENT_PRESSED: Color = Color::from_rgb8(0x2D, 0xD4, 0xBF);
-    pub const ACCENT_TEXT: Color = Color::from_rgb8(0x7D, 0xF0, 0xDC);
-    pub const ACCENT_TINT: Color = Color::from_rgb8(0x0D, 0x26, 0x24);
-    pub const ACCENT_DIM: Color = Color::from_rgb8(0x1C, 0x4A, 0x46);
-    pub const ON_ACCENT: Color = Color::from_rgb8(0x04, 0x12, 0x0F);
-    pub const ROW_HOVER: Color = Color::from_rgb8(0x14, 0x1D, 0x29);
-    pub const ROW_PRESSED: Color = Color::from_rgb8(0x19, 0x24, 0x32);
-    pub const TRACK: Color = Color::from_rgb8(0x1A, 0x25, 0x33);
-    pub const CHIP: Color = Color::from_rgb8(0x14, 0x1C, 0x26);
-    pub const DISABLED_BG: Color = Color::from_rgb8(0x16, 0x1E, 0x29);
-    pub const DISABLED_TEXT: Color = Color::from_rgb8(0x64, 0x73, 0x87);
-    pub const SUCCESS: Color = Color::from_rgb8(0x34, 0xD3, 0x99);
-    pub const SUCCESS_TINT: Color = Color::from_rgb8(0x0D, 0x28, 0x1F);
-    pub const SUCCESS_TEXT: Color = Color::from_rgb8(0x6E, 0xE7, 0xB7);
-    pub const WARNING: Color = Color::from_rgb8(0xFB, 0xBF, 0x24);
-    pub const WARNING_TINT: Color = Color::from_rgb8(0x2A, 0x23, 0x14);
-    pub const WARNING_TEXT: Color = Color::from_rgb8(0xFD, 0xE6, 0x8A);
-    pub const DANGER: Color = Color::from_rgb8(0xFB, 0x71, 0x85);
-    pub const DANGER_TINT: Color = Color::from_rgb8(0x2C, 0x15, 0x1B);
-    pub const DANGER_TEXT: Color = Color::from_rgb8(0xFD, 0xA4, 0xAF);
+    use crate::settings::ThemeKind;
+
+    /// Every color the interface uses. Style functions receive the active
+    /// iced theme, look up the matching palette, and build from these fields.
+    pub struct Palette {
+        pub canvas: Color,
+        pub surface: Color,
+        pub surface_alt: Color,
+        pub border: Color,
+        pub border_strong: Color,
+        pub text: Color,
+        pub text_secondary: Color,
+        pub text_muted: Color,
+        pub accent: Color,
+        pub accent_blue: Color,
+        pub accent_hover: Color,
+        pub accent_pressed: Color,
+        pub accent_blue_hover: Color,
+        pub accent_blue_pressed: Color,
+        pub accent_text: Color,
+        pub accent_tint: Color,
+        pub accent_dim: Color,
+        pub on_accent: Color,
+        pub row_hover: Color,
+        pub row_pressed: Color,
+        pub track: Color,
+        pub chip: Color,
+        pub disabled_bg: Color,
+        pub disabled_text: Color,
+        pub success: Color,
+        pub success_tint: Color,
+        pub success_text: Color,
+        pub warning: Color,
+        pub warning_tint: Color,
+        pub warning_text: Color,
+        pub danger: Color,
+        pub danger_tint: Color,
+        pub danger_text: Color,
+        pub hero_from: Color,
+        pub hero_to: Color,
+        pub hero_shadow: Color,
+        pub panel_shadow: Color,
+        pub notice_border: Color,
+        pub brand_shadow: Color,
+        pub orb_shadow: Color,
+    }
+
+    pub const DARK: Palette = Palette {
+        canvas: Color::from_rgb8(0x07, 0x0A, 0x0F),
+        surface: Color::from_rgb8(0x0D, 0x12, 0x19),
+        surface_alt: Color::from_rgb8(0x11, 0x18, 0x23),
+        border: Color::from_rgb8(0x1D, 0x27, 0x35),
+        border_strong: Color::from_rgb8(0x2B, 0x3B, 0x4F),
+        text: Color::from_rgb8(0xF3, 0xF7, 0xFB),
+        text_secondary: Color::from_rgb8(0xA6, 0xB3, 0xC4),
+        text_muted: Color::from_rgb8(0x76, 0x85, 0x9A),
+        accent: Color::from_rgb8(0x5E, 0xEA, 0xD4),
+        accent_blue: Color::from_rgb8(0x60, 0xA5, 0xFA),
+        accent_hover: Color::from_rgb8(0x7F, 0xF3, 0xE1),
+        accent_pressed: Color::from_rgb8(0x2D, 0xD4, 0xBF),
+        accent_blue_hover: Color::from_rgb8(0x8B, 0xC5, 0xFF),
+        accent_blue_pressed: Color::from_rgb8(0x38, 0x7B, 0xD9),
+        accent_text: Color::from_rgb8(0x7D, 0xF0, 0xDC),
+        accent_tint: Color::from_rgb8(0x0D, 0x26, 0x24),
+        accent_dim: Color::from_rgb8(0x1C, 0x4A, 0x46),
+        on_accent: Color::from_rgb8(0x04, 0x12, 0x0F),
+        row_hover: Color::from_rgb8(0x14, 0x1D, 0x29),
+        row_pressed: Color::from_rgb8(0x19, 0x24, 0x32),
+        track: Color::from_rgb8(0x1A, 0x25, 0x33),
+        chip: Color::from_rgb8(0x14, 0x1C, 0x26),
+        disabled_bg: Color::from_rgb8(0x16, 0x1E, 0x29),
+        disabled_text: Color::from_rgb8(0x64, 0x73, 0x87),
+        success: Color::from_rgb8(0x34, 0xD3, 0x99),
+        success_tint: Color::from_rgb8(0x0D, 0x28, 0x1F),
+        success_text: Color::from_rgb8(0x6E, 0xE7, 0xB7),
+        warning: Color::from_rgb8(0xFB, 0xBF, 0x24),
+        warning_tint: Color::from_rgb8(0x2A, 0x23, 0x14),
+        warning_text: Color::from_rgb8(0xFD, 0xE6, 0x8A),
+        danger: Color::from_rgb8(0xFB, 0x71, 0x85),
+        danger_tint: Color::from_rgb8(0x2C, 0x15, 0x1B),
+        danger_text: Color::from_rgb8(0xFD, 0xA4, 0xAF),
+        hero_from: Color::from_rgb8(0x0E, 0x20, 0x26),
+        hero_to: Color::from_rgb8(0x0C, 0x12, 0x1B),
+        hero_shadow: Color::from_rgba8(0x00, 0x00, 0x00, 0.35),
+        panel_shadow: Color::from_rgba8(0x00, 0x00, 0x00, 0.28),
+        notice_border: Color::from_rgb8(0x4A, 0x26, 0x30),
+        brand_shadow: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.22),
+        orb_shadow: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.18),
+    };
+
+    pub const LIGHT: Palette = Palette {
+        canvas: Color::from_rgb8(0xF4, 0xF7, 0xFB),
+        surface: Color::from_rgb8(0xFF, 0xFF, 0xFF),
+        surface_alt: Color::from_rgb8(0xF7, 0xFA, 0xFD),
+        border: Color::from_rgb8(0xE1, 0xE8, 0xF0),
+        border_strong: Color::from_rgb8(0xC6, 0xD2, 0xE1),
+        text: Color::from_rgb8(0x0B, 0x15, 0x24),
+        text_secondary: Color::from_rgb8(0x4A, 0x5B, 0x70),
+        text_muted: Color::from_rgb8(0x60, 0x71, 0x87),
+        accent: Color::from_rgb8(0x0F, 0x8F, 0x7C),
+        accent_blue: Color::from_rgb8(0x25, 0x63, 0xC9),
+        accent_hover: Color::from_rgb8(0x12, 0xA5, 0x8F),
+        accent_pressed: Color::from_rgb8(0x0A, 0x74, 0x65),
+        accent_blue_hover: Color::from_rgb8(0x3B, 0x7B, 0xE0),
+        accent_blue_pressed: Color::from_rgb8(0x1D, 0x4F, 0xA8),
+        accent_text: Color::from_rgb8(0x0B, 0x6F, 0x60),
+        accent_tint: Color::from_rgb8(0xE6, 0xF7, 0xF3),
+        accent_dim: Color::from_rgb8(0xB9, 0xE5, 0xDD),
+        on_accent: Color::from_rgb8(0xFF, 0xFF, 0xFF),
+        row_hover: Color::from_rgb8(0xF0, 0xF5, 0xFA),
+        row_pressed: Color::from_rgb8(0xE8, 0xEF, 0xF7),
+        track: Color::from_rgb8(0xE4, 0xEB, 0xF3),
+        chip: Color::from_rgb8(0xEE, 0xF3, 0xF9),
+        disabled_bg: Color::from_rgb8(0xED, 0xF1, 0xF6),
+        disabled_text: Color::from_rgb8(0x9A, 0xA8, 0xB8),
+        success: Color::from_rgb8(0x0E, 0x9F, 0x6E),
+        success_tint: Color::from_rgb8(0xE7, 0xF8, 0xF0),
+        success_text: Color::from_rgb8(0x08, 0x7A, 0x51),
+        warning: Color::from_rgb8(0xB7, 0x79, 0x1F),
+        warning_tint: Color::from_rgb8(0xFF, 0xF6, 0xE0),
+        warning_text: Color::from_rgb8(0x8A, 0x5A, 0x00),
+        danger: Color::from_rgb8(0xD1, 0x43, 0x5B),
+        danger_tint: Color::from_rgb8(0xFD, 0xEB, 0xEE),
+        danger_text: Color::from_rgb8(0xA6, 0x1E, 0x36),
+        hero_from: Color::from_rgb8(0xEA, 0xF7, 0xF4),
+        hero_to: Color::from_rgb8(0xEE, 0xF4, 0xFF),
+        hero_shadow: Color::from_rgba8(0x0F, 0x17, 0x2A, 0.10),
+        panel_shadow: Color::from_rgba8(0x0F, 0x17, 0x2A, 0.08),
+        notice_border: Color::from_rgb8(0xF3, 0xC6, 0xCE),
+        brand_shadow: Color::from_rgba8(0x0F, 0x8F, 0x7C, 0.25),
+        orb_shadow: Color::from_rgba8(0x0F, 0x8F, 0x7C, 0.15),
+    };
+
+    const DARK_NAME: &str = "Kalo Midnight";
+    const LIGHT_NAME: &str = "Kalo Daylight";
+
+    pub fn palette(kind: ThemeKind) -> &'static Palette {
+        match kind {
+            ThemeKind::Dark => &DARK,
+            ThemeKind::Light => &LIGHT,
+        }
+    }
+
+    fn palette_for(theme: &Theme) -> &'static Palette {
+        if theme.name() == LIGHT_NAME {
+            &LIGHT
+        } else {
+            &DARK
+        }
+    }
 
     pub const SEMIBOLD: Font = Font {
         family: iced::font::Family::SansSerif,
@@ -1404,16 +2260,20 @@ mod ui {
 
     /// The custom iced theme used for built-in widget details such as
     /// scrollbars, so they belong to the same surface as the app.
-    pub fn theme() -> Theme {
+    pub fn theme(kind: ThemeKind) -> Theme {
+        let palette = palette(kind);
         Theme::custom(
-            "Kalo Midnight",
+            match kind {
+                ThemeKind::Dark => DARK_NAME,
+                ThemeKind::Light => LIGHT_NAME,
+            },
             iced::theme::Palette {
-                background: CANVAS,
-                text: TEXT,
-                primary: ACCENT,
-                success: SUCCESS,
-                warning: WARNING,
-                danger: DANGER,
+                background: palette.canvas,
+                text: palette.text,
+                primary: palette.accent,
+                success: palette.success,
+                warning: palette.warning,
+                danger: palette.danger,
             },
         )
     }
@@ -1427,26 +2287,24 @@ mod ui {
         )
     }
 
-    pub fn canvas(_: &Theme) -> container::Style {
+    pub fn canvas(theme: &Theme) -> container::Style {
         container::Style {
-            background: Some(Background::Color(CANVAS)),
+            background: Some(Background::Color(palette_for(theme).canvas)),
             ..container::Style::default()
         }
     }
 
-    pub fn hero(_: &Theme) -> container::Style {
+    pub fn hero(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(gradient_background(
-                Color::from_rgb8(0x0E, 0x20, 0x26),
-                Color::from_rgb8(0x0C, 0x12, 0x1B),
-            )),
+            background: Some(gradient_background(p.hero_from, p.hero_to)),
             border: Border {
-                color: BORDER,
+                color: p.border,
                 width: 1.0,
                 radius: 20.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0x00, 0x00, 0x00, 0.35),
+                color: p.hero_shadow,
                 offset: Vector::new(0.0, 8.0),
                 blur_radius: 24.0,
             },
@@ -1454,16 +2312,17 @@ mod ui {
         }
     }
 
-    pub fn panel(_: &Theme) -> container::Style {
+    pub fn panel(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(SURFACE)),
+            background: Some(Background::Color(p.surface)),
             border: Border {
-                color: BORDER,
+                color: p.border,
                 width: 1.0,
                 radius: 18.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0x00, 0x00, 0x00, 0.28),
+                color: p.panel_shadow,
                 offset: Vector::new(0.0, 6.0),
                 blur_radius: 18.0,
             },
@@ -1471,11 +2330,12 @@ mod ui {
         }
     }
 
-    pub fn inset(_: &Theme) -> container::Style {
+    pub fn inset(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(SURFACE_ALT)),
+            background: Some(Background::Color(p.surface_alt)),
             border: Border {
-                color: BORDER,
+                color: p.border,
                 width: 1.0,
                 radius: 12.0.into(),
             },
@@ -1483,11 +2343,12 @@ mod ui {
         }
     }
 
-    pub fn active_transfer(_: &Theme) -> container::Style {
+    pub fn active_transfer(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(ACCENT_TINT)),
+            background: Some(Background::Color(p.accent_tint)),
             border: Border {
-                color: ACCENT_DIM,
+                color: p.accent_dim,
                 width: 1.0,
                 radius: 12.0.into(),
             },
@@ -1495,11 +2356,12 @@ mod ui {
         }
     }
 
-    pub fn notice(_: &Theme) -> container::Style {
+    pub fn notice(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(DANGER_TINT)),
+            background: Some(Background::Color(p.danger_tint)),
             border: Border {
-                color: Color::from_rgb8(0x4A, 0x26, 0x30),
+                color: p.notice_border,
                 width: 1.0,
                 radius: 12.0.into(),
             },
@@ -1507,16 +2369,17 @@ mod ui {
         }
     }
 
-    pub fn brand(_: &Theme) -> container::Style {
+    pub fn brand(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(gradient_background(ACCENT, ACCENT_BLUE)),
+            background: Some(gradient_background(p.accent, p.accent_blue)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
                 radius: 12.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.22),
+                color: p.brand_shadow,
                 offset: Vector::new(0.0, 4.0),
                 blur_radius: 16.0,
             },
@@ -1524,9 +2387,9 @@ mod ui {
         }
     }
 
-    pub fn step_badge(_: &Theme) -> container::Style {
+    pub fn step_badge(theme: &Theme) -> container::Style {
         container::Style {
-            background: Some(Background::Color(ACCENT)),
+            background: Some(Background::Color(palette_for(theme).accent)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -1537,14 +2400,30 @@ mod ui {
     }
 
     pub fn avatar(selected: bool) -> impl Fn(&Theme) -> container::Style {
-        move |_| container::Style {
-            background: Some(Background::Color(if selected {
-                ACCENT
-            } else {
-                ACCENT_TINT
-            })),
+        move |theme| {
+            let p = palette_for(theme);
+            container::Style {
+                background: Some(Background::Color(if selected {
+                    p.accent
+                } else {
+                    p.accent_tint
+                })),
+                border: Border {
+                    color: if selected { p.accent } else { p.accent_dim },
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..container::Style::default()
+            }
+        }
+    }
+
+    pub fn icon_tile(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
+        container::Style {
+            background: Some(Background::Color(p.accent_tint)),
             border: Border {
-                color: if selected { ACCENT } else { ACCENT_DIM },
+                color: p.accent_dim,
                 width: 1.0,
                 radius: 10.0.into(),
             },
@@ -1552,11 +2431,12 @@ mod ui {
         }
     }
 
-    pub fn icon_tile(_: &Theme) -> container::Style {
+    pub fn icon_tile_muted(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(ACCENT_TINT)),
+            background: Some(Background::Color(p.chip)),
             border: Border {
-                color: ACCENT_DIM,
+                color: p.border,
                 width: 1.0,
                 radius: 10.0.into(),
             },
@@ -1564,23 +2444,25 @@ mod ui {
         }
     }
 
-    pub fn icon_tile_muted(_: &Theme) -> container::Style {
+    pub fn warning_tile(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(CHIP)),
+            background: Some(Background::Color(p.warning_tint)),
             border: Border {
-                color: BORDER,
+                color: p.warning,
                 width: 1.0,
-                radius: 10.0.into(),
+                radius: 9.0.into(),
             },
             ..container::Style::default()
         }
     }
 
-    fn accent_ring(alpha: f32) -> container::Style {
+    pub fn success_tile(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.03))),
+            background: Some(Background::Color(p.success_tint)),
             border: Border {
-                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, alpha),
+                color: p.success,
                 width: 1.0,
                 radius: 999.0.into(),
             },
@@ -1588,24 +2470,117 @@ mod ui {
         }
     }
 
-    pub fn orb_outer(_: &Theme) -> container::Style {
-        accent_ring(0.12)
-    }
-
-    pub fn orb_ring(_: &Theme) -> container::Style {
-        accent_ring(0.24)
-    }
-
-    pub fn orb_core(_: &Theme) -> container::Style {
+    pub fn prompt(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(ACCENT_TINT)),
+            background: Some(Background::Color(p.warning_tint)),
             border: Border {
-                color: ACCENT_DIM,
+                color: p.warning,
+                width: 1.0,
+                radius: 11.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn success_panel(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
+        container::Style {
+            background: Some(Background::Color(p.success_tint)),
+            border: Border {
+                color: p.success,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn policy_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+        move |theme, status| {
+            let p = palette_for(theme);
+            let hovered = matches!(status, button::Status::Hovered);
+            let pressed = matches!(status, button::Status::Pressed);
+            let (background, text_color, border_color) = if active {
+                (p.accent_tint, p.accent_text, p.accent)
+            } else if pressed {
+                (p.row_pressed, p.text, p.border_strong)
+            } else if hovered {
+                (p.row_hover, p.text, p.border_strong)
+            } else {
+                (p.surface_alt, p.text_secondary, p.border)
+            };
+            button::Style {
+                background: Some(Background::Color(background)),
+                text_color,
+                border: Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..button::Style::default()
+            }
+        }
+    }
+
+    pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
+        let p = palette_for(theme);
+        let (background, text_color, border_color) = match status {
+            button::Status::Active => (p.danger_tint, p.danger_text, p.danger),
+            button::Status::Hovered => (p.row_hover, p.danger_text, p.danger),
+            button::Status::Pressed => (p.row_pressed, p.danger_text, p.danger),
+            button::Status::Disabled => (p.disabled_bg, p.disabled_text, p.border),
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color,
+            border: Border {
+                color: border_color,
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+
+    fn accent_ring(theme: &Theme, alpha: f32) -> container::Style {
+        let p = palette_for(theme);
+        container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.03,
+                ..p.accent
+            })),
+            border: Border {
+                color: Color {
+                    a: alpha,
+                    ..p.accent
+                },
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            ..container::Style::default()
+        }
+    }
+
+    pub fn orb_outer(theme: &Theme) -> container::Style {
+        accent_ring(theme, 0.12)
+    }
+
+    pub fn orb_ring(theme: &Theme) -> container::Style {
+        accent_ring(theme, 0.24)
+    }
+
+    pub fn orb_core(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
+        container::Style {
+            background: Some(Background::Color(p.accent_tint)),
+            border: Border {
+                color: p.accent_dim,
                 width: 1.0,
                 radius: 999.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0x5E, 0xEA, 0xD4, 0.18),
+                color: p.orb_shadow,
                 offset: Vector::new(0.0, 0.0),
                 blur_radius: 22.0,
             },
@@ -1634,11 +2609,12 @@ mod ui {
         fill(background, 999.0)
     }
 
-    pub fn chip(_: &Theme) -> container::Style {
+    pub fn chip(theme: &Theme) -> container::Style {
+        let p = palette_for(theme);
         container::Style {
-            background: Some(Background::Color(CHIP)),
+            background: Some(Background::Color(p.chip)),
             border: Border {
-                color: BORDER,
+                color: p.border,
                 width: 1.0,
                 radius: 999.0.into(),
             },
@@ -1646,19 +2622,20 @@ mod ui {
         }
     }
 
-    pub fn divider(_: &Theme) -> rule::Style {
+    pub fn divider(theme: &Theme) -> rule::Style {
         rule::Style {
-            color: BORDER,
+            color: palette_for(theme).border,
             radius: 0.0.into(),
             fill_mode: rule::FillMode::Full,
             snap: true,
         }
     }
 
-    pub fn progress(_: &Theme) -> progress_bar::Style {
+    pub fn progress(theme: &Theme) -> progress_bar::Style {
+        let p = palette_for(theme);
         progress_bar::Style {
-            background: Background::Color(TRACK),
-            bar: gradient_background(ACCENT, ACCENT_BLUE),
+            background: Background::Color(p.track),
+            bar: gradient_background(p.accent, p.accent_blue),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -1667,18 +2644,19 @@ mod ui {
         }
     }
 
-    pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
+    pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
+        let p = palette_for(theme);
         let (background, text_color) = match status {
-            button::Status::Active => (gradient_background(ACCENT, ACCENT_BLUE), ON_ACCENT),
+            button::Status::Active => (gradient_background(p.accent, p.accent_blue), p.on_accent),
             button::Status::Hovered => (
-                gradient_background(ACCENT_HOVER, Color::from_rgb8(0x8B, 0xC5, 0xFF)),
-                ON_ACCENT,
+                gradient_background(p.accent_hover, p.accent_blue_hover),
+                p.on_accent,
             ),
             button::Status::Pressed => (
-                gradient_background(ACCENT_PRESSED, Color::from_rgb8(0x38, 0x7B, 0xD9)),
-                ON_ACCENT,
+                gradient_background(p.accent_pressed, p.accent_blue_pressed),
+                p.on_accent,
             ),
-            button::Status::Disabled => (Background::Color(DISABLED_BG), DISABLED_TEXT),
+            button::Status::Disabled => (Background::Color(p.disabled_bg), p.disabled_text),
         };
 
         button::Style {
@@ -1698,12 +2676,13 @@ mod ui {
         }
     }
 
-    pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
+    pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
+        let p = palette_for(theme);
         let (background, text_color, border_color) = match status {
-            button::Status::Active => (SURFACE_ALT, TEXT_SECONDARY, BORDER_STRONG),
-            button::Status::Hovered => (ROW_HOVER, TEXT, BORDER_STRONG),
-            button::Status::Pressed => (ROW_PRESSED, TEXT, BORDER_STRONG),
-            button::Status::Disabled => (DISABLED_BG, DISABLED_TEXT, BORDER),
+            button::Status::Active => (p.surface_alt, p.text_secondary, p.border_strong),
+            button::Status::Hovered => (p.row_hover, p.text, p.border_strong),
+            button::Status::Pressed => (p.row_pressed, p.text, p.border_strong),
+            button::Status::Disabled => (p.disabled_bg, p.disabled_text, p.border),
         };
 
         button::Style {
@@ -1719,29 +2698,30 @@ mod ui {
     }
 
     pub fn device_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-        move |_, status| {
+        move |theme, status| {
+            let p = palette_for(theme);
             let hovered = matches!(status, button::Status::Hovered);
             let pressed = matches!(status, button::Status::Pressed);
             let background = if selected {
-                ACCENT_TINT
+                p.accent_tint
             } else if pressed {
-                ROW_PRESSED
+                p.row_pressed
             } else if hovered {
-                ROW_HOVER
+                p.row_hover
             } else {
-                SURFACE_ALT
+                p.surface_alt
             };
             let border_color = if selected {
-                ACCENT
+                p.accent
             } else if hovered || pressed {
-                BORDER_STRONG
+                p.border_strong
             } else {
-                BORDER
+                p.border
             };
 
             button::Style {
                 background: Some(Background::Color(background)),
-                text_color: TEXT,
+                text_color: p.text,
                 border: Border {
                     color: border_color,
                     width: 1.0,
@@ -1768,8 +2748,10 @@ mod tests {
     }
 
     fn app() -> App {
+        let sink = EventSink::new(64);
+        let trust = TrustStore::in_memory();
         App {
-            tx: EventSink::new(64),
+            tx: sink.clone(),
             devices: vec![device("AA:BB", "phone")],
             devices_request_id: 1,
             devices_loaded: true,
@@ -1784,6 +2766,16 @@ mod tests {
             send_result: None,
             incoming: Vec::new(),
             receiver_state: ReceiverStatus::Starting,
+            settings: Settings::default(),
+            authorizer: Authorizer::new(trust.clone(), sink, true),
+            trust,
+            save_dir: SaveDir::new(PathBuf::from("/tmp/kalo-downloads")),
+            picking_folder: false,
+            pending_authorizations: Vec::new(),
+            last_saved: None,
+            show_trust: false,
+            demo: true,
+            tray_ready: false,
         }
     }
 
@@ -2124,5 +3116,121 @@ mod tests {
             "report.pdf".to_string()
         );
         assert_eq!(file_name(Path::new("/")), "/".to_string());
+    }
+
+    #[test]
+    fn sender_names_prefer_known_devices() {
+        let devices = vec![device("AA:BB:CC:11:22:33", "Pixel 8")];
+        assert_eq!(
+            sender_name(&devices, "aa:bb:cc:11:22:33", "AA:BB:CC:11:22:33"),
+            "Pixel 8"
+        );
+        assert_eq!(sender_name(&[], "AA:BB", "AA:BB"), "AA:BB");
+        assert_eq!(sender_name(&devices, "", "Some sender"), "Some sender");
+    }
+
+    #[test]
+    fn theme_toggle_and_save_folder_update_locally() {
+        let mut app = app();
+        assert_eq!(app.settings.theme, ThemeKind::Dark);
+
+        let _ = update(&mut app, Message::ToggleTheme);
+        assert_eq!(app.settings.theme, ThemeKind::Light);
+        let _ = update(&mut app, Message::ToggleTheme);
+        assert_eq!(app.settings.theme, ThemeKind::Dark);
+
+        let folder = PathBuf::from("/tmp/kalo-received");
+        let _ = update(&mut app, Message::SaveFolderPicked(Some(folder.clone())));
+        assert_eq!(app.save_dir.get(), folder);
+        assert_eq!(app.settings.save_dir, Some(folder));
+        assert!(app.log.iter().any(|line| line.contains("now save to")));
+    }
+
+    #[test]
+    fn authorization_prompt_is_shown_and_dismissed() {
+        let mut app = app();
+        let _ = handle_event(
+            &mut app,
+            Event::IncomingAuthorization {
+                id: "auth-1".into(),
+                sender: "Pixel 8".into(),
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                name: "photo.jpg".into(),
+                size: Some(10),
+                stable: true,
+            },
+        );
+        assert_eq!(app.pending_authorizations.len(), 1);
+        assert_eq!(app.pending_authorizations[0].sender, "Pixel 8");
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("waiting for approval"))
+        );
+
+        let _ = update(
+            &mut app,
+            Message::AuthorizationResponse {
+                id: "auth-1".into(),
+                allow: false,
+                remember: false,
+            },
+        );
+        assert!(app.pending_authorizations.is_empty());
+    }
+
+    #[test]
+    fn completed_incoming_transfer_offers_the_saved_folder() {
+        let mut app = app();
+        let path = PathBuf::from("/tmp/kalo-received/photo.jpg");
+        let _ = handle_event(
+            &mut app,
+            Event::IncomingDone {
+                id: "in-1".into(),
+                sender: "Pixel 8".into(),
+                name: "photo.jpg".into(),
+                saved_to: path.clone(),
+                bytes: 10,
+                elapsed_secs: 1.0,
+                mbps: 1.0,
+                partial: false,
+            },
+        );
+        let saved = app.last_saved.as_ref().expect("saved banner");
+        assert_eq!(saved.name, "photo.jpg");
+        assert_eq!(saved.path, path);
+        assert!(!saved.partial);
+    }
+
+    #[test]
+    fn removing_a_trusted_sender_updates_the_store() {
+        let mut app = app();
+        app.trust
+            .remember(
+                "AA:BB:CC:DD:EE:FF",
+                "Pixel 8",
+                crate::trust::TrustDecision::Allow,
+            )
+            .unwrap();
+        assert_eq!(app.trust.entries().len(), 1);
+
+        let _ = update(
+            &mut app,
+            Message::RemoveTrustedSender("aa:bb:cc:dd:ee:ff".into()),
+        );
+        assert!(app.trust.entries().is_empty());
+    }
+
+    #[test]
+    fn long_save_folders_are_shortened_for_the_footer() {
+        assert_eq!(
+            short_path(Path::new("/home/you/Downloads")),
+            "/home/you/Downloads"
+        );
+        let long = short_path(Path::new(
+            "/home/you/a-very-long-folder-name/received files",
+        ));
+        assert!(long.starts_with("…/"));
+        assert!(long.ends_with("received files"));
     }
 }

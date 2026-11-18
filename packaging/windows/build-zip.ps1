@@ -41,6 +41,7 @@ $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("kalo-zip-" + [guid]::NewG
 New-Item -ItemType Directory -Path $Stage | Out-Null
 try {
     Copy-Item $Exe $Stage
+    Copy-Item "packaging\windows\kalo.ico" $Stage
     Copy-Item "README.md", "LICENSE" $Stage
     New-Item -ItemType Directory -Force -Path "dist" | Out-Null
     $Zip = Join-Path "dist" "kalo-$Version-$Arch.zip"

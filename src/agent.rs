@@ -1,7 +1,8 @@
 //! OBEX agent: receives incoming OPP pushes into a staging directory under
-//! obexd's root, then moves finished files into `~/Downloads`.
+//! obexd's root, then moves finished files into the user's save folder.
 //!
-//! SPIKE NOTE: authorization is accept-all; the trust store arrives in Phase 1.
+//! New senders are authorized by the trust store or approved in the desktop
+//! UI; the CLI receiver accepts remembered senders only.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,8 @@ use crate::events::{Event, EventSink, TransferStatus};
 use crate::paths;
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
+use crate::settings::{SaveDir, Settings};
+use crate::trust::{Authorizer, TrustStore};
 
 /// Root path for agent objects. Every registration exports a unique child
 /// path so a late `Release` from an old registration can never affect the
@@ -150,6 +153,7 @@ pub struct AgentService {
     events: EventSink,
     handle: ReceiverHandle,
     registration: u64,
+    authorizer: Authorizer,
 }
 
 #[interface(name = "org.bluez.obex.Agent1")]
@@ -179,7 +183,6 @@ impl AgentService {
 }
 
 impl AgentService {
-    /// SPIKE: accept every push. Trust checks arrive in Phase 1.
     async fn authorize(&self, transfer: &OwnedObjectPath) -> Result<PathBuf> {
         let t = TransferPropsProxy::builder(&self.conn)
             .path(transfer.as_str())?
@@ -209,14 +212,32 @@ impl AgentService {
             .destination()
             .await
             .unwrap_or_else(|_| "unknown".into());
+        if sender.trim().is_empty() || sender == "unknown" {
+            bail!("cannot identify the sender");
+        }
         let root = session_props
             .root()
             .await
             .unwrap_or_else(|_| obexd_root_fallback());
         let size = t.size().await.ok();
 
-        // Stage inside obexd's root (it may refuse to write outside it).
         let id = Uuid::new_v4().simple().to_string();
+        if let Err(reason) = self
+            .authorizer
+            .authorize(&id, &sender, &sender, &safe_name, size)
+            .await
+        {
+            self.events.send(Event::IncomingFailed {
+                id,
+                sender,
+                name: safe_name,
+                error: reason,
+                staged_at: None,
+            });
+            bail!("incoming push was not authorized");
+        }
+
+        // Stage inside obexd's root (it may refuse to write outside it).
         let staging_dir = PathBuf::from(&root).join(format!("kalo-{id}"));
         std::fs::create_dir_all(&staging_dir)
             .with_context(|| format!("create staging dir {staging_dir:?}"))?;
@@ -280,8 +301,9 @@ const STAGING_STALE_AGE: Duration = INCOMING_STALL_TIMEOUT;
 /// remove the now-empty `kalo-*` directories.
 ///
 /// The supervisor runs this after registration and periodically afterwards.
-fn sweep_staging(downloads: &Path, events: &EventSink) {
-    let recovered = sweep_stale_staging(&staging_root(), downloads, STAGING_STALE_AGE, events);
+fn sweep_staging(save_dir: &SaveDir, events: &EventSink) {
+    let downloads = save_dir.get();
+    let recovered = sweep_stale_staging(&staging_root(), &downloads, STAGING_STALE_AGE, events);
     if recovered > 0 {
         events.send(Event::Log(format!(
             "recovered {recovered} file(s) from an interrupted transfer"
@@ -608,13 +630,16 @@ fn incoming_stall_reason(
 pub async fn poll_pending(
     conn: &Connection,
     pending: &PendingTransfers,
-    downloads: &Path,
+    save_dir: &SaveDir,
     events: &EventSink,
 ) {
     let list = pending.lock().expect("pending lock").clone();
     if list.is_empty() {
         return;
     }
+    // Snapshot once per poll: a preference change takes effect on the next
+    // poll rather than splitting one completion across two folders.
+    let downloads = save_dir.get();
     // Entries are finished by `id`, never by object path (obexd reuses paths).
     let mut finished: Vec<String> = Vec::new();
 
@@ -634,7 +659,7 @@ pub async fn poll_pending(
                     }
                     handle_object_gone(
                         p,
-                        downloads,
+                        &downloads,
                         events,
                         format!("transfer object unavailable: {e}"),
                     );
@@ -654,7 +679,7 @@ pub async fn poll_pending(
                 }
                 handle_object_gone(
                     p,
-                    downloads,
+                    &downloads,
                     events,
                     format!("transfer object unavailable: {e}"),
                 );
@@ -680,7 +705,7 @@ pub async fn poll_pending(
                 }
                 handle_object_gone(
                     p,
-                    downloads,
+                    &downloads,
                     events,
                     format!("transfer object disappeared before completion: {e}"),
                 );
@@ -696,7 +721,7 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir: it may hold the old file
                 }
-                if let Err(e) = finalize_transfer(p, downloads, events, false) {
+                if let Err(e) = finalize_transfer(p, &downloads, events, false) {
                     // Keep the staged source: a failed move must not destroy
                     // the only copy of the received file.
                     fail(
@@ -714,7 +739,7 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                recover_failed_transfer(p, downloads, events, "transfer reported error");
+                recover_failed_transfer(p, &downloads, events, "transfer reported error");
                 finished.push(p.id.clone());
             }
             TransferStatus::Unknown(raw) if raw.eq_ignore_ascii_case("cancelled") => {
@@ -723,7 +748,7 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                recover_failed_transfer(p, downloads, events, "transfer was canceled");
+                recover_failed_transfer(p, &downloads, events, "transfer was canceled");
                 finished.push(p.id.clone());
             }
             _ => {
@@ -732,7 +757,7 @@ pub async fn poll_pending(
                 let idle =
                     record_progress(pending, &p.id, transferred.unwrap_or(p.last_transferred));
                 if let Some(reason) = incoming_stall_reason(&status, status_since, idle) {
-                    handle_object_gone(p, downloads, events, reason);
+                    handle_object_gone(p, &downloads, events, reason);
                     finished.push(p.id.clone());
                     continue;
                 }
@@ -832,6 +857,7 @@ async fn export_agent(
     events: EventSink,
     handle: ReceiverHandle,
     registration: u64,
+    authorizer: Authorizer,
 ) -> Result<()> {
     let service = AgentService {
         conn: conn.clone(),
@@ -839,6 +865,7 @@ async fn export_agent(
         events,
         handle,
         registration,
+        authorizer,
     };
     conn.object_server()
         .at(path, service)
@@ -854,6 +881,7 @@ async fn register_receiver(
     handle: ReceiverHandle,
     pending: PendingTransfers,
     events: EventSink,
+    authorizer: Authorizer,
 ) -> Result<String> {
     let registration = handle.begin_registration();
     let path = registration_path(registration);
@@ -865,6 +893,7 @@ async fn register_receiver(
         events.clone(),
         handle.clone(),
         registration,
+        authorizer,
     )
     .await?;
 
@@ -934,14 +963,16 @@ pub fn registration_error(e: &anyhow::Error) -> String {
 pub async fn run_receiver(
     handle: ReceiverHandle,
     pending: PendingTransfers,
-    downloads: PathBuf,
+    save_dir: SaveDir,
     events: EventSink,
+    authorizer: Authorizer,
 ) -> ! {
     loop {
         match Connection::session().await {
             Ok(conn) => {
                 if let Err(e) =
-                    receiver_session(&conn, &handle, &pending, &downloads, &events).await
+                    receiver_session(&conn, &handle, &pending, &save_dir, &events, &authorizer)
+                        .await
                 {
                     let reason = format!("session bus connection lost: {e}; reconnecting");
                     handle.mark_lost(&reason);
@@ -961,8 +992,9 @@ async fn receiver_session(
     conn: &Connection,
     handle: &ReceiverHandle,
     pending: &PendingTransfers,
-    downloads: &Path,
+    save_dir: &SaveDir,
     events: &EventSink,
+    authorizer: &Authorizer,
 ) -> Result<()> {
     let mut owner_changes = match obexd_owner_changes(conn).await {
         Ok(changes) => Some(changes),
@@ -973,22 +1005,29 @@ async fn receiver_session(
     };
 
     let mut last_registration_error: Option<String> = None;
-    let mut current_path =
-        match register_receiver(conn, handle.clone(), pending.clone(), events.clone()).await {
-            Ok(path) => {
-                sweep_staging(downloads, events);
-                Some(path)
-            }
-            Err(e) => {
-                let reason = registration_error(&e);
-                handle.mark_lost(&reason);
-                events.send(Event::Log(format!(
-                    "receiver registration failed: {reason}"
-                )));
-                last_registration_error = Some(reason);
-                None
-            }
-        };
+    let mut current_path = match register_receiver(
+        conn,
+        handle.clone(),
+        pending.clone(),
+        events.clone(),
+        authorizer.clone(),
+    )
+    .await
+    {
+        Ok(path) => {
+            sweep_staging(save_dir, events);
+            Some(path)
+        }
+        Err(e) => {
+            let reason = registration_error(&e);
+            handle.mark_lost(&reason);
+            events.send(Event::Log(format!(
+                "receiver registration failed: {reason}"
+            )));
+            last_registration_error = Some(reason);
+            None
+        }
+    };
     // Poll while any agent object exists: in-flight transfers may still
     // finish even after obexd released the registration.
     let mut exported = current_path.is_some();
@@ -1033,13 +1072,21 @@ async fn receiver_session(
                 }
             }
             _ = poll.tick(), if exported => {
-                poll_pending(conn, pending, downloads, events).await;
+                poll_pending(conn, pending, save_dir, events).await;
                 if conn.is_closed() {
                     bail!("session bus connection closed");
                 }
             }
             _ = retry.tick(), if !handle.is_active() => {
-                match register_receiver(conn, handle.clone(), pending.clone(), events.clone()).await {
+                match register_receiver(
+                    conn,
+                    handle.clone(),
+                    pending.clone(),
+                    events.clone(),
+                    authorizer.clone(),
+                )
+                .await
+                {
                     Ok(path) => {
                         if let Some(old) = current_path.replace(path) {
                             let _ = conn
@@ -1049,7 +1096,7 @@ async fn receiver_session(
                         }
                         exported = true;
                         last_registration_error = None;
-                        sweep_staging(downloads, events);
+                        sweep_staging(save_dir, events);
                     }
                     Err(e) => {
                         let reason = registration_error(&e);
@@ -1066,7 +1113,7 @@ async fn receiver_session(
                 }
             }
             _ = sweep.tick(), if handle.is_active() => {
-                sweep_staging(downloads, events);
+                sweep_staging(save_dir, events);
             }
         }
     }
@@ -1078,7 +1125,8 @@ pub async fn agent_check() -> Result<()> {
     let events = EventSink::new(64);
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
-    let path = register_receiver(&conn, handle, new_pending(), events.clone()).await?;
+    let authorizer = Authorizer::new(TrustStore::in_memory(), events.clone(), false);
+    let path = register_receiver(&conn, handle, new_pending(), events.clone(), authorizer).await?;
     let manager = AgentManagerProxy::new(&conn).await?;
     manager.unregister_agent(opath(&path)?).await?;
     let _ = conn
@@ -1092,15 +1140,33 @@ pub async fn agent_check() -> Result<()> {
     Ok(())
 }
 
-/// CLI: run the receiver in the foreground (SPIKE: accepts everything).
+/// CLI: run the receiver in the foreground. Trusted senders only; approve
+/// new senders from the desktop UI.
 pub async fn receive() -> Result<()> {
     let events = EventSink::new(1024);
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
     let pending = new_pending();
-    let downloads = paths::downloads_dir();
+    let (settings, settings_warning) = Settings::load();
+    if let Some(warning) = settings_warning {
+        eprintln!("warning: {warning}");
+    }
+    let save_dir = SaveDir::new(
+        settings
+            .save_dir
+            .clone()
+            .unwrap_or_else(paths::downloads_dir),
+    );
+    let (trust, trust_warning) = TrustStore::load();
+    if let Some(warning) = trust_warning {
+        eprintln!("warning: {warning}");
+    }
+    let authorizer = Authorizer::new(trust, events.clone(), false);
 
-    println!("listening… (Ctrl-C to stop)");
+    println!(
+        "listening… (Ctrl-C to stop); new senders are rejected in the CLI — approve \
+         them in the Kalo window"
+    );
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -1113,7 +1179,7 @@ pub async fn receive() -> Result<()> {
         }
     });
 
-    run_receiver(handle, pending, downloads, events).await
+    run_receiver(handle, pending, save_dir, events, authorizer).await
 }
 
 #[cfg(test)]

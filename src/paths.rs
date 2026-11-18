@@ -1,6 +1,65 @@
 //! Platform-aware filesystem locations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+/// Directory for Kalo's settings and trust store.
+#[cfg(not(windows))]
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    base.join("kalo")
+}
+
+#[cfg(windows)]
+pub fn config_dir() -> PathBuf {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    };
+
+    let known = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG(0), None)
+            .ok()
+            .and_then(|ptr| {
+                let path = ptr.to_string().ok();
+                CoTaskMemFree(Some(ptr.0 as *const core::ffi::c_void));
+                path
+            })
+    };
+    known
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Kalo")
+}
+
+pub fn settings_file() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+pub fn trust_file() -> PathBuf {
+    config_dir().join("trust.json")
+}
+
+/// Open a folder in the platform file manager, creating it first so the
+/// default Downloads folder works on a fresh account.
+pub fn open_folder(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("create folder {}", path.display()))?;
+    #[cfg(not(windows))]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer");
+    command
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("open {}", path.display()))?;
+    Ok(())
+}
 
 /// The user's Downloads directory.
 ///

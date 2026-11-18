@@ -52,8 +52,10 @@ package() {
   install -Dm755 target/release/kalo "$pkgdir/usr/bin/kalo"
   install -Dm644 packaging/common/kalo.desktop \
     "$pkgdir/usr/share/applications/kalo.desktop"
-  install -Dm644 packaging/common/kalo.svg \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/kalo.svg"
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "packaging/common/icons/hicolor/${size}x${size}/apps/kalo.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/kalo.png"
+  done
   install -Dm644 packaging/common/kalo.1 \
     "$pkgdir/usr/share/man/man1/kalo.1"
   gzip -9n "$pkgdir/usr/share/man/man1/kalo.1"

@@ -1,7 +1,6 @@
 //! Incoming OPP receiver: advertise the Windows OBEX Object Push service and
-//! stream pushes into a staging directory before moving them to Downloads.
-//!
-//! SPIKE NOTE: every push is accepted. Trust checks remain Phase 1 work.
+//! stream pushes into a staging directory before moving them to the save
+//! folder. New senders are approved in the desktop UI or rejected.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -18,17 +17,21 @@ use obex_protocol::packet::{ConnectParameters, Response};
 use obex_protocol::response::ResponseCode;
 use obex_protocol::transport::PacketStream;
 use uuid::Uuid;
+use windows::Devices::Bluetooth::BluetoothDevice;
 use windows::Devices::Bluetooth::Rfcomm::{RfcommServiceId, RfcommServiceProvider};
 use windows::Foundation::TypedEventHandler;
+use windows::Networking::HostName;
 use windows::Networking::Sockets::{
     StreamSocket, StreamSocketListener, StreamSocketListenerConnectionReceivedEventArgs,
 };
 
 use super::rfcomm::RfcommStream;
-use super::{ComGuard, hstring, run_blocking};
+use super::{ComGuard, format_mac, hstring, run_blocking};
 use crate::events::{Event, EventSink};
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
+use crate::settings::{SaveDir, Settings};
+use crate::trust::{Authorizer, TrustStore};
 
 /// The Windows backend has no shared transfer registry; the UI follows the
 /// event stream. A non-unit marker keeps the platform facade signature
@@ -53,9 +56,26 @@ pub async fn receive() -> Result<()> {
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
     let pending = new_pending();
-    let downloads = crate::paths::downloads_dir();
+    let (settings, settings_warning) = Settings::load();
+    if let Some(warning) = settings_warning {
+        eprintln!("warning: {warning}");
+    }
+    let save_dir = SaveDir::new(
+        settings
+            .save_dir
+            .clone()
+            .unwrap_or_else(crate::paths::downloads_dir),
+    );
+    let (trust, trust_warning) = TrustStore::load();
+    if let Some(warning) = trust_warning {
+        eprintln!("warning: {warning}");
+    }
+    let authorizer = Authorizer::new(trust, events.clone(), false);
 
-    println!("listening… (Ctrl-C to stop)");
+    println!(
+        "listening… (Ctrl-C to stop); new senders are rejected in the CLI — approve \
+         them in the Kalo window"
+    );
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -68,7 +88,7 @@ pub async fn receive() -> Result<()> {
         }
     });
 
-    run_receiver(handle, pending, downloads, events).await
+    run_receiver(handle, pending, save_dir, events, authorizer).await
 }
 
 /// Supervise the advertised RFCOMM OPP service. Advertising failures (radio
@@ -76,14 +96,18 @@ pub async fn receive() -> Result<()> {
 pub async fn run_receiver(
     handle: ReceiverHandle,
     _pending: PendingTransfers,
-    downloads: PathBuf,
+    save_dir: SaveDir,
     events: EventSink,
+    authorizer: Authorizer,
 ) -> ! {
     loop {
-        sweep_staging(&downloads, &events);
-        let start_downloads = downloads.clone();
+        sweep_staging(&save_dir.get(), &events);
+        let start_save_dir = save_dir.clone();
         let start_events = events.clone();
-        let started = run_blocking(move || start_advertising(start_downloads, start_events)).await;
+        let start_authorizer = authorizer.clone();
+        let started =
+            run_blocking(move || start_advertising(start_save_dir, start_events, start_authorizer))
+                .await;
         match started {
             Ok(service) => {
                 let registration = handle.begin_registration();
@@ -96,7 +120,7 @@ pub async fn run_receiver(
                 let _service = service;
                 loop {
                     tokio::time::sleep(SWEEP_INTERVAL).await;
-                    sweep_staging(&downloads, &events);
+                    sweep_staging(&save_dir.get(), &events);
                     if !handle.is_active() {
                         break;
                     }
@@ -151,11 +175,16 @@ impl Drop for ReceiverService {
 }
 
 struct ConnectionContext {
-    downloads: PathBuf,
+    save_dir: SaveDir,
     events: EventSink,
+    authorizer: Authorizer,
 }
 
-fn start_advertising(downloads: PathBuf, events: EventSink) -> Result<ReceiverService> {
+fn start_advertising(
+    save_dir: SaveDir,
+    events: EventSink,
+    authorizer: Authorizer,
+) -> Result<ReceiverService> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
@@ -167,7 +196,7 @@ fn start_advertising(downloads: PathBuf, events: EventSink) -> Result<ReceiverSe
                 return;
             }
         };
-        let (provider, listener, _handler) = match advertise(downloads, events) {
+        let (provider, listener, _handler) = match advertise(save_dir, events, authorizer) {
             Ok(parts) => parts,
             Err(error) => {
                 let _ = ready_tx.send(Err(format!("{error:#}")));
@@ -197,8 +226,9 @@ fn start_advertising(downloads: PathBuf, events: EventSink) -> Result<ReceiverSe
 }
 
 fn advertise(
-    downloads: PathBuf,
+    save_dir: SaveDir,
     events: EventSink,
+    authorizer: Authorizer,
 ) -> Result<(
     RfcommServiceProvider,
     StreamSocketListener,
@@ -210,7 +240,11 @@ fn advertise(
         .context("create the OBEX Object Push service provider")?;
     let listener = StreamSocketListener::new()?;
 
-    let context = Arc::new(ConnectionContext { downloads, events });
+    let context = Arc::new(ConnectionContext {
+        save_dir,
+        events,
+        authorizer,
+    });
     let handler: ConnectionHandler = TypedEventHandler::new(
         move |_sender: windows::core::Ref<'_, StreamSocketListener>,
               args: windows::core::Ref<'_, StreamSocketListenerConnectionReceivedEventArgs>| {
@@ -238,9 +272,17 @@ fn advertise(
 /// Serve one accepted RFCOMM connection until it disconnects or fails.
 fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
     let sender = remote_sender(&socket);
-    context.events.send(Event::Log(format!(
-        "incoming OBEX connection from {sender}"
-    )));
+    if sender.stable {
+        context.events.send(Event::Log(format!(
+            "incoming OBEX connection from {} ({})",
+            sender.name, sender.address
+        )));
+    } else {
+        context.events.send(Event::Log(format!(
+            "incoming OBEX connection from {} (Bluetooth address unavailable)",
+            sender.name
+        )));
+    }
 
     let watchdog_socket = socket.clone();
     let last_activity = Arc::new(Mutex::new(Instant::now()));
@@ -320,7 +362,37 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
                 }
 
                 if incoming.is_none() {
-                    match start_transfer(&context, &sender, name, size) {
+                    let safe_name = sanitize::filename(name.as_deref().unwrap_or(""));
+                    if !sender.stable && sender.name == "unknown device" {
+                        context.events.send(Event::Log(
+                            "rejected incoming push: the sender could not be identified".into(),
+                        ));
+                        let _ = stream.write_response(&Response::new(ResponseCode::Forbidden));
+                        break;
+                    }
+                    let id = Uuid::new_v4().simple().to_string();
+                    if let Err(reason) = context.authorizer.authorize_blocking(
+                        &id,
+                        &sender.address,
+                        &sender.name,
+                        &safe_name,
+                        size,
+                    ) {
+                        context.events.send(Event::IncomingFailed {
+                            id,
+                            sender: sender.name.clone(),
+                            name: safe_name,
+                            error: reason.clone(),
+                            staged_at: None,
+                        });
+                        context.events.send(Event::Log(format!(
+                            "incoming push from {} rejected: {reason}",
+                            sender.name
+                        )));
+                        let _ = stream.write_response(&Response::new(ResponseCode::Forbidden));
+                        break;
+                    }
+                    match start_transfer(&context, &sender, id, safe_name, size) {
                         Ok(transfer) => incoming = Some(transfer),
                         Err(error) => {
                             context.events.send(Event::Log(format!(
@@ -343,7 +415,7 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
 
                 if last_chunk {
                     let transfer = incoming.take().expect("incoming exists");
-                    match finish_transfer(transfer, &context.downloads, &context.events) {
+                    match finish_transfer(transfer, &context.save_dir.get(), &context.events) {
                         Ok(()) => {
                             if let Err(error) =
                                 stream.write_response(&Response::new(ResponseCode::Success))
@@ -399,6 +471,18 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
     done.store(true, Ordering::SeqCst);
 }
 
+/// The remote device as far as the receiver can identify it. `stable` means
+/// the Bluetooth address was resolved; display-name-only identities are
+/// accepted for one transfer but never persisted.
+#[derive(Debug, Clone)]
+struct SenderIdentity {
+    /// Trust-store key (`AA:BB:...` or `name:<display name>`).
+    address: String,
+    /// Human-readable name for logs and prompts.
+    name: String,
+    stable: bool,
+}
+
 struct Incoming {
     id: String,
     name: String,
@@ -444,12 +528,11 @@ impl Incoming {
 
 fn start_transfer(
     context: &ConnectionContext,
-    sender: &str,
-    name: Option<String>,
+    sender: &SenderIdentity,
+    id: String,
+    safe_name: String,
     size: Option<u64>,
 ) -> Result<Incoming> {
-    let safe_name = sanitize::filename(name.as_deref().unwrap_or(""));
-    let id = Uuid::new_v4().simple().to_string();
     let staging_dir = staging_root().join(format!("kalo-{id}"));
     std::fs::create_dir_all(&staging_dir)
         .with_context(|| format!("create staging directory {staging_dir:?}"))?;
@@ -462,14 +545,14 @@ fn start_transfer(
 
     context.events.send(Event::IncomingStarted {
         id: id.clone(),
-        sender: sender.to_string(),
+        sender: sender.name.clone(),
         name: safe_name.clone(),
         size,
     });
     Ok(Incoming {
         id,
         name: safe_name,
-        sender: sender.to_string(),
+        sender: sender.name.clone(),
         size,
         dest,
         staging_dir,
@@ -590,23 +673,48 @@ fn spawn_watchdog(
     });
 }
 
-fn remote_sender(socket: &StreamSocket) -> String {
-    let Ok(info) = socket.Information() else {
-        return "unknown device".into();
-    };
-    let Ok(address) = info.RemoteAddress() else {
-        return "unknown device".into();
-    };
-    for name in [address.DisplayName().ok(), address.RawName().ok()]
+fn remote_sender(socket: &StreamSocket) -> SenderIdentity {
+    let host = socket
+        .Information()
+        .ok()
+        .and_then(|info| info.RemoteAddress().ok());
+    let name = host
+        .as_ref()
+        .and_then(remote_name)
+        .unwrap_or_else(|| "unknown device".into());
+    let address = host.and_then(|host| {
+        BluetoothDevice::FromHostNameAsync(&host)
+            .ok()?
+            .join()
+            .ok()?
+            .BluetoothAddress()
+            .ok()
+    });
+    match address {
+        Some(address) => SenderIdentity {
+            address: format_mac(address),
+            name,
+            stable: true,
+        },
+        None => SenderIdentity {
+            address: format!("name:{name}"),
+            name,
+            stable: false,
+        },
+    }
+}
+
+fn remote_name(host: &HostName) -> Option<String> {
+    for name in [host.DisplayName().ok(), host.RawName().ok()]
         .into_iter()
         .flatten()
     {
         let name = hstring(name);
         if !name.trim().is_empty() {
-            return name;
+            return Some(name);
         }
     }
-    "unknown device".into()
+    None
 }
 
 fn staging_root() -> PathBuf {

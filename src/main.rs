@@ -6,6 +6,9 @@
 //! - `app`      — Iced UI (devices, send, receiver state, log)
 //! - `events`   — shared event bus between background work and the UI
 //! - `sanitize` — filename safety for untrusted names
+//! - `settings` — persistent theme/save-folder preferences
+//! - `tray`     — Linux status-area icon (shared no-op elsewhere)
+//! - `trust`    — incoming-sender decisions and approval prompts
 //! - `paths`    — platform filesystem locations
 //!
 //! Linux-only modules:
@@ -28,6 +31,9 @@ mod paths;
 mod platform;
 mod receiver;
 mod sanitize;
+mod settings;
+mod tray;
+mod trust;
 #[cfg(windows)]
 mod win;
 
@@ -74,7 +80,8 @@ enum Cmd {
         /// File to send
         file: PathBuf,
     },
-    /// Listen for incoming OPP pushes (SPIKE: accepts everything)
+    /// Listen for incoming OPP pushes (trusted senders only; approve new
+    /// senders in the Kalo window)
     Receive,
 }
 

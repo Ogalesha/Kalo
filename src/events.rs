@@ -67,7 +67,7 @@ impl fmt::Display for ReceiverStatus {
         match self {
             Self::Starting => f.write_str("starting…"),
             Self::Active => {
-                f.write_str("receiver active — incoming files land in your Downloads folder")
+                f.write_str("receiver active — incoming files are saved to your save folder")
             }
             Self::Off(reason) => write!(f, "receiver OFF — {reason}"),
         }
@@ -86,7 +86,19 @@ pub enum Event {
         size: Option<u64>,
         status: TransferStatus,
     },
-    /// An incoming OPP push was authorized (spike: accept-all).
+    /// A new sender needs a decision from the desktop UI. The transfer waits
+    /// for [`Authorizer::respond`](crate::trust::Authorizer::respond) or a
+    /// timeout. `stable` is false when the backend could only determine a
+    /// display name, so "remember" must not be offered.
+    IncomingAuthorization {
+        id: String,
+        sender: String,
+        address: String,
+        name: String,
+        size: Option<u64>,
+        stable: bool,
+    },
+    /// An incoming OPP push was authorized.
     IncomingStarted {
         id: String,
         sender: String,
@@ -265,6 +277,7 @@ mod tests {
                 .to_string()
                 .contains("receiver active")
         );
+        assert!(ReceiverStatus::Active.to_string().contains("save folder"));
         assert_eq!(
             ReceiverStatus::Off("released".into()).to_string(),
             "receiver OFF — released"
