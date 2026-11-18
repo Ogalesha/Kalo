@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build Ubuntu package
+        run: ./packaging/ubuntu/build-deb.sh
+
+      - name: Upload Ubuntu package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  windows:
+    name: Windows (experimental)
+    runs-on: windows-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build portable ZIP
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build-zip.ps1
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: target/release/kalo.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish latest builds
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{linux-deb,windows-zip,windows-exe}"
+          merge-multiple: true
+          path: artifacts
+
+      - name: Prepare stable asset names
+        run: |
+          mkdir -p release
+          cp artifacts/*.deb release/kalo_amd64.deb
+          cp artifacts/*.zip release/kalo-windows-x64.zip
+          cp artifacts/kalo.exe release/kalo-windows-x64.exe
+          cd release
+          sha256sum kalo_amd64.deb kalo-windows-x64.zip kalo-windows-x64.exe > SHA256SUMS.txt
+          ls -lh
+
+      - name: Publish the rolling latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Rolling builds from the newest successful `main` build.
+
+            - Ubuntu: `kalo_amd64.deb`
+            - Windows (experimental, untested on hardware): `kalo-windows-x64.zip`, `kalo-windows-x64.exe`
+
+            Built from commit `${{ github.sha }}` by GitHub Actions. Windows builds are
+            experimental and unsigned. See `SHA256SUMS.txt` for checksums.
+          files: release/*
+          draft: false
+          prerelease: false
+          make_latest: true
+          overwrite_files: true
