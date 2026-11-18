@@ -20,7 +20,7 @@ use crate::trust::Authorizer;
 
 /// The macOS backend has no receiver registry; the marker keeps the shared
 /// platform facade signature identical without pretending there is state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PendingTransfers;
 
 pub fn new_pending() -> PendingTransfers {

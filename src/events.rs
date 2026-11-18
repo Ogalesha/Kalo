@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 ///
 /// The Windows backend only emits the subset its native OBEX engine can
 /// report; the full vocabulary remains available to the shared renderers.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferStatus {
     Queued,
@@ -22,7 +22,7 @@ pub enum TransferStatus {
     Unknown(String),
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 impl TransferStatus {
     pub fn parse(raw: &str) -> Self {
         match raw {
@@ -107,6 +107,7 @@ pub enum Event {
         stable: bool,
     },
     /// An incoming OPP push was authorized.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     IncomingStarted {
         id: String,
         sender: String,
@@ -114,6 +115,7 @@ pub enum Event {
         size: Option<u64>,
     },
     /// Progress of an incoming transfer (polled).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     IncomingProgress {
         id: String,
         name: String,
@@ -123,6 +125,7 @@ pub enum Event {
     /// Incoming transfer completed and was moved into Downloads. `partial`
     /// is true when the transfer was interrupted or the byte count did not
     /// match the size announced by the sender.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     IncomingDone {
         id: String,
         sender: String,
@@ -135,6 +138,7 @@ pub enum Event {
     },
     /// Incoming transfer failed or was rejected. `staged_at` is set when a
     /// usable staged file was deliberately kept for manual recovery.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     IncomingFailed {
         id: String,
         sender: String,

@@ -24,6 +24,7 @@ struct ReceiverInner {
     status: ReceiverStatus,
     /// Registration id currently allowed to speak for the receiver.
     current: Option<u64>,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     next: u64,
 }
 
@@ -43,12 +44,14 @@ impl ReceiverHandle {
         self.inner.lock().expect("receiver lock").status.clone()
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn is_active(&self) -> bool {
         self.status() == ReceiverStatus::Active
     }
 
     /// Allocate the id for a registration attempt and make it the only one
     /// whose `Release` is honored.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn begin_registration(&self) -> u64 {
         let mut inner = self.inner.lock().expect("receiver lock");
         let id = inner.next;
@@ -60,6 +63,7 @@ impl ReceiverHandle {
     /// Mark a registration active. Returns whether this changed the state.
     /// A registration invalidated by a release/restart in the meantime is
     /// left alone.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn mark_active(&self, id: u64) -> bool {
         let mut inner = self.inner.lock().expect("receiver lock");
         if inner.current != Some(id) || inner.status == ReceiverStatus::Active {
@@ -71,6 +75,7 @@ impl ReceiverHandle {
 
     /// A `Release` for `id`. Stale releases from earlier registrations are
     /// ignored; only the current registration can turn the receiver off.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn release(&self, id: u64, reason: &str) {
         let mut inner = self.inner.lock().expect("receiver lock");
         if inner.current != Some(id) {

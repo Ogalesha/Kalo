@@ -34,6 +34,7 @@ impl Cancel {
 
     /// Resolve when cancellation is requested or the sending side is gone.
     /// Safe to call repeatedly; each call watches from the current value.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub async fn wait(&self) {
         let mut rx = self.rx.clone();
         loop {
