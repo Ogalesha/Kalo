@@ -39,6 +39,7 @@ mod obex;
 mod paths;
 mod platform;
 mod receiver;
+#[cfg(any(target_os = "linux", windows))]
 mod sanitize;
 mod security;
 mod selection;

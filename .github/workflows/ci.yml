@@ -122,7 +122,60 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --message-format=json -- -D warnings 2>&1 | tee clippy.jsonl
+
+      - name: Report Clippy diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          if [[ ! -f clippy.jsonl ]]; then
+            echo "no Clippy diagnostics were captured"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+
+          def escape(value):
+              return (
+                  str(value)
+                  .replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+
+          with open("clippy.jsonl", encoding="utf-8", errors="replace") as log:
+              for raw in log:
+                  try:
+                      record = json.loads(raw)
+                  except json.JSONDecodeError:
+                      continue
+                  if record.get("reason") != "compiler-message":
+                      continue
+                  message = record.get("message", {})
+                  level = message.get("level", "error")
+                  if level not in ("error", "warning"):
+                      continue
+                  text = escape(message.get("message", "Clippy diagnostic"))
+                  spans = message.get("spans") or []
+                  primary = next(
+                      (span for span in spans if span.get("is_primary")), None
+                  )
+                  if primary:
+                      print(
+                          "::{} file={},line={},col={}::{}".format(
+                              level,
+                              escape(primary.get("file_name", "")),
+                              primary.get("line_start", 1),
+                              primary.get("column_start", 1),
+                              text,
+                          )
+                      )
+                  else:
+                      print("::{}::{}".format(level, text))
+          PY
 
       - name: Run tests
         run: cargo test --all-targets

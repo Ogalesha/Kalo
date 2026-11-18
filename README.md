@@ -265,7 +265,7 @@ To type-check the Windows target from Linux, with the target and its prerequisit
 cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 ```
 
-Shared modules cover the `iced` UI, platform interface, receiver status, event handling, filename safety, settings, trust decisions, selection handling, cancellation, security policy, and download paths. Linux-specific modules integrate with BlueZ and `obexd`; Windows-specific modules implement WinRT RFCOMM/OBEX operations; macOS-specific modules use IOBluetooth.
+Shared modules cover the `iced` UI, platform interface, receiver status, event handling, settings, trust decisions, selection handling, cancellation, security policy, and download paths. Receiver filename sanitization is compiled on Linux and Windows, where Kalo hosts the incoming transfer. Linux-specific modules integrate with BlueZ and `obexd`; Windows-specific modules implement WinRT RFCOMM/OBEX operations; macOS-specific modules use IOBluetooth.
 
 The [GitHub Actions workflow](.github/workflows/ci.yml) runs formatting, Clippy and tests on Linux, macOS and Windows, builds and smoke-tests the Ubuntu `.deb`, the Arch Linux `kalo-git` package, the universal macOS app and the experimental Windows ZIP/EXE, and publishes them to the rolling latest release only after all builds succeed. The UI includes a debug-only demo mode (`KALO_DEMO=1`, with `KALO_DEMO_THEME=light` for the light appearance) used to capture the screenshots without exposing real devices.
 

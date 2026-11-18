@@ -30,6 +30,7 @@ pub const MAX_SEND_FILES: usize = 500;
 /// Bounded incoming concurrency: four simultaneous OPP pushes already saturate
 /// a Bluetooth link, while an unbounded number of connections would let a
 /// remote peer exhaust file descriptors and memory.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub const MAX_CONCURRENT_INCOMING: usize = 4;
 
 /// OPP length headers are 32-bit, so a single object cannot exceed 4 GiB.
@@ -41,6 +42,7 @@ const MAX_BLOCKLIST_BYTES: u64 = 64 * 1024 * 1024;
 const BLOCKLIST_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const BLOCKLIST_RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const FREE_SPACE_MARGIN: u64 = 16 * 1024 * 1024;
 const HASH_BUFFER: usize = 64 * 1024;
 
@@ -151,6 +153,7 @@ pub fn check_send_file(path: &Path) -> Result<u64> {
 
 /// Scan a staged incoming file. The caller decides what to do with a blocked
 /// result (Kalo deletes the staged copy instead of saving it).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn scan_received_file(path: &Path) -> Result<Scan> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
@@ -414,6 +417,7 @@ pub fn restrict_file_permissions(_path: &Path) -> Result<()> {
 /// Applied to every file moved into the save folder. Received content is
 /// never executable and, on Windows, carries Mark-of-the-Web so the shell
 /// treats it like a file downloaded from the internet.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn harden_received_file(path: &Path) -> Result<()> {
     restrict_file_permissions(path)?;
     #[cfg(windows)]
@@ -435,6 +439,7 @@ pub fn harden_received_file(path: &Path) -> Result<()> {
 
 /// Free bytes available to the current user at `path`, looking at the nearest
 /// existing ancestor so a not-yet-created save folder works.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn available_space(path: &Path) -> Result<u64> {
     let existing = path
         .ancestors()
@@ -444,6 +449,7 @@ pub fn available_space(path: &Path) -> Result<u64> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn platform_available_space(path: &Path) -> Result<u64> {
     let stat = rustix::fs::statvfs(path)
         .with_context(|| format!("read free space for {}", path.display()))?;
@@ -467,6 +473,7 @@ fn platform_available_space(path: &Path) -> Result<u64> {
 
 /// Refuse a transfer that cannot possibly fit, before any bytes are written.
 /// Unknown sizes still require a small working margin.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn ensure_free_space(path: &Path, needed: Option<u64>) -> Result<()> {
     let required = needed.unwrap_or(0).saturating_add(FREE_SPACE_MARGIN);
     let available = available_space(path)?;
