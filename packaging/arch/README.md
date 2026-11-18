@@ -5,9 +5,24 @@ Ubuntu. The `PKGBUILD` builds the current `main` branch as `kalo-git`; the
 desktop entry, icon and manual page are shared with the Ubuntu package from
 `packaging/common/`.
 
+Arch Linux and Omarchy are supported targets. GitHub Actions builds the package
+on the latest Arch Linux container and publishes it as
+`kalo-git-x86_64.pkg.tar.zst` in the rolling latest release. The package depends
+on `bluez` and `bluez-obex` (the Arch package that provides `obexd`).
+
+## Install the published package
+
+```sh
+sudo pacman -U kalo-git-x86_64.pkg.tar.zst
+kalo
+```
+
+The CI package is built against current Arch Linux libraries. On an older or
+partially upgraded system, upgrade first or build the package locally.
+
 ## Build and install
 
-Install the usual Arch build tools first (they are part of `base-devel`):
+Install the usual Arch build tools first:
 
 ```sh
 sudo pacman -S --needed base-devel git rust cargo

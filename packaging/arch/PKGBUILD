@@ -9,12 +9,17 @@ pkgdesc="Bluetooth file transfer over OBEX/OPP"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Ogalesha/Kalo"
 license=('MIT')
+# The windowing libraries and the BlueZ/obexd daemons are loaded at runtime
+# (dlopen or D-Bus), so namcap cannot detect them from the ELF headers.
 depends=(
   'bluez'
-  'bluez-obexd'
+  'bluez-obex'
   'gcc-libs'
   'glibc'
+  'hicolor-icon-theme'
   'libx11'
+  'libxcursor'
+  'libxi'
   'libxkbcommon'
   'libxkbcommon-x11'
   'wayland'
@@ -24,11 +29,13 @@ optdepends=(
   'vulkan-icd-loader: preferred GPU renderer'
   'xdg-desktop-portal: native file picker'
   'xdg-desktop-portal-gtk: portal backend for GTK desktops'
+  'xdg-desktop-portal-hyprland: portal backend for Hyprland and Omarchy'
   'xdg-desktop-portal-kde: portal backend for KDE Plasma'
 )
 provides=('kalo')
 conflicts=('kalo')
-source=("git+$url.git#branch=main")
+options=('!debug')
+source=("$pkgname::git+$url.git#branch=main")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -43,7 +50,7 @@ pkgver() {
 
 build() {
   cd "$srcdir/$pkgname"
-  cargo build --release --locked --frozen
+  cargo build --release --locked
 }
 
 package() {

@@ -28,8 +28,12 @@
       `packaging/ubuntu/`, build script and desktop assets.
 - [x] **Arch Linux packaging** — `kalo-git` PKGBUILD and `.SRCINFO` in
       `packaging/arch/`, shared desktop assets and correct BlueZ/obexd/portal
-      dependencies.
-- [ ] Test `kalo-git` on a clean Arch install and publish it to the AUR.
+      and X11/Wayland dependencies. Built and installed in a clean Arch Linux
+      container, checked with `namcap`, and the GUI started under Xvfb and a
+      headless Wayland compositor; CI builds and publishes the package as
+      `kalo-git-x86_64.pkg.tar.zst`.
+- [ ] Validate `kalo-git` on a real Omarchy/Hyprland desktop (tray host and
+      portal file picker) and publish it to the AUR.
 - [x] **Windows backend (experimental)** — native WinRT RFCOMM transport, OPP
       sender with progress/cancel/watchdog, incoming OPP service advertisement
       and streaming receiver, device listing/discovery/pairing, and the shared
@@ -52,6 +56,8 @@
       interval-based watchdogs, pairing timeouts and periodic staging recovery.
 - [x] Add CI for `fmt`, `clippy`, tests, Linux package builds, a Windows
       `clippy`/test job and rolling GitHub downloads for the latest successful
-      `.deb`, Windows ZIP and Windows `.exe`.
+      `.deb`, Arch `kalo-git` package, Windows ZIP and Windows `.exe`. The
+      Windows executable is smoke-tested with `--version` and `--help`, and the
+      Arch package is installed and smoke-tested in an Arch container.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
       adapters where the environment allows it.

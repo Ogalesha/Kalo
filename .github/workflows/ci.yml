@@ -83,6 +83,14 @@ jobs:
         shell: powershell
         run: powershell -ExecutionPolicy Bypass -File packaging\windows\build-zip.ps1
 
+      - name: Smoke-test the executable
+        shell: powershell
+        run: |
+          .\target\release\kalo.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\kalo.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -97,10 +105,62 @@ jobs:
           path: target/release/kalo.exe
           if-no-files-found: error
 
+  arch:
+    name: Arch Linux
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm git namcap rust cargo sudo
+
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare the build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          cp -a "$GITHUB_WORKSPACE" /home/builder/kalo
+          chown -R builder:builder /home/builder/kalo
+          su builder -c "cd /home/builder/kalo && git checkout -b ci-source"
+
+      - name: Build the package
+        run: |
+          mkdir -p /home/builder/pkg
+          cp /home/builder/kalo/packaging/arch/PKGBUILD /home/builder/pkg/
+          sed -i 's|^source=.*|source=("kalo-git::git+file:///home/builder/kalo#branch=ci-source")|' /home/builder/pkg/PKGBUILD
+          chown -R builder:builder /home/builder/pkg
+          su builder -c "cd /home/builder/pkg && makepkg -s --noconfirm"
+          echo "--- namcap ---"
+          namcap /home/builder/pkg/*.pkg.tar.zst || true
+
+      - name: Install and smoke-test the package
+        run: |
+          pacman -U --noconfirm /home/builder/pkg/*.pkg.tar.zst
+          kalo --version
+          kalo --help
+
+      - name: Collect the package
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp /home/builder/pkg/kalo-git-[0-9]*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: ${{ github.workspace }}/dist/*.pkg.tar.zst
+          if-no-files-found: error
+
   release:
     name: Publish latest builds
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux, windows]
+    needs: [linux, windows, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -108,7 +168,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "{linux-deb,windows-zip,windows-exe}"
+          pattern: "{linux-deb,windows-zip,windows-exe,arch-package}"
           merge-multiple: true
           path: artifacts
 
@@ -118,8 +178,9 @@ jobs:
           cp artifacts/*.deb release/kalo_amd64.deb
           cp artifacts/*.zip release/kalo-windows-x64.zip
           cp artifacts/kalo.exe release/kalo-windows-x64.exe
+          cp artifacts/kalo-git-[0-9]*.pkg.tar.zst release/kalo-git-x86_64.pkg.tar.zst
           cd release
-          sha256sum kalo_amd64.deb kalo-windows-x64.zip kalo-windows-x64.exe > SHA256SUMS.txt
+          sha256sum kalo_amd64.deb kalo-windows-x64.zip kalo-windows-x64.exe kalo-git-x86_64.pkg.tar.zst > SHA256SUMS.txt
           ls -lh
 
       - name: Publish the rolling latest release
@@ -131,6 +192,7 @@ jobs:
             Rolling builds from the newest successful `main` build.
 
             - Ubuntu: `kalo_amd64.deb`
+            - Arch Linux: `kalo-git-x86_64.pkg.tar.zst`
             - Windows (experimental, untested on hardware): `kalo-windows-x64.zip`, `kalo-windows-x64.exe`
 
             Built from commit `${{ github.sha }}` by GitHub Actions. Windows builds are

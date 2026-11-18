@@ -10,20 +10,25 @@ pkgbase = kalo-git
 	makedepends = git
 	makedepends = rust
 	depends = bluez
-	depends = bluez-obexd
+	depends = bluez-obex
 	depends = gcc-libs
 	depends = glibc
+	depends = hicolor-icon-theme
 	depends = libx11
+	depends = libxcursor
+	depends = libxi
 	depends = libxkbcommon
 	depends = libxkbcommon-x11
 	depends = wayland
 	optdepends = vulkan-icd-loader: preferred GPU renderer
 	optdepends = xdg-desktop-portal: native file picker
 	optdepends = xdg-desktop-portal-gtk: portal backend for GTK desktops
+	optdepends = xdg-desktop-portal-hyprland: portal backend for Hyprland and Omarchy
 	optdepends = xdg-desktop-portal-kde: portal backend for KDE Plasma
 	provides = kalo
 	conflicts = kalo
-	source = git+https://github.com/Ogalesha/Kalo.git#branch=main
+	options = !debug
+	source = kalo-git::git+https://github.com/Ogalesha/Kalo.git#branch=main
 	sha256sums = SKIP
 
 pkgname = kalo-git

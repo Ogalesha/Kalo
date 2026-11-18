@@ -10,7 +10,7 @@ Kalo is a native desktop app for sending and receiving files over Bluetooth. Cho
 
 Built with **Rust** and **[iced](https://iced.rs/)**, Kalo provides a desktop interface and a command-line interface (CLI). Transfers use **Bluetooth Object Push Profile (OPP/OBEX)**, so the other device must support that profile.
 
-> **Project status — early development (Phase 0).** Ubuntu and Arch Linux are the current Linux targets. A native Windows backend has been implemented, but **has not been validated on real Windows hardware**. GitHub Actions publishes the latest successful Ubuntu `.deb` and experimental Windows builds; Arch Linux packages are built locally from the included `PKGBUILD`.
+> **Project status — early development (Phase 0).** Ubuntu and Arch Linux are the current Linux targets. A native Windows backend has been implemented, but **has not been validated on real Windows hardware**. GitHub Actions publishes the latest successful Ubuntu `.deb`, Arch Linux package and experimental Windows builds; Arch users can also build `kalo-git` from the included `PKGBUILD`.
 
 > **Incoming files and trust:** Kalo asks before accepting a file from a new sender. The desktop UI offers **Allow once**, **Always allow**, **Decline** and **Block**; allow and block decisions are remembered by Bluetooth address. You can also switch the receiver to **Trusted only** and manage remembered senders. The CLI receiver cannot show a prompt, so it rejects unknown senders. On Windows, senders whose Bluetooth address cannot be resolved are never remembered.
 
@@ -42,7 +42,7 @@ Kalo does not use a hosted service for file transfer and does not require sign-i
 | Platform | Current status | Packaging |
 | --- | --- | --- |
 | Ubuntu | Supported Linux target | Download the latest `.deb` or build it locally |
-| Arch Linux | Supported Linux target | Build `kalo-git` from the included `PKGBUILD`; not yet published to the AUR |
+| Arch Linux / Omarchy | Supported Linux target | Download the latest `kalo-git` package or build it from the included `PKGBUILD`; not yet published to the AUR |
 | Windows 10/11 | **Experimental; not yet tested on physical Windows hardware** | Download the latest portable ZIP or `.exe`; no installer |
 
 ## Requirements and compatibility
@@ -60,12 +60,12 @@ sudo apt install bluez bluez-obexd
 **Arch Linux runtime dependencies:**
 
 ```sh
-sudo pacman -S bluez bluez-obexd
+sudo pacman -S bluez bluez-obex
 ```
 
-On Linux, Kalo uses BlueZ and `obexd`, plus an XDG desktop portal for the file picker. Ubuntu Desktop typically provides a portal; on Arch, install `xdg-desktop-portal-gtk` or another compatible portal backend if needed. No **separate Kalo daemon** needs to be enabled.
+On Linux, Kalo uses BlueZ and `obexd`, plus an XDG desktop portal for the file picker. Ubuntu Desktop typically provides a portal; on Arch, install `xdg-desktop-portal-gtk`, or `xdg-desktop-portal-hyprland` on Hyprland/Omarchy, or another compatible portal backend if needed. No **separate Kalo daemon** needs to be enabled.
 
-The Linux status-area icon uses StatusNotifierItem. KDE Plasma, Cinnamon and XFCE provide a host out of the box; GNOME needs an extension such as **AppIndicator and KStatusNotifierItem Support**. Without a compatible host, Kalo closes normally instead of hiding to the tray.
+The Linux status-area icon uses StatusNotifierItem. KDE Plasma, Cinnamon, XFCE and Omarchy's Waybar (with its `tray` module) provide a host out of the box; GNOME needs an extension such as **AppIndicator and KStatusNotifierItem Support**. Without a compatible host, Kalo closes normally instead of hiding to the tray.
 
 On Windows, Kalo uses WinRT Bluetooth APIs and its own RFCOMM/OBEX implementation; BlueZ, `obexd`, and D-Bus are not required. This path is still experimental, and there is no notification-area icon on Windows yet.
 
@@ -78,10 +78,12 @@ To compile from source, use a recent Rust toolchain (edition 2024; Rust 1.98 or 
 GitHub Actions publishes stable asset names, so these links always resolve to the newest successful build:
 
 - **Ubuntu `.deb`:** [kalo_amd64.deb](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo_amd64.deb)
+- **Arch Linux / Omarchy package:** [kalo-git-x86_64.pkg.tar.zst](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo-git-x86_64.pkg.tar.zst)
 - **Windows portable ZIP (experimental):** [kalo-windows-x64.zip](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo-windows-x64.zip)
 - **Windows standalone executable (experimental):** [kalo-windows-x64.exe](https://github.com/Ogalesha/Kalo/releases/latest/download/kalo-windows-x64.exe)
+- **Checksums:** [SHA256SUMS.txt](https://github.com/Ogalesha/Kalo/releases/latest/download/SHA256SUMS.txt)
 
-All published builds are listed on the [releases page](https://github.com/Ogalesha/Kalo/releases).
+All published builds are listed on the [releases page](https://github.com/Ogalesha/Kalo/releases). The Arch package and the Windows builds are unsigned; verify downloaded files against the checksums.
 
 ### Ubuntu
 
@@ -104,9 +106,17 @@ The locally built `.deb` targets the architecture and glibc version of the build
 
 Remove it with `sudo apt remove kalo`.
 
-### Arch Linux
+### Arch Linux / Omarchy
 
-From the root of a local checkout:
+Install the downloaded package (the file is named `kalo-git-x86_64.pkg.tar.zst`
+and installs the `kalo-git` package):
+
+```sh
+sudo pacman -U kalo-git-x86_64.pkg.tar.zst
+kalo
+```
+
+Or build the package from the root of a local checkout:
 
 ```sh
 sudo pacman -S --needed base-devel git rust cargo
@@ -115,7 +125,9 @@ makepkg -si
 kalo
 ```
 
-The package uses the current `main` branch. It is **not yet published to the AUR**. See [Arch packaging notes](packaging/arch/README.md).
+Both paths install the same `PKGBUILD` metadata, desktop entry, icon and manual
+page. The package uses the current `main` branch. It is **not yet published to
+the AUR**. See [Arch packaging notes](packaging/arch/README.md).
 
 ### Windows (experimental)
 
@@ -220,7 +232,7 @@ cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
 Shared modules cover the `iced` UI, platform interface, receiver status, event handling, filename safety, settings, trust decisions, and download paths. Linux-specific modules integrate with BlueZ and `obexd`; Windows-specific modules implement WinRT RFCOMM/OBEX operations.
 
-The [GitHub Actions workflow](.github/workflows/ci.yml) runs formatting, Clippy and tests on Linux and Windows, builds the Ubuntu `.deb` and the experimental Windows ZIP/EXE, and publishes them to the rolling latest release only after all builds succeed. The UI includes a debug-only demo mode (`KALO_DEMO=1`, with `KALO_DEMO_THEME=light` for the light appearance) used to capture the screenshots without exposing real devices.
+The [GitHub Actions workflow](.github/workflows/ci.yml) runs formatting, Clippy and tests on Linux and Windows, builds and smoke-tests the Ubuntu `.deb`, the Arch Linux `kalo-git` package and the experimental Windows ZIP/EXE, and publishes them to the rolling latest release only after all builds succeed. The UI includes a debug-only demo mode (`KALO_DEMO=1`, with `KALO_DEMO_THEME=light` for the light appearance) used to capture the screenshots without exposing real devices.
 
 ## License
 

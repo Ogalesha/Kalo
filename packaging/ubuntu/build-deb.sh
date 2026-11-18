@@ -76,7 +76,7 @@ Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
 Section: net
 Priority: optional
-Depends: libc6, libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libwayland-client0
+Depends: libc6, libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libwayland-client0
 Recommends: bluez, bluez-obexd, xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-kde, libvulkan1
 Description: Bluetooth file sharing for Ubuntu
  Kalo sends and receives files over Bluetooth OPP/OBEX. It provides a
