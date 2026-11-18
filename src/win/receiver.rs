@@ -191,7 +191,7 @@ struct IncomingSlot {
 impl IncomingSlot {
     fn acquire(active: Arc<AtomicUsize>) -> Option<Self> {
         active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 (count < security::MAX_CONCURRENT_INCOMING).then_some(count + 1)
             })
             .ok()
@@ -630,6 +630,14 @@ fn finish_transfer(
     events: &EventSink,
 ) -> Result<SaveOutcome> {
     transfer.close();
+    // The incremental hash must cover exactly the bytes written to disk.
+    if transfer.hasher.bytes() != transfer.bytes {
+        bail!(
+            "incoming file integrity check failed: hashed {} bytes but wrote {}",
+            transfer.hasher.bytes(),
+            transfer.bytes
+        );
+    }
     let digest = std::mem::take(&mut transfer.hasher).finish();
     if security::is_blocked(digest) {
         let _ = std::fs::remove_file(&transfer.dest);

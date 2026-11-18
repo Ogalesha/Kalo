@@ -107,7 +107,7 @@ jobs:
 
   macos:
     name: macOS
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
