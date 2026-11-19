@@ -17,6 +17,7 @@ use crate::crypto::{Encryption, MIN_PASSPHRASE_CHARS};
 use crate::events::{
     Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
 };
+use crate::identity::{DeviceIdentity, PairingManager};
 use crate::paths;
 use crate::platform::{self, DeviceInfo, PendingTransfers, ReceiverHandle, new_pending};
 use crate::selection::Selection;
@@ -35,6 +36,7 @@ struct EventBus {
     save_dir: SaveDir,
     authorizer: Authorizer,
     encryption: Encryption,
+    pairing: Option<PairingManager>,
     /// Screenshot mode: never touch Bluetooth or the user's config.
     demo: bool,
 }
@@ -55,6 +57,7 @@ impl EventBus {
             self.sink.clone(),
             self.authorizer.clone(),
             self.encryption.clone(),
+            self.pairing.clone(),
         ));
     }
 }
@@ -84,6 +87,13 @@ pub enum Message {
     EncryptionPassphraseChanged(String),
     SaveEncryptionPassphrase,
     ClearEncryptionPassphrase,
+    PairDevice,
+    CancelPairing,
+    PairingRequestSent {
+        address: String,
+        name: String,
+        result: Result<(), String>,
+    },
     PickSaveFolder,
     SaveFolderPicked(Option<PathBuf>),
     OpenPath(PathBuf),
@@ -190,6 +200,14 @@ struct App {
     pending_authorizations: Vec<AuthPromptUi>,
     last_saved: Option<SavedUi>,
     show_trust: bool,
+    pairing: Option<PairingManager>,
+    pairing_busy: bool,
+    /// Bluetooth address of the device being paired, when a request is open.
+    pairing_target: Option<String>,
+    /// When the current outgoing pairing request was sent; an unanswered
+    /// request stops blocking the UI after the protocol timeout.
+    pairing_started: Option<std::time::Instant>,
+    pairing_error: Option<String>,
     demo: bool,
     tray_ready: bool,
 }
@@ -210,8 +228,10 @@ impl App {
         if self.demo {
             return;
         }
-        if let Err(error) = self.settings.save() {
-            self.log(format!("Couldn't save settings: {error:#}"));
+        match self.settings.save() {
+            Ok(Some(warning)) => self.log(warning),
+            Ok(None) => {}
+            Err(error) => self.log(format!("Couldn't save settings: {error:#}")),
         }
     }
 }
@@ -315,11 +335,27 @@ pub fn run() -> iced::Result {
     } else {
         TrustStore::load()
     };
+    let (pairing, pairing_note) = if demo {
+        (None, None)
+    } else {
+        match DeviceIdentity::load_or_create() {
+            Ok(identity) => (
+                Some(PairingManager::new(identity, trust.clone(), sink.clone())),
+                None,
+            ),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "Paired-device encryption is unavailable: {error:#}"
+                )),
+            ),
+        }
+    };
     let save_dir = SaveDir::new(
         settings
             .save_dir
             .clone()
-            .unwrap_or_else(paths::downloads_dir),
+            .unwrap_or_else(paths::default_save_dir),
     );
     let encryption = Encryption::new(
         settings.encrypt_sends,
@@ -335,6 +371,7 @@ pub fn run() -> iced::Result {
             save_dir: save_dir.clone(),
             authorizer: authorizer.clone(),
             encryption: encryption.clone(),
+            pairing: pairing.clone(),
             demo,
         })
         .is_err()
@@ -351,6 +388,9 @@ pub fn run() -> iced::Result {
                 log.push(note);
             }
             if let Some(note) = trust_note.clone() {
+                log.push(note);
+            }
+            if let Some(note) = pairing_note.clone() {
                 log.push(note);
             }
             if settings.encrypt_sends && !encryption.enabled() {
@@ -403,6 +443,11 @@ pub fn run() -> iced::Result {
                 },
                 last_saved: None,
                 show_trust: false,
+                pairing: pairing.clone(),
+                pairing_busy: false,
+                pairing_target: None,
+                pairing_started: None,
+                pairing_error: None,
                 demo,
                 tray_ready,
             };
@@ -606,32 +651,43 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
             let tx = app.tx.clone();
             let encryption = app.encryption.clone();
+            let trust = app.trust.clone();
+            let pairing = app.pairing.clone();
             Task::perform(
                 async move {
-                    platform::send(&mac, &files, &tx, send_id, cancel, &encryption)
-                        .await
-                        .map(|summary| {
-                            if summary.files == 1 {
-                                let name = files
-                                    .first()
-                                    .map(|file| file_name(file))
-                                    .unwrap_or_else(|| "file".to_string());
-                                format!(
-                                    "Sent {name} to {result_target} · {} in {:.1}s ({:.1} MB/s)",
-                                    format_bytes(summary.bytes),
-                                    summary.elapsed_secs,
-                                    summary.mbps
-                                )
-                            } else {
-                                format!(
-                                    "Sent {} files ({}) to {result_target} · {:.1}s ({:.1} MB/s)",
-                                    summary.files,
-                                    format_bytes(summary.bytes),
-                                    summary.elapsed_secs,
-                                    summary.mbps
-                                )
-                            }
-                        })
+                    platform::send(
+                        &mac,
+                        &files,
+                        &tx,
+                        send_id,
+                        cancel,
+                        &encryption,
+                        &trust,
+                        pairing.as_ref(),
+                    )
+                    .await
+                    .map(|summary| {
+                        if summary.files == 1 {
+                            let name = files
+                                .first()
+                                .map(|file| file_name(file))
+                                .unwrap_or_else(|| "file".to_string());
+                            format!(
+                                "Sent {name} to {result_target} · {} in {:.1}s ({:.1} MB/s)",
+                                format_bytes(summary.bytes),
+                                summary.elapsed_secs,
+                                summary.mbps
+                            )
+                        } else {
+                            format!(
+                                "Sent {} files ({}) to {result_target} · {:.1}s ({:.1} MB/s)",
+                                summary.files,
+                                format_bytes(summary.bytes),
+                                summary.elapsed_secs,
+                                summary.mbps
+                            )
+                        }
+                    })
                 },
                 move |result| Message::SendFinished {
                     send_id,
@@ -743,6 +799,107 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.settings.encrypt_sends = false;
             app.persist_settings();
             app.log("Encryption passphrase cleared; outgoing encryption is off.");
+            Task::none()
+        }
+        Message::PairDevice => {
+            let Some(device) = resolve_target(&app.devices, app.selected.as_deref()) else {
+                app.log("select a device first");
+                return Task::none();
+            };
+            if app
+                .pairing_started
+                .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(180))
+                && app.pairing_busy
+            {
+                app.log("a pairing request is already waiting for the other device");
+                return Task::none();
+            }
+            app.pairing_busy = false;
+            app.pairing_target = None;
+            app.pairing_started = None;
+            if !crate::trust::is_stable_key(&device.address) {
+                app.pairing_error = Some(
+                    "This device has no stable Bluetooth address, so it cannot be paired.".into(),
+                );
+                return Task::none();
+            }
+            if app.trust.is_paired(&device.address) {
+                app.pairing_error =
+                    Some("This device is already paired; remove it before pairing again.".into());
+                return Task::none();
+            }
+            let Some(pairing) = app.pairing.clone() else {
+                app.pairing_error =
+                    Some("Paired-device encryption is unavailable on this device.".into());
+                return Task::none();
+            };
+            let Some(passphrase) = app.encryption.passphrase() else {
+                app.pairing_error = Some("Set a shared passphrase before pairing.".into());
+                return Task::none();
+            };
+            let mac = device.address.clone();
+            let target = device_name(device).to_string();
+            match pairing.begin(&mac, &passphrase) {
+                Ok(request) => {
+                    app.pairing_busy = true;
+                    app.pairing_target = Some(mac.clone());
+                    app.pairing_started = Some(std::time::Instant::now());
+                    app.pairing_error = None;
+                    app.log(format!(
+                        "Pairing request sent to {target}; waiting for the other device…"
+                    ));
+                    let tx = app.tx.clone();
+                    let address_for_result = mac.clone();
+                    Task::perform(
+                        async move {
+                            platform::send_control(&mac, &request, &tx)
+                                .await
+                                .map_err(|error| format!("{error:#}"))
+                        },
+                        move |result| Message::PairingRequestSent {
+                            address: address_for_result,
+                            name: target.clone(),
+                            result,
+                        },
+                    )
+                }
+                Err(error) => {
+                    app.pairing_error = Some(format!("{error:#}"));
+                    app.log(format!("Couldn't start pairing: {error:#}"));
+                    Task::none()
+                }
+            }
+        }
+        Message::PairingRequestSent {
+            address,
+            name,
+            result,
+        } => {
+            match result {
+                Ok(()) => app.log(format!("Pairing request delivered to {name}.")),
+                Err(error) => {
+                    app.pairing_busy = false;
+                    app.pairing_target = None;
+                    app.pairing_started = None;
+                    app.pairing_error = Some(error.clone());
+                    app.log(format!("Pairing with {name} failed: {error}"));
+                    if let Some(pairing) = &app.pairing {
+                        pairing.cancel(&address);
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::CancelPairing => {
+            if let Some(address) = app.pairing_target.take()
+                && let Some(pairing) = &app.pairing
+            {
+                pairing.cancel(&address);
+            }
+            app.pairing_busy = false;
+            app.pairing_started = None;
+            app.pairing_error = None;
+            app.log("Pairing request cancelled.");
             Task::none()
         }
         Message::PickSaveFolder => {
@@ -1021,6 +1178,23 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             };
             app.receiver_state = state;
             app.log(line);
+        }
+        Event::Pairing {
+            address,
+            name,
+            ok,
+            message,
+        } => {
+            app.pairing_busy = false;
+            app.pairing_target = None;
+            app.pairing_started = None;
+            if ok {
+                app.pairing_error = None;
+                app.log(format!("{message} ({address}, {name})"));
+            } else {
+                app.pairing_error = Some(message.clone());
+                app.log(format!("Pairing failed: {message}"));
+            }
         }
     }
     Task::none()
@@ -1314,6 +1488,7 @@ fn view(app: &App) -> Element<'_, Message> {
             rule::horizontal(1).style(ui::divider),
             file_section,
             send_action(app, target),
+            pairing_row(app, target, p),
         ]
         .spacing(15)
         .height(Length::Fill),
@@ -2147,6 +2322,89 @@ fn encryption_row<'a>(
     .into()
 }
 
+fn pairing_row<'a>(
+    app: &'a App,
+    target: Option<&'a DeviceInfo>,
+    p: &'a ui::Palette,
+) -> Element<'a, Message> {
+    let paired = target.is_some_and(|device| app.trust.is_paired(&device.address));
+    let busy = app.pairing_busy;
+    let mut body = column![].spacing(2).width(Length::Fill);
+    if paired {
+        body = body.push(
+            row![
+                text("Paired for encrypted Kalo transfers")
+                    .size(11.5)
+                    .font(ui::MEDIUM)
+                    .color(p.text),
+                badge("Paired", p.accent_tint, p.accent_text),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        );
+        body = body.push(
+            text("Files to this device are authenticated with its pinned identity.")
+                .size(10)
+                .color(p.text_muted),
+        );
+    } else if busy {
+        body = body.push(
+            text("Waiting for the other device to confirm the pairing…")
+                .size(11.5)
+                .font(ui::MEDIUM)
+                .color(p.text),
+        );
+        body = body.push(
+            text("Keep both devices nearby and the Kalo receiver running.")
+                .size(10)
+                .color(p.text_muted),
+        );
+    } else {
+        body = body.push(
+            text("Pair for encrypted, authenticated transfers")
+                .size(11.5)
+                .font(ui::MEDIUM)
+                .color(p.text),
+        );
+        body = body.push(
+            text(if target.is_some() {
+                "Both devices need the same passphrase. Standard Bluetooth receivers cannot pair."
+            } else {
+                "Select a device first. Both Kalo devices need the same passphrase."
+            })
+            .size(10)
+            .color(p.text_muted),
+        );
+    }
+    if let Some(error) = app.pairing_error.as_deref() {
+        body = body.push(text(error).size(10).color(p.danger_text));
+    }
+
+    let action: Element<'a, Message> = if busy {
+        button(text("Cancel").size(10).font(ui::MEDIUM))
+            .padding([3, 8])
+            .style(ui::secondary_button)
+            .on_press(Message::CancelPairing)
+            .into()
+    } else {
+        button(
+            text(if paired { "Paired" } else { "Pair" })
+                .size(10)
+                .font(ui::MEDIUM),
+        )
+        .padding([3, 8])
+        .style(ui::policy_button(false))
+        .on_press_maybe((target.is_some() && !paired).then_some(Message::PairDevice))
+        .into()
+    };
+
+    container(row![body, action].spacing(10).align_y(Alignment::Center))
+        .padding([8, 10])
+        .width(Length::Fill)
+        .style(ui::inset)
+        .into()
+}
+
 fn trust_panel(
     entries: Vec<(String, crate::trust::TrustEntry)>,
     policy: IncomingPolicy,
@@ -2178,16 +2436,19 @@ fn trust_panel(
                     .color(p.text_muted),
             );
         }
+        let mut row = row![details, badge(label, tint, color)]
+            .spacing(7)
+            .align_y(Alignment::Center);
+        if entry.peer_key.is_some() {
+            row = row.push(badge("Paired", p.accent_tint, p.accent_text));
+        }
         list = list.push(
-            row![
-                details,
-                badge(label, tint, color),
+            row.push(
                 button(text("Remove").size(10).font(ui::MEDIUM))
                     .padding([3, 7])
                     .style(ui::secondary_button)
                     .on_press(Message::RemoveTrustedSender(address)),
-            ]
-            .spacing(7)
+            )
             .align_y(Alignment::Center),
         );
     }
@@ -3152,6 +3413,11 @@ mod tests {
             pending_authorizations: Vec::new(),
             last_saved: None,
             show_trust: false,
+            pairing: None,
+            pairing_busy: false,
+            pairing_target: None,
+            pairing_started: None,
+            pairing_error: None,
             demo: true,
             tray_ready: false,
         }

@@ -91,9 +91,15 @@ privacy of transfer metadata, and the confidentiality of transferred content.
 - On Unix, saved files are restricted to mode `0600`. On Windows, Kalo writes a
   `Zone.Identifier` Mark-of-the-Web so the shell treats the file like an
   internet download.
-- Received files are moved into the save folder only after the transfer
-  completes and the scan passes. Partial data is recovered only when the
-  protocol and filesystem state make that safe.
+- Received files are moved into `Downloads/Kalo/<sender>/` only after the
+  transfer completes and the scan passes. The sender label comes from the
+  BlueZ alias on Linux or the remote name on Windows, with a normalized
+  Bluetooth address as fallback; recovered files without a known sender go to
+  `Downloads/Kalo/Recovered/`. Existing files are never overwritten:
+  collisions use `name_1.ext`, `name_2.ext`, and so on.
+- Partial data is recovered only when the protocol and filesystem state make
+  that safe. Stale pairing objects are deleted by the recovery sweep and are
+  never presented as received files.
 
 ### Optional application-layer encryption
 
@@ -128,6 +134,48 @@ Kalo-to-Kalo transfer, the following applies:
   size, metadata bounds, and reserved flags before deriving a key, so a
   malicious container cannot request an unbounded or absurdly cheap KDF.
 
+### Authenticated pairing and per-device encryption
+
+Kalo pairing is optional and requires the same shared passphrase on both
+devices. It is the only mode that proves which device sent a file.
+
+- The exchange is a three-object SPAKE2 handshake carried as OPP pushes:
+  request, response, and confirmation. The passphrase is the SPAKE2 password;
+  the protocol magic is `KALOPAIR1` and the filenames are
+  `kalo-pair-*.kalopair`.
+- Each object carries the sender's Ed25519 public key and a signature over the
+  serialized object. The response and confirmation add a transcript hash and
+  an HMAC proof derived from the SPAKE2 session, so an object from a different
+  exchange or a different identity is rejected.
+- The initiator pins the responder's identity only after verifying the
+  response proof. The responder pins the initiator only after verifying the
+  confirmation. Response and confirmation objects require pending state.
+- Pairing is reciprocal: a successful exchange writes a trust decision for the
+  peer on both devices, so no additional incoming approval is shown in either
+  direction.
+- Pairing control objects bypass the generic file prompt, but they are never
+  saved to the save folder and are deleted after processing. They are bounded
+  to 64 KiB, must be regular files, and stale objects are removed by recovery.
+  A control object from a sender without a stable Bluetooth address is
+  rejected. Pairing is unavailable in the CLI receiver only when the identity
+  or passphrase is missing; the UI and receiver share the same manager.
+- Paired transfers use a `KALOENC2` container. The header carries the sender's
+  8-byte key identifier; the payload is encrypted with a directional
+  HMAC-SHA256 hash-ratchet chain and signed with the sender's Ed25519 key.
+  The receiver looks up the pinned identity, verifies the signature, checks the
+  step number, and commits the next incoming chain key only after successful
+  decryption.
+- Outgoing and incoming chains are independent. A step is never reused: the
+  sender commits its outgoing ratchet after every attempted file, including
+  failures and cancellation, and the receiver commits the incoming ratchet
+  immediately after authenticated decryption, before the malware scan or save.
+- A replay, a step beyond the bounded forward-skip window (`4096`), a wrong
+  signature, an unknown key identifier, or a container from a device that is no
+  longer paired is rejected and the container is deleted. A pinned device with
+  no available identity fails closed rather than falling back to plaintext.
+- Removing the peer from the trust store deletes its pinned key and both
+  ratchets, so the old containers can no longer be authenticated.
+
 ### Malware hash blocklist
 
 - Sources: the bundled baseline in `assets/malware-sha256.txt` and the
@@ -160,9 +208,18 @@ Kalo-to-Kalo transfer, the following applies:
 - Kalo's config directory is created with owner-only permissions (`0700` on
   Unix), and `settings.json`, `trust.json`, and the hash cache are written with
   `0600`. Writes go through a temporary file and an atomic rename.
-- `settings.json` stores the encryption passphrase in plaintext so the
-  receiver can decrypt without prompting every time. Treat read access to that
-  file as equivalent to knowledge of the passphrase.
+- The encryption passphrase is stored through the operating system keyring
+  under the service/account pair `Kalo` / `encryption-passphrase` when a
+  Secret Service, Keychain, or Credential Manager is available. A legacy
+  plaintext value is migrated out of `settings.json` on load.
+- If the keyring is unavailable or fails, Kalo warns and falls back to the
+  owner-only settings file so receiving still works. In that fallback, read
+  access to `settings.json` is equivalent to knowledge of the passphrase.
+- `trust.json` stores pinned public keys and directional ratchet keys. It is
+  written with `0600` and must be treated as security-sensitive: the ratchet
+  keys are symmetric secrets for their current step.
+- `identity.json` stores the device's Ed25519 private key unencrypted. It is
+  written with `0600`; anyone who can read it can impersonate this device.
 - Received files are private to the account that runs Kalo.
 
 ## What Kalo does not guarantee
@@ -177,20 +234,31 @@ Kalo-to-Kalo transfer, the following applies:
   confidentiality against a compromised peer or a compromised Bluetooth
   stack. A stock OPP receiver cannot open a Kalo container and saves it as an
   opaque file; Apple's Bluetooth Sharing behaves the same way.
-- **Encryption has no forward secrecy, key rotation, or sender
-  authentication.** One shared passphrase protects all containers. Anyone who
-  learns the passphrase can decrypt previously captured containers and can
-  create containers the receiver will accept. There is no per-transfer key
-  exchange, revocation, or proof of which device sent a file. Argon2id slows
-  guessing but cannot make a weak passphrase safe.
+- **Shared-passphrase encryption has no sender authentication or forward
+  secrecy.** One shared passphrase protects all `KALOENC1` containers. Anyone
+  who learns the passphrase can decrypt previously captured containers and can
+  create containers the receiver will accept. Argon2id slows guessing but
+  cannot make a weak passphrase safe. Use pairing between Kalo devices when
+  sender authentication matters.
+- **Pairing has no out-of-band fingerprint comparison.** The passphrase
+  authenticates the SPAKE2 exchange, but an attacker who knows the passphrase
+  and can actively intercept or relay the OPP objects during the first pairing
+  could substitute an identity. Pair on a trusted network and compare the
+  paired device out of band if the threat model requires it. Later transfers
+  are bound to the pinned key and reject a substituted identity.
+- **Paired-device ratchets provide past-step forward secrecy, not
+  post-compromise recovery.** An attacker who obtains the current chain key can
+  derive later steps for that direction; earlier steps remain protected after
+  their keys are erased. Compromise of `identity.json` allows impersonation
+  until the peer is unpaired.
 - **Encrypted outer metadata is visible.** The peer sees a random `.kalo`
   name and the ciphertext size. The original filename and plaintext size are
   encrypted. Once saved, decrypted content is ordinary plaintext at rest.
-- **The passphrase is stored in plaintext in Kalo's settings file.** On Unix
-  the file is mode `0600`; on Windows it lives in the private per-user
-  application-data directory. Any local process or user able to read that
-  file can recover the passphrase. OS keyring storage and a passphrase
-  prompt per session remain future work.
+- **Passphrase protection depends on the OS keyring.** When no keyring is
+  available, Kalo falls back to storing the passphrase in the owner-only
+  settings file and warns. Any local process or user able to read that file
+  can recover the passphrase. The identity and ratchet state are not stored in
+  the keyring, so protect the app-data directory as well.
 - **No protection from operating-system or firmware vulnerabilities.** A flaw
   in the Bluetooth driver, the OBEX implementation, or the OS file APIs is
   outside Kalo's control. Keep the OS and Bluetooth stack updated.
@@ -201,9 +269,10 @@ Kalo-to-Kalo transfer, the following applies:
 - **Windows is experimental.** The Windows backend has not been validated on
   physical Windows hardware. Do not rely on it for high-assurance transfers
   until that validation is complete.
-- **No remote attestation or identity proof.** Trust is remembered by the
-  Bluetooth address reported by the operating system. A compromised or spoofed
-  local Bluetooth stack can undermine that identity.
+- **No remote attestation or global identity proof.** Trust is remembered by
+  the Bluetooth address reported by the operating system. A compromised or
+  spoofed local Bluetooth stack can undermine that identity. Pairing pins a
+  key, but the key is only as trustworthy as the first pairing exchange.
 - **No sandbox around the UI.** Kalo is a native desktop app with the
   permissions of the user who launches it.
 
@@ -215,10 +284,15 @@ Kalo-to-Kalo transfer, the following applies:
   addresses you do not recognize.
 - Keep the save folder on a local filesystem with enough free space.
 - Review received files before opening them, even when they pass the blocklist.
-- Use encryption when sending between Kalo devices, with a long passphrase
-  that is unique to that pair or group. Turn it off when the receiver is a
-  stock OPP device, including a Mac using Bluetooth Sharing; an encrypted
-  container is opaque to those receivers.
+- Pair two Kalo devices when you want authenticated, automatically encrypted
+  transfers. Remove pairings you no longer need so old containers cannot be
+  replayed and the pinned identity stops being trusted.
+- Use a long, unique passphrase for pairing and for shared-passphrase
+  encryption. Turn encryption off when the receiver is a stock OPP device,
+  including a Mac using Bluetooth Sharing; an encrypted container is opaque to
+  those receivers.
+- Keep the app-data directory private (`0600` files, `0700` directory) and
+  avoid copying `identity.json` or `trust.json` between machines.
 - On Linux, do not run a second OBEX agent at the same time; it can interfere
   with receiver registration.
 - On macOS, use Bluetooth Sharing only while you need it, and review its

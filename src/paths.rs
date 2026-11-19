@@ -57,6 +57,11 @@ pub fn trust_file() -> PathBuf {
     config_dir().join("trust.json")
 }
 
+/// Long-lived Ed25519 identity used for authenticated pairing.
+pub fn identity_file() -> PathBuf {
+    config_dir().join("identity.json")
+}
+
 /// Open a folder in the platform file manager, creating it first so the
 /// default Downloads folder works on a fresh account.
 pub fn open_folder(path: &Path) -> Result<()> {
@@ -127,4 +132,21 @@ pub fn downloads_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Downloads")
+}
+
+/// Default save root: `Downloads/Kalo`, with one subfolder per sender.
+pub fn default_save_dir() -> PathBuf {
+    downloads_dir().join("Kalo")
+}
+
+/// A human-readable name for this computer, used in pairing messages and
+/// sender folders. It never includes path separators because the other side
+/// sanitizes it before writing.
+pub fn device_name() -> String {
+    let name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    name.unwrap_or_else(|| "Kalo device".to_string())
 }

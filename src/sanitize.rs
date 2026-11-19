@@ -63,7 +63,14 @@ fn is_windows_reserved(name: &str) -> bool {
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
-/// Find a non-colliding path in `dir` for `name`: `name (1).ext` style.
+/// Folder that receives files from one sender. The label is sanitized like a
+/// filename, so a device alias can never escape the save folder or collide
+/// with a Windows device name.
+pub fn sender_dir(root: &Path, label: &str) -> PathBuf {
+    root.join(filename(label))
+}
+
+/// Find a non-colliding path in `dir` for `name`: `name_1.ext` style.
 pub fn unique_in_dir(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
@@ -76,8 +83,8 @@ pub fn unique_in_dir(dir: &Path, name: &str) -> PathBuf {
     let ext = Path::new(name).extension().and_then(|s| s.to_str());
     for i in 1..u32::MAX {
         let name2 = match ext {
-            Some(e) => format!("{stem} ({i}).{e}"),
-            None => format!("{stem} ({i})"),
+            Some(e) => format!("{stem}_{i}.{e}"),
+            None => format!("{stem}_{i}"),
         };
         let candidate = dir.join(&name2);
         if !candidate.exists() {
@@ -196,10 +203,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(unique_in_dir(&dir, "a.txt"), dir.join("a.txt"));
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
-        assert_eq!(unique_in_dir(&dir, "a.txt"), dir.join("a (1).txt"));
-        std::fs::write(dir.join("a (1).txt"), b"x").unwrap();
-        assert_eq!(unique_in_dir(&dir, "a.txt"), dir.join("a (2).txt"));
+        assert_eq!(unique_in_dir(&dir, "a.txt"), dir.join("a_1.txt"));
+        std::fs::write(dir.join("a_1.txt"), b"x").unwrap();
+        assert_eq!(unique_in_dir(&dir, "a.txt"), dir.join("a_2.txt"));
+        std::fs::write(dir.join("noext"), b"x").unwrap();
+        assert_eq!(unique_in_dir(&dir, "noext"), dir.join("noext_1"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sender_folders_are_sanitized() {
+        let root = Path::new("/tmp/Kalo");
+        assert_eq!(sender_dir(root, "Pixel 8"), root.join("Pixel 8"));
+        assert_eq!(sender_dir(root, "AA:BB:CC"), root.join("AA_BB_CC"));
+        assert_eq!(sender_dir(root, "../../etc"), root.join("etc"));
+        assert_eq!(sender_dir(root, "CON"), root.join("_CON"));
+        assert_eq!(sender_dir(root, "   "), root.join("received-file"));
     }
 
     #[test]

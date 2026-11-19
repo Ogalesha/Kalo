@@ -87,6 +87,40 @@ pub async fn send(
     run_blocking(move || worker.run()).await
 }
 
+/// Send a tiny control object from a blocking receiver thread. This mirrors
+/// `send` without the tokio cancellation watcher; control objects are small
+/// and bounded by the pairing protocol.
+pub(super) fn send_blocking(mac: &str, file: &Path, events: &EventSink) -> Result<()> {
+    let file = file.canonicalize().context("file not found")?;
+    let metadata = std::fs::metadata(&file).context("read the file")?;
+    if !metadata.is_file() {
+        bail!("not a regular file: {}", file.display());
+    }
+    let size = metadata.len();
+    if size > u32::MAX as u64 {
+        bail!("files larger than 4 GB are not supported by OPP");
+    }
+    let name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "kalo-control".to_string());
+    let address = parse_mac(mac)?;
+    let target = format_mac(address);
+    let worker = SendJob {
+        address,
+        target,
+        file,
+        name,
+        size,
+        events: events.clone(),
+        send_id: u64::MAX,
+        canceled: Arc::new(AtomicBool::new(false)),
+        socket_slot: Arc::new(Mutex::new(None)),
+    };
+    worker.run().map(|_| ())
+}
+
 struct SendJob {
     address: u64,
     target: String,

@@ -16,15 +16,17 @@
       either files or a folder tree; folders are flattened, hidden entries and
       symlinks are skipped, the selection is capped and sorted, and the batch
       shares progress and cancellation.
-- [ ] **Two-way trusted peers.** Once two computers trust each other, transfers
-      should need no approval in either direction. Today each receiver can
-      remember a sender, but there is no reciprocal trust handshake yet.
-- [ ] **Downloads/Kalo folder.** Save incoming files in a `Kalo` folder inside
-      the platform Downloads folder by default, instead of directly in
-      Downloads.
-- [ ] **`_n` collision suffix.** When a received file has the same name as an
-      existing file, use `name_1.ext`, `name_2.ext`, … instead of the current
-      `name (1).ext` form.
+- [x] **Two-way trusted peers.** SPAKE2 pairing over OPP pins an Ed25519
+      identity on both devices, derives independent directional ratchets, and
+      writes reciprocal trust so neither side prompts again. Pairing is
+      available on Linux and Windows; macOS can initiate but has no receiver
+      to answer.
+- [x] **Downloads/Kalo folder.** Incoming files save to
+      `Downloads/Kalo/<sender>/`, with `Recovered` for files recovered
+      without a known sender. The sender label uses the Linux BlueZ alias or
+      the Windows remote name, falling back to the normalized address.
+- [x] **`_n` collision suffix.** Repeated names use `name_1.ext`,
+      `name_2.ext`, … and never overwrite an existing file.
 
 ## Platform support
 
@@ -101,13 +103,18 @@
       README and SECURITY. Off by default because stock OPP receivers cannot
       open a container; the outer random name and ciphertext size remain
       visible to the Bluetooth peer.
-- [ ] **Keyring-backed passphrase storage.** Replace the plaintext passphrase
-      in `settings.json` with an OS keyring entry and a per-session unlock,
-      avoiding secret storage in a readable config file.
-- [ ] **Authenticated per-device key exchange.** Replace the shared passphrase
-      with a paired-device handshake (for example a PAKE) to gain forward
-      secrecy, sender authentication, key rotation, and revocation while
-      keeping compatibility with Kalo peers.
+- [x] **Keyring-backed passphrase storage.** The shared passphrase lives in
+      the OS keyring (`Kalo` / `encryption-passphrase`). Plaintext values are
+      migrated on load; if no keyring is available Kalo warns and falls back
+      to the owner-only settings file so the receiver still works.
+- [x] **Authenticated per-device key exchange.** Pairing uses SPAKE2 over the
+      shared passphrase and pins an Ed25519 identity. Paired transfers use
+      `KALOENC2` with signed, directional HMAC-SHA256 hash ratchets, bounded
+      forward skipping, replay rejection, and automatic encryption. The
+      shared-passphrase `KALOENC1` mode remains for unpaired compatibility.
+- [ ] **Pairing fingerprint verification.** Add an out-of-band fingerprint
+      comparison or QR/display code so users can verify the pinned identity
+      instead of trusting the first SPAKE2 exchange.
 
 ## Engineering
 
@@ -126,3 +133,102 @@
       checksums.
 - [ ] Add an end-to-end transfer test harness with two virtual Bluetooth
       adapters where the environment allows it.
+
+## Full security audit and automatic remediation (planned)
+
+Execute this as one dedicated pass over the whole repository. It is an
+implementation task, not a report-only review: fix every confirmed
+vulnerability that can be safely fixed, add regression tests, and document
+what remains. Do not commit, push, publish, or modify remotes unless the
+user explicitly authorizes it.
+
+Rules: inspect the real code before concluding; never invent findings,
+builds, or guarantees; separate confirmed vulnerabilities from plausible
+risks and false positives; prefer root-cause fixes; fail closed; never
+weaken crypto, validation, authorization, or permissions to get a green
+build; never expose secrets in reports or logs; use isolated or mocked
+environments for destructive tests; do not probe unrelated devices.
+
+- [ ] **Phase 1 — Reconnaissance and threat model.** Map every module under
+      `src/`, the BlueZ/obexd and WinRT/RFCOMM/OBEX stacks, send/receive and
+      staging pipelines, filename handling, trust/authorization, crypto and
+      secret storage, async tasks, GUI/CLI lifecycle, packaging (Ubuntu,
+      Arch, Windows), CI, and diagnostics. Enumerate entry points, trust
+      boundaries, external inputs, privileged operations, and
+      security-sensitive state transitions. Model assets, attacker
+      capabilities (especially a nearby Bluetooth device), local and remote
+      surfaces, abuse scenarios, existing controls, and gaps.
+- [ ] **Phase 2 — Deep audit.** Review Bluetooth/OBEX/RFCOMM authorization,
+      packet parsing, lengths/overflow, state transitions, replays,
+      disconnects, resource exhaustion, cancellation, receiver restarts and
+      registration conflicts. Review filesystem handling for traversal,
+      symlink/hardlink and TOCTOU attacks, staging names, collisions,
+      overwrites, recovery, Unicode/normalization, Windows ADS/reserved
+      names, permissions, disk exhaustion, and atomicity. Review Rust memory
+      and runtime safety, `unsafe`/FFI, panics on untrusted input,
+      allocations, cancellation safety, zeroization, and error handling.
+      Review concurrency, deadlocks, double completion/cancellation, stale
+      events, orphaned tasks, watchdogs, timeouts, and recovery. Audit direct
+      and transitive dependencies with `cargo audit`, `cargo deny`, Clippy,
+      Semgrep or equivalents, secret scanning, and fuzzing where useful; fix
+      compatible vulnerable dependencies without unrelated churn. Review
+      crypto use, randomness, KDF parameters, nonces, AEAD, key lifecycle,
+      permissions, and accidental disclosure. Review GUI/CLI parity, argument
+      validation, subprocess safety, log injection, path exposure, and
+      security indicators. Audit packaging permissions, scripts, download
+      integrity, artifact contamination, privilege requirements, and release
+      provenance.
+- [ ] **Phase 2 special — incoming authorization.** Verify whether
+      accept-all incoming authorization still exists. If it does, implement
+      explicit consent and/or trusted devices, default-deny unsolicited
+      transfers, do not silently trust every paired device, keep CLI and GUI
+      consistent, enforce equivalent Linux/Windows decisions where feasible,
+      and prevent bypass across receiver restarts or races. Handle an
+      unavailable UI safely. Add negative tests proving unauthorized
+      transfers are rejected.
+- [ ] **Phase 3 — Automatic remediation.** For each finding: root cause,
+      exploitability/impact, justified severity (Critical/High/Medium/Low/
+      Informational), affected files/functions, smallest robust fix,
+      implementation, focused regression test, checks, patch inspection, and
+      documentation updates. Prioritize Critical and High, then Medium and
+      Low. Report limitations precisely instead of claiming a fix that was
+      not validated.
+- [ ] **Phase 4 — Adversarial tests.** Add deterministic tests for malicious
+      filenames, traversal, Unicode/path edges, symlink and collision races,
+      corrupt/truncated OBEX frames, inconsistent lengths, oversized inputs,
+      unauthorized transfers, interrupted connections, repeated
+      cancellation, concurrent transfers, receiver restarts, disconnects,
+      disk-full/permission failures, recovery failures, watchdog boundaries,
+      and resource exhaustion. Use property-based testing and fuzzing where
+      meaningful; keep protocol-level mocks and isolated adapters. Separate
+      simulated coverage from hardware validation.
+- [ ] **Phase 5 — Validation.** Run `cargo fmt --all -- --check`,
+      `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`,
+      `cargo build --release`, and `cargo audit`. Add target-specific checks;
+      validate Linux and Windows separately; cross-compile when hardware is
+      unavailable without claiming physical-device testing. Record every
+      failure and distinguish defects from missing tooling.
+- [ ] **Phase 6 — Second independent audit.** Re-review the modified code
+      for incomplete fixes, new authorization bypasses, races, regressions,
+      functionality loss, cross-platform divergence, unhandled failures,
+      permissive fallbacks, new vulnerable dependencies, and configuration
+      changes. Remediate and retest until no additional actionable issue is
+      found or a clear blocker is documented. Never claim zero
+      vulnerabilities.
+- [ ] **Phase 7 — Permanent hardening.** Add practical CI security checks,
+      dependency advisory scanning, formatting/lint gates, security
+      regression tests, cross-platform build checks, safe dependency update
+      workflow, fuzz targets for parsers, maintain `SECURITY.md`, and
+      document trust boundaries, authorization behavior, and residual
+      limitations without excessive CI cost or unmaintainable complexity.
+- [ ] **Deliverables.** Implement the actual code changes; create
+      `SECURITY_AUDIT.md` (scope, threat model, methodology/tools, findings
+      and evidence, severity rationale, affected files, exploitability,
+      remediation, tests, verification, residual risks, platform limits);
+      create `REMEDIATION_SUMMARY.md` (confirmed/fixed/unresolved findings,
+      dependency updates, modified files, new controls/tests, commands and
+      results, environment limits, next steps); end with the required
+      "SECURITY AUDIT RESULTS" assessment and the five most important
+      findings, exact changes, executed tools, unresolved issues, and
+      remaining manual validation. Every number must map to a documented
+      finding or executed check.

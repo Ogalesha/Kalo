@@ -128,24 +128,55 @@ pub async fn list_known_devices() -> Result<Vec<DeviceInfo>> {
     let mut devices = Vec::new();
     for (_path, interfaces) in objects {
         if let Some(props) = interfaces.get("org.bluez.Device1") {
-            devices.push(DeviceInfo {
-                address: prop_str(props, "Address"),
-                alias: {
-                    let alias = prop_str(props, "Alias");
-                    if alias.is_empty() {
-                        prop_str(props, "Address")
-                    } else {
-                        alias
-                    }
-                },
-                paired: prop_bool(props, "Paired"),
-                trusted: prop_bool(props, "Trusted"),
-                connected: prop_bool(props, "Connected"),
-            });
+            devices.push(device_from_props(props));
         }
     }
     devices.sort_by(|a, b| b.paired.cmp(&a.paired).then(a.alias.cmp(&b.alias)));
     Ok(devices)
+}
+
+/// Friendly name for one device address, if BlueZ knows it. Used to name the
+/// per-sender save folder without trusting a name supplied over the air.
+pub async fn device_alias(conn: &zbus::Connection, address: &str) -> Option<String> {
+    let om = BluezObjectsProxy::new(conn).await.ok()?;
+    let objects = om.get_managed_objects().await.ok()?;
+    find_alias(&objects, address)
+}
+
+fn find_alias(objects: &ManagedObjects, address: &str) -> Option<String> {
+    let want = address.trim().to_ascii_uppercase();
+    for interfaces in objects.values() {
+        let Some(props) = interfaces.get("org.bluez.Device1") else {
+            continue;
+        };
+        if prop_str(props, "Address").trim().to_ascii_uppercase() != want {
+            continue;
+        }
+        for key in ["Alias", "Name"] {
+            let value = prop_str(props, key);
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn device_from_props(props: &HashMap<String, OwnedValue>) -> DeviceInfo {
+    DeviceInfo {
+        address: prop_str(props, "Address"),
+        alias: {
+            let alias = prop_str(props, "Alias");
+            if alias.is_empty() {
+                prop_str(props, "Address")
+            } else {
+                alias
+            }
+        },
+        paired: prop_bool(props, "Paired"),
+        trusted: prop_bool(props, "Trusted"),
+        connected: prop_bool(props, "Connected"),
+    }
 }
 
 /// CLI: print adapter state.

@@ -40,6 +40,7 @@ pub async fn run_receiver(
     events: EventSink,
     _authorizer: Authorizer,
     _encryption: Encryption,
+    _pairing: Option<crate::identity::PairingManager>,
 ) -> ! {
     handle.mark_lost(REASON);
     events.send(crate::events::Event::Log(REASON.to_string()));

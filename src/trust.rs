@@ -41,10 +41,60 @@ pub enum TrustDecision {
     Block,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustEntry {
     pub name: String,
     pub decision: TrustDecision,
+    /// Ed25519 public key pinned during Kalo pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_key: Option<String>,
+    /// Outgoing ratchet: next chain key and the step it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_chain: Option<String>,
+    #[serde(default)]
+    pub send_step: u64,
+    /// Incoming ratchet, independent from the outgoing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_chain: Option<String>,
+    #[serde(default)]
+    pub recv_step: u64,
+}
+
+impl std::fmt::Debug for TrustEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustEntry")
+            .field("name", &self.name)
+            .field("decision", &self.decision)
+            .field(
+                "peer_key",
+                &self
+                    .peer_key
+                    .as_ref()
+                    .map(|_| "<pinned>")
+                    .unwrap_or("<none>"),
+            )
+            .field("send_chain", &self.send_chain.as_ref().map(|_| "<set>"))
+            .field("send_step", &self.send_step)
+            .field("recv_chain", &self.recv_chain.as_ref().map(|_| "<set>"))
+            .field("recv_step", &self.recv_step)
+            .finish()
+    }
+}
+
+/// One direction of a paired device's ratchet.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChainState {
+    pub key: [u8; 32],
+    pub step: u64,
+}
+
+impl std::fmt::Debug for ChainState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainState")
+            .field("key", &"<set>")
+            .field("step", &self.step)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -135,6 +185,11 @@ impl TrustStore {
                 TrustEntry {
                     name: "Pixel 8".into(),
                     decision: TrustDecision::Allow,
+                    peer_key: None,
+                    send_chain: None,
+                    send_step: 0,
+                    recv_chain: None,
+                    recv_step: 0,
                 },
             );
             data.devices.insert(
@@ -142,6 +197,11 @@ impl TrustStore {
                 TrustEntry {
                     name: "Studio laptop".into(),
                     decision: TrustDecision::Allow,
+                    peer_key: None,
+                    send_chain: None,
+                    send_step: 0,
+                    recv_chain: None,
+                    recv_step: 0,
                 },
             );
         }
@@ -190,13 +250,17 @@ impl TrustStore {
         let key = normalize_key(address);
         {
             let mut data = self.inner.data.lock().expect("trust lock");
-            data.devices.insert(
-                key,
-                TrustEntry {
-                    name: name.to_string(),
-                    decision,
-                },
-            );
+            let entry = data.devices.entry(key).or_insert_with(|| TrustEntry {
+                name: name.to_string(),
+                decision,
+                peer_key: None,
+                send_chain: None,
+                send_step: 0,
+                recv_chain: None,
+                recv_step: 0,
+            });
+            entry.name = name.to_string();
+            entry.decision = decision;
         }
         self.persist()
     }
@@ -212,6 +276,143 @@ impl TrustStore {
         self.persist()
     }
 
+    /// The full entry for a sender, including pinned keys. Callers must not
+    /// log the secret chain fields.
+    pub fn entry(&self, address: &str) -> Option<TrustEntry> {
+        let key = normalize_key(address);
+        self.inner
+            .data
+            .lock()
+            .expect("trust lock")
+            .devices
+            .get(&key)
+            .cloned()
+    }
+
+    /// A paired device has a pinned identity and both ratchet directions.
+    pub fn is_paired(&self, address: &str) -> bool {
+        self.entry(address).is_some_and(|entry| {
+            entry.decision == TrustDecision::Allow
+                && entry.peer_key.is_some()
+                && entry.send_chain.is_some()
+                && entry.recv_chain.is_some()
+        })
+    }
+
+    pub fn peer_public(&self, address: &str) -> Option<[u8; 32]> {
+        parse_key32(self.entry(address)?.peer_key.as_deref()?)
+    }
+
+    /// Outgoing chain state, or `None` when this is not a paired sender.
+    pub fn outgoing_chain(&self, address: &str) -> Option<ChainState> {
+        let entry = self.entry(address)?;
+        if entry.decision != TrustDecision::Allow {
+            return None;
+        }
+        Some(ChainState {
+            key: parse_key32(entry.send_chain.as_deref()?)?,
+            step: entry.send_step,
+        })
+    }
+
+    /// Incoming chain state, or `None` when this sender is not paired.
+    pub fn incoming_chain(&self, address: &str) -> Option<ChainState> {
+        let entry = self.entry(address)?;
+        if entry.decision != TrustDecision::Allow {
+            return None;
+        }
+        Some(ChainState {
+            key: parse_key32(entry.recv_chain.as_deref()?)?,
+            step: entry.recv_step,
+        })
+    }
+
+    /// Persist a newly completed pairing. The device is trusted in both
+    /// directions: the pairing itself proved possession of the passphrase and
+    /// of the advertised identity key, so no extra prompt is needed.
+    pub fn pin_peer(
+        &self,
+        address: &str,
+        name: &str,
+        peer_key: [u8; 32],
+        send_chain: [u8; 32],
+        recv_chain: [u8; 32],
+    ) -> Result<()> {
+        let key = normalize_key(address);
+        {
+            let mut data = self.inner.data.lock().expect("trust lock");
+            let entry = data.devices.entry(key).or_insert_with(|| TrustEntry {
+                name: name.to_string(),
+                decision: TrustDecision::Allow,
+                peer_key: None,
+                send_chain: None,
+                send_step: 0,
+                recv_chain: None,
+                recv_step: 0,
+            });
+            entry.name = name.to_string();
+            entry.decision = TrustDecision::Allow;
+            entry.peer_key = Some(hex::encode(peer_key));
+            entry.send_chain = Some(hex::encode(send_chain));
+            entry.send_step = 0;
+            entry.recv_chain = Some(hex::encode(recv_chain));
+            entry.recv_step = 0;
+        }
+        self.persist()
+    }
+
+    /// Advance the outgoing ratchet after one attempted send. `expected_step`
+    /// must still be current, so a concurrent or stale send cannot rewind the
+    /// chain.
+    pub fn commit_outgoing(&self, address: &str, expected_step: u64, next: [u8; 32]) -> Result<()> {
+        let key = normalize_key(address);
+        {
+            let mut data = self.inner.data.lock().expect("trust lock");
+            let entry = data
+                .devices
+                .get_mut(&key)
+                .context("the sender is no longer paired")?;
+            if entry.send_step != expected_step || entry.send_chain.is_none() {
+                anyhow::bail!("the outgoing key chain advanced concurrently; retry the send");
+            }
+            entry.send_chain = Some(hex::encode(next));
+            entry.send_step = expected_step + 1;
+        }
+        self.persist()
+    }
+
+    /// Advance the incoming ratchet after a container authenticated at
+    /// `expected_step`. Replays and stale completions are refused.
+    pub fn commit_incoming(&self, address: &str, expected_step: u64, next: [u8; 32]) -> Result<()> {
+        let key = normalize_key(address);
+        {
+            let mut data = self.inner.data.lock().expect("trust lock");
+            let entry = data
+                .devices
+                .get_mut(&key)
+                .context("the sender is no longer paired")?;
+            if entry.recv_step != expected_step || entry.recv_chain.is_none() {
+                anyhow::bail!("the incoming key chain advanced concurrently; retry the receive");
+            }
+            entry.recv_chain = Some(hex::encode(next));
+            entry.recv_step = expected_step + 1;
+        }
+        self.persist()
+    }
+
+    /// Find a paired device by the 8-byte key identifier carried in a peer
+    /// container. Recovery uses this when the Bluetooth address is unknown.
+    pub fn peer_by_key_id(&self, key_id: &[u8; 8]) -> Option<(String, TrustEntry)> {
+        self.entries().into_iter().find(|(_, entry)| {
+            entry.decision == TrustDecision::Allow
+                && entry
+                    .peer_key
+                    .as_deref()
+                    .and_then(parse_key32)
+                    .is_some_and(|key| crate::crypto::key_id(&key) == *key_id)
+        })
+    }
+
     fn persist(&self) -> Result<()> {
         let Some(path) = self.inner.path.as_deref() else {
             return Ok(());
@@ -225,6 +426,12 @@ impl TrustStore {
 /// cannot appear twice with different casing.
 pub fn normalize_key(address: &str) -> String {
     address.trim().to_ascii_uppercase()
+}
+
+/// Decode a 32-byte key from its lowercase/uppercase hex form.
+fn parse_key32(value: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(value).ok()?;
+    bytes.try_into().ok()
 }
 
 /// Display-name identities are weaker than a Bluetooth address. They are

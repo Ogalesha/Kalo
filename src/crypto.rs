@@ -29,13 +29,31 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::security;
 
-/// First eight bytes of every Kalo encrypted container.
+/// First eight bytes of every passphrase-encrypted Kalo container.
 pub const MAGIC: &[u8; 8] = b"KALOENC1";
+
+/// First eight bytes of a per-device (paired) Kalo container.
+pub const MAGIC2: &[u8; 8] = b"KALOENC2";
+
+/// Peer containers use a 60-byte prefix plus a 64-byte Ed25519 signature.
+const PEER_PREFIX: usize = 60;
+const PEER_HEADER: usize = PEER_PREFIX + 64;
+const PEER_VERSION: u8 = 2;
+const PEER_MODE_CHAIN: u8 = 1;
+/// How far a receiver may skip ahead in a peer ratchet. A sender advances
+/// once per attempted file, so skipped steps are normal; an unbounded gap
+/// would let an attacker make the receiver spin.
+pub const MAX_CHAIN_SKIP: u64 = 4096;
+const CHAIN_FILE_LABEL: &[u8] = b"Kalo chain file key v1";
+const CHAIN_NEXT_LABEL: &[u8] = b"Kalo chain advance v1";
 
 /// Prefix of the private temporary files used while decrypting. The receiver
 /// sweep deletes leftovers instead of treating them as received files.
@@ -180,6 +198,22 @@ impl Encryption {
             bail!("encryption is enabled but no passphrase is set");
         }
         Ok(Some(Encryptor::new(&passphrase)?))
+    }
+
+    /// The shared passphrase, used for SPAKE2 pairing. Callers must not log
+    /// or persist the returned value.
+    pub fn passphrase(&self) -> Option<Zeroizing<String>> {
+        let passphrase = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .passphrase
+            .clone();
+        if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase)
+        }
     }
 
     /// A decryptor is available whenever a passphrase is configured, even
@@ -648,6 +682,541 @@ impl Decryptor {
     }
 }
 
+/// Which authentication scheme a Kalo container uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// Shared-passphrase KALOENC1 container.
+    Passphrase,
+    /// Paired-device KALOENC2 container.
+    Peer,
+}
+
+/// Identifier of an Ed25519 identity inside a peer container.
+pub fn key_id(public: &[u8; 32]) -> [u8; 8] {
+    let digest = Sha256::digest(public);
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest[..8]);
+    id
+}
+
+/// Derive the per-file key for one ratchet step.
+fn chain_file_key(chain: &[u8; 32], step: u64) -> Zeroizing<[u8; 32]> {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(chain).expect("HMAC accepts any key length");
+    mac.update(CHAIN_FILE_LABEL);
+    mac.update(&step.to_le_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&digest);
+    key
+}
+
+/// Derive the next chain key. Keeping this one-way is what makes skipped or
+/// replayed files safe: an old key can never be recovered from a newer one.
+fn chain_next(chain: &[u8; 32], step: u64) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(chain).expect("HMAC accepts any key length");
+    mac.update(CHAIN_NEXT_LABEL);
+    mac.update(&step.to_le_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut next = [0u8; 32];
+    next.copy_from_slice(&digest);
+    next
+}
+
+/// Encrypts one file for a paired device. The caller owns the ratchet state
+/// and must persist [`PeerEncryptor::next_state`] after the attempt, even if
+/// encryption fails, because the sender is expected to burn the step.
+pub struct PeerEncryptor {
+    chain: Zeroizing<[u8; 32]>,
+    step: u64,
+    key_id: [u8; 8],
+    signing: SigningKey,
+    chunk_size: u32,
+}
+
+impl PeerEncryptor {
+    /// Build an encryptor from the current outgoing chain state and this
+    /// device's identity key.
+    pub fn new(chain: [u8; 32], step: u64, signing: SigningKey) -> Self {
+        let key_id = key_id(&signing.verifying_key().to_bytes());
+        Self {
+            chain: Zeroizing::new(chain),
+            step,
+            key_id,
+            signing,
+            chunk_size: CHUNK_SIZE,
+        }
+    }
+
+    /// State to persist after this file was attempted.
+    pub fn next_state(&self) -> ([u8; 32], u64) {
+        (
+            chain_next(&self.chain, self.step),
+            self.step.saturating_add(1),
+        )
+    }
+
+    /// Exact outer size for a plaintext file.
+    pub fn container_len(&self, plaintext: u64, name: &str) -> Result<u64> {
+        ensure!(
+            plaintext <= security::MAX_FILE_BYTES,
+            "the file is larger than the 4 GB OPP limit"
+        );
+        let name = normalized_name(name);
+        let metadata_plain = 12usize
+            .checked_add(name.len())
+            .context("encrypted filename is too long")?;
+        let metadata_cipher = metadata_plain
+            .checked_add(TAG_BYTES)
+            .context("encrypted metadata is too long")?;
+        ensure!(
+            metadata_cipher <= MAX_METADATA_BYTES,
+            "encrypted filename is too long"
+        );
+        let chunks = plaintext.div_ceil(self.chunk_size as u64);
+        let total = PEER_HEADER as u64
+            + metadata_cipher as u64
+            + chunks
+                .checked_mul(RECORD_OVERHEAD)
+                .context("encrypted size overflow")?
+            + plaintext
+            + RECORD_OVERHEAD;
+        ensure!(
+            total <= security::MAX_FILE_BYTES,
+            "adding encryption overhead would push the file over the 4 GB OPP limit"
+        );
+        Ok(total)
+    }
+
+    /// Encrypt `input` into `output`. The output must not exist. The header is
+    /// signed with this device's Ed25519 key so the receiver can attribute
+    /// the file to the paired identity, not just to a Bluetooth address.
+    pub fn encrypt_file(&self, input: &Path, output: &Path, name: &str) -> Result<u64> {
+        let metadata = std::fs::symlink_metadata(input)
+            .with_context(|| format!("inspect {}", input.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("{} is not a regular file", input.display());
+        }
+        let plaintext_size = metadata.len();
+        let name = normalized_name(name);
+        let expected = self.container_len(plaintext_size, &name)?;
+
+        let mut source =
+            BufReader::new(File::open(input).with_context(|| format!("open {}", input.display()))?);
+        let mut output_file = create_private_file(output)
+            .with_context(|| format!("create encrypted container {}", output.display()))?;
+
+        let result = (|| -> Result<()> {
+            let mut metadata_plain = Vec::with_capacity(12 + name.len());
+            metadata_plain.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            metadata_plain.extend_from_slice(name.as_bytes());
+            metadata_plain.extend_from_slice(&plaintext_size.to_le_bytes());
+
+            let metadata_nonce = random_nonce()?;
+            let prefix = peer_header_prefix(
+                self.chunk_size,
+                self.step,
+                self.key_id,
+                metadata_nonce,
+                metadata_plain.len() + TAG_BYTES,
+            );
+            let file_key = chain_file_key(&self.chain, self.step);
+            let cipher = XChaCha20Poly1305::new_from_slice(&file_key[..])
+                .map_err(|_| anyhow!("invalid encryption key length"))?;
+            let metadata_cipher = cipher
+                .encrypt(
+                    XNonce::from_slice(&metadata_nonce),
+                    Payload {
+                        msg: &metadata_plain,
+                        aad: &prefix,
+                    },
+                )
+                .map_err(|_| anyhow!("encrypt the file metadata"))?;
+
+            let mut signed = Vec::with_capacity(PEER_PREFIX + metadata_cipher.len());
+            signed.extend_from_slice(&prefix);
+            signed.extend_from_slice(&metadata_cipher);
+            let signature = self.signing.sign(&signed).to_bytes();
+            let mut header = [0u8; PEER_HEADER];
+            header[..PEER_PREFIX].copy_from_slice(&prefix);
+            header[PEER_PREFIX..].copy_from_slice(&signature);
+
+            let mut out = BufWriter::new(&mut output_file);
+            out.write_all(&header).context("write encrypted header")?;
+            out.write_all(&metadata_cipher)
+                .context("write encrypted metadata")?;
+
+            let mut buffer = vec![0u8; self.chunk_size as usize];
+            let mut index = 0u64;
+            let mut written = 0u64;
+            loop {
+                let mut filled = 0usize;
+                while filled < buffer.len() {
+                    let read = source
+                        .read(&mut buffer[filled..])
+                        .with_context(|| format!("read {}", input.display()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
+                }
+                if filled == 0 {
+                    break;
+                }
+                ensure!(
+                    written.saturating_add(filled as u64) <= plaintext_size,
+                    "the source file grew while it was being encrypted"
+                );
+                let length = filled as u32;
+                let nonce = random_nonce()?;
+                let chunk = cipher
+                    .encrypt(
+                        XNonce::from_slice(&nonce),
+                        Payload {
+                            msg: &buffer[..filled],
+                            aad: &chunk_aad(&header, index, length),
+                        },
+                    )
+                    .map_err(|_| anyhow!("encrypt file content"))?;
+                out.write_all(&length.to_le_bytes())
+                    .context("write encrypted chunk length")?;
+                out.write_all(&nonce)
+                    .context("write encrypted chunk nonce")?;
+                out.write_all(&chunk).context("write encrypted chunk")?;
+                written += filled as u64;
+                index += 1;
+            }
+            ensure!(
+                written == plaintext_size,
+                "the source file changed while it was being encrypted"
+            );
+
+            let nonce = random_nonce()?;
+            let end = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &[],
+                        aad: &end_aad(&header, index, written),
+                    },
+                )
+                .map_err(|_| anyhow!("seal the encrypted container"))?;
+            out.write_all(&END_MARKER.to_le_bytes())
+                .context("write encrypted end marker")?;
+            out.write_all(&nonce).context("write encrypted end nonce")?;
+            out.write_all(&end).context("write encrypted end record")?;
+            out.flush().context("flush encrypted container")?;
+            out.get_ref()
+                .sync_all()
+                .context("sync encrypted container")?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            drop(output_file);
+            let _ = std::fs::remove_file(output);
+            return Err(error);
+        }
+        drop(output_file);
+
+        let actual = std::fs::metadata(output)
+            .with_context(|| format!("inspect encrypted container {}", output.display()))?
+            .len();
+        ensure!(
+            actual == expected,
+            "encrypted container size changed unexpectedly"
+        );
+        Ok(actual)
+    }
+}
+
+/// A successfully decrypted peer container. The caller must persist the
+/// returned ratchet state before saving the file or reporting the transfer.
+#[derive(Debug)]
+pub struct PeerDecrypted {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub step: u64,
+    pub next_key: [u8; 32],
+}
+
+/// Decrypts a KALOENC2 container using a pinned peer identity and the current
+/// incoming ratchet state.
+pub struct PeerDecryptor {
+    chain: Zeroizing<[u8; 32]>,
+    step: u64,
+    peer: VerifyingKey,
+}
+
+impl PeerDecryptor {
+    pub fn new(chain: [u8; 32], step: u64, peer_public: [u8; 32]) -> Result<Self> {
+        let peer = VerifyingKey::from_bytes(&peer_public)
+            .map_err(|_| anyhow!("the paired device's public key is invalid"))?;
+        Ok(Self {
+            chain: Zeroizing::new(chain),
+            step,
+            peer,
+        })
+    }
+
+    pub fn decrypt_to_gated(
+        &self,
+        input: &Path,
+        dir: &Path,
+        gate: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<PeerDecrypted> {
+        let file_len = std::fs::metadata(input)
+            .with_context(|| format!("inspect encrypted container {}", input.display()))?
+            .len();
+        ensure!(
+            file_len <= security::MAX_FILE_BYTES,
+            "encrypted container exceeds the 4 GB OPP limit"
+        );
+        ensure!(
+            file_len >= (PEER_HEADER + TAG_BYTES) as u64,
+            "encrypted container is truncated"
+        );
+
+        let mut reader =
+            BufReader::new(File::open(input).with_context(|| format!("open {}", input.display()))?);
+        let mut header = [0u8; PEER_HEADER];
+        reader
+            .read_exact(&mut header)
+            .context("read encrypted header")?;
+        let parsed = parse_peer_header(&header)?;
+        ensure!(
+            parsed.key_id == key_id(&self.peer.to_bytes()),
+            "the encrypted file was signed by a different device identity"
+        );
+
+        let mut metadata_cipher = vec![0u8; parsed.metadata_len as usize];
+        reader
+            .read_exact(&mut metadata_cipher)
+            .context("read encrypted metadata")?;
+        let mut signed = Vec::with_capacity(PEER_PREFIX + metadata_cipher.len());
+        signed.extend_from_slice(&header[..PEER_PREFIX]);
+        signed.extend_from_slice(&metadata_cipher);
+        let signature =
+            Signature::from_bytes(&header[PEER_PREFIX..].try_into().expect("fixed slice"));
+        self.peer
+            .verify_strict(&signed, &signature)
+            .map_err(|_| anyhow!("the encrypted file signature is invalid"))?;
+
+        ensure!(
+            parsed.step >= self.step,
+            "the encrypted file is a replay from an older key-chain step"
+        );
+        ensure!(
+            parsed.step.saturating_sub(self.step) <= MAX_CHAIN_SKIP,
+            "the encrypted file is too far ahead in the key chain"
+        );
+
+        let mut chain = self.chain.clone();
+        let mut step = self.step;
+        while step < parsed.step {
+            chain = Zeroizing::new(chain_next(&chain, step));
+            step += 1;
+        }
+        let file_key = chain_file_key(&chain, step);
+        let cipher = XChaCha20Poly1305::new_from_slice(&file_key[..])
+            .map_err(|_| anyhow!("invalid encryption key length"))?;
+        let metadata_plain = cipher
+            .decrypt(
+                XNonce::from_slice(&parsed.metadata_nonce),
+                Payload {
+                    msg: &metadata_cipher,
+                    aad: &header[..PEER_PREFIX],
+                },
+            )
+            .map_err(|_| anyhow!("the encrypted file metadata failed authentication"))?;
+        let (name, plaintext_size) = parse_metadata(&metadata_plain)?;
+        gate(plaintext_size)?;
+
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create decryption directory {}", dir.display()))?;
+        security::create_private_dir(dir)
+            .with_context(|| format!("secure decryption directory {}", dir.display()))?;
+        let output_path = dir.join(format!(
+            "{DECRYPT_TEMP_PREFIX}{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        let output_file = create_private_file(&output_path)
+            .with_context(|| format!("create decrypted file {}", output_path.display()))?;
+
+        let result = (|| -> Result<()> {
+            let mut out = BufWriter::new(output_file);
+            let mut total = 0u64;
+            let mut index = 0u64;
+            let mut short_chunk = false;
+            loop {
+                let mut length_bytes = [0u8; 4];
+                reader
+                    .read_exact(&mut length_bytes)
+                    .context("encrypted container ended before its final record")?;
+                let length = u32::from_le_bytes(length_bytes);
+                if length == END_MARKER {
+                    let mut nonce = [0u8; NONCE_BYTES];
+                    let mut tag = [0u8; TAG_BYTES];
+                    reader
+                        .read_exact(&mut nonce)
+                        .context("read encrypted final nonce")?;
+                    reader
+                        .read_exact(&mut tag)
+                        .context("read encrypted final tag")?;
+                    ensure!(
+                        total == plaintext_size,
+                        "encrypted file size does not match its metadata"
+                    );
+                    let end = cipher
+                        .decrypt(
+                            XNonce::from_slice(&nonce),
+                            Payload {
+                                msg: &tag,
+                                aad: &end_aad(&header, index, total),
+                            },
+                        )
+                        .map_err(|_| anyhow!("encrypted container failed authentication"))?;
+                    ensure!(end.is_empty(), "encrypted final record is not empty");
+                    let mut trailing = [0u8; 1];
+                    ensure!(
+                        reader.read(&mut trailing).context("read trailing data")? == 0,
+                        "encrypted container has trailing data"
+                    );
+                    break;
+                }
+                ensure!(
+                    length <= parsed.chunk_size,
+                    "encrypted chunk is larger than its header allows"
+                );
+                ensure!(
+                    !short_chunk,
+                    "encrypted container has data after a short chunk"
+                );
+                ensure!(
+                    total.saturating_add(length as u64) <= plaintext_size,
+                    "encrypted file is larger than its metadata says"
+                );
+                let mut nonce = [0u8; NONCE_BYTES];
+                let mut ciphertext = vec![0u8; length as usize + TAG_BYTES];
+                reader
+                    .read_exact(&mut nonce)
+                    .context("read encrypted chunk nonce")?;
+                reader
+                    .read_exact(&mut ciphertext)
+                    .with_context(|| format!("read encrypted chunk {index}"))?;
+                let plaintext = Zeroizing::new(
+                    cipher
+                        .decrypt(
+                            XNonce::from_slice(&nonce),
+                            Payload {
+                                msg: &ciphertext,
+                                aad: &chunk_aad(&header, index, length),
+                            },
+                        )
+                        .map_err(|_| anyhow!("encrypted container failed authentication"))?,
+                );
+                ensure!(
+                    plaintext.len() == length as usize,
+                    "encrypted chunk length mismatch"
+                );
+                out.write_all(&plaintext)
+                    .with_context(|| format!("write decrypted file {}", output_path.display()))?;
+                total += length as u64;
+                index += 1;
+                short_chunk = length < parsed.chunk_size;
+            }
+            ensure!(
+                total == plaintext_size,
+                "encrypted file size does not match its metadata"
+            );
+            out.flush().context("flush decrypted file")?;
+            out.get_ref().sync_all().context("sync decrypted file")?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error);
+        }
+
+        Ok(PeerDecrypted {
+            path: output_path,
+            name,
+            size: plaintext_size,
+            step,
+            next_key: chain_next(&chain, step),
+        })
+    }
+}
+
+struct PeerHeader {
+    chunk_size: u32,
+    step: u64,
+    key_id: [u8; 8],
+    metadata_nonce: [u8; NONCE_BYTES],
+    metadata_len: u32,
+}
+
+fn peer_header_prefix(
+    chunk_size: u32,
+    step: u64,
+    key_id: [u8; 8],
+    metadata_nonce: [u8; NONCE_BYTES],
+    metadata_len: usize,
+) -> [u8; PEER_PREFIX] {
+    let mut header = [0u8; PEER_PREFIX];
+    header[..8].copy_from_slice(MAGIC2);
+    header[8] = PEER_VERSION;
+    header[9] = PEER_MODE_CHAIN;
+    header[12..16].copy_from_slice(&chunk_size.to_le_bytes());
+    header[16..24].copy_from_slice(&step.to_le_bytes());
+    header[24..32].copy_from_slice(&key_id);
+    header[32..56].copy_from_slice(&metadata_nonce);
+    header[56..60].copy_from_slice(&(metadata_len as u32).to_le_bytes());
+    header
+}
+
+fn parse_peer_header(header: &[u8; PEER_HEADER]) -> Result<PeerHeader> {
+    ensure!(&header[..8] == MAGIC2, "not a paired Kalo container");
+    ensure!(
+        header[8] == PEER_VERSION,
+        "unsupported paired Kalo container version {}",
+        header[8]
+    );
+    ensure!(
+        header[9] == PEER_MODE_CHAIN,
+        "unsupported paired Kalo container mode"
+    );
+    ensure!(
+        header[10..12] == [0, 0],
+        "unsupported paired Kalo container flags"
+    );
+    let chunk_size = u32::from_le_bytes(header[12..16].try_into().expect("fixed slice"));
+    ensure!(
+        (MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&chunk_size),
+        "paired container asks for an unsupported chunk size"
+    );
+    let step = u64::from_le_bytes(header[16..24].try_into().expect("fixed slice"));
+    let mut key_id = [0u8; 8];
+    key_id.copy_from_slice(&header[24..32]);
+    let mut metadata_nonce = [0u8; NONCE_BYTES];
+    metadata_nonce.copy_from_slice(&header[32..56]);
+    let metadata_len = u32::from_le_bytes(header[56..60].try_into().expect("fixed slice"));
+    ensure!(
+        metadata_len as usize >= TAG_BYTES && metadata_len as usize <= MAX_METADATA_BYTES,
+        "paired container metadata length is invalid"
+    );
+    Ok(PeerHeader {
+        chunk_size,
+        step,
+        key_id,
+        metadata_nonce,
+        metadata_len,
+    })
+}
+
 #[derive(Default)]
 struct KeyCache {
     entries: Vec<CacheEntry>,
@@ -772,7 +1341,7 @@ fn parse_metadata(metadata: &[u8]) -> Result<(String, u64)> {
     Ok((name, size))
 }
 
-fn chunk_aad(header: &[u8; HEADER_PREFIX], index: u64, length: u32) -> Vec<u8> {
+fn chunk_aad(header: &[u8], index: u64, length: u32) -> Vec<u8> {
     let mut aad = Vec::with_capacity(1 + HEADER_PREFIX + 12);
     aad.push(b'c');
     aad.extend_from_slice(header);
@@ -781,7 +1350,7 @@ fn chunk_aad(header: &[u8; HEADER_PREFIX], index: u64, length: u32) -> Vec<u8> {
     aad
 }
 
-fn end_aad(header: &[u8; HEADER_PREFIX], chunks: u64, total: u64) -> Vec<u8> {
+fn end_aad(header: &[u8], chunks: u64, total: u64) -> Vec<u8> {
     let mut aad = Vec::with_capacity(1 + HEADER_PREFIX + 16);
     aad.push(b'e');
     aad.extend_from_slice(header);
@@ -856,8 +1425,8 @@ fn create_private_file(path: &Path) -> Result<File> {
         .with_context(|| format!("create {}", path.display()))
 }
 
-/// Detect the container magic before deciding how to save an incoming file.
-pub fn is_container(path: &Path) -> Result<bool> {
+/// Read the first eight bytes of a file without failing on short files.
+fn read_magic(path: &Path) -> Result<Option<[u8; 8]>> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut magic = [0u8; 8];
     let mut read = 0;
@@ -866,11 +1435,35 @@ pub fn is_container(path: &Path) -> Result<bool> {
             .read(&mut magic[read..])
             .with_context(|| format!("read {}", path.display()))?;
         if count == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         read += count;
     }
-    Ok(&magic == MAGIC)
+    Ok(Some(magic))
+}
+
+/// Detect which Kalo container (if any) an incoming file uses.
+pub fn container_kind(path: &Path) -> Result<Option<ContainerKind>> {
+    match read_magic(path)? {
+        Some(magic) if &magic == MAGIC => Ok(Some(ContainerKind::Passphrase)),
+        Some(magic) if &magic == MAGIC2 => Ok(Some(ContainerKind::Peer)),
+        _ => Ok(None),
+    }
+}
+
+/// The pinned-identity identifier carried by a KALOENC2 header, used by the
+/// recovery sweep when the Bluetooth sender address is no longer known.
+pub fn peer_key_id(path: &Path) -> Result<Option<[u8; 8]>> {
+    if container_kind(path)? != Some(ContainerKind::Peer) {
+        return Ok(None);
+    }
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut prefix = [0u8; PEER_PREFIX];
+    file.read_exact(&mut prefix)
+        .context("read paired container header")?;
+    let mut key_id = [0u8; 8];
+    key_id.copy_from_slice(&prefix[24..32]);
+    Ok(Some(key_id))
 }
 
 /// A random, non-identifying container name in a private temp directory.
@@ -1029,7 +1622,7 @@ mod tests {
         let dir = temp_dir();
         let plain = dir.join("plain.txt");
         std::fs::write(&plain, b"just a file").unwrap();
-        assert!(!is_container(&plain).unwrap());
+        assert!(container_kind(&plain).unwrap().is_none());
 
         let input = dir.join("input.bin");
         std::fs::write(&input, b"secret").unwrap();
@@ -1037,7 +1630,10 @@ mod tests {
         encryptor()
             .encrypt_file(&input, &container, "secret.txt")
             .unwrap();
-        assert!(is_container(&container).unwrap());
+        assert!(matches!(
+            container_kind(&container).unwrap(),
+            Some(ContainerKind::Passphrase)
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1070,6 +1666,163 @@ mod tests {
         assert_eq!(seen, Some(6));
         assert!(format!("{error:#}").contains("deliberately no room"));
         assert!(!out.exists(), "no plaintext directory should be created");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn peer_signing() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn peer_chain(encryptor: &PeerEncryptor, input: &Path, output: &Path, name: &str) -> u64 {
+        encryptor.encrypt_file(input, output, name).unwrap()
+    }
+
+    #[test]
+    fn peer_containers_round_trip_and_advance_the_chain() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let chain = [9u8; 32];
+        let encryptor = PeerEncryptor::new(chain, 0, signing.clone());
+        let first = dir.join("first.bin");
+        let second = dir.join("second.bin");
+        std::fs::write(&first, b"first file").unwrap();
+        std::fs::write(&second, vec![3u8; MIN_CHUNK_SIZE as usize + 9]).unwrap();
+        let container1 = dir.join("one.kalo");
+        let container2 = dir.join("two.kalo");
+        peer_chain(&encryptor, &first, &container1, "first.txt");
+
+        assert_eq!(
+            container_kind(&container1).unwrap(),
+            Some(ContainerKind::Peer)
+        );
+        assert_eq!(
+            peer_key_id(&container1).unwrap(),
+            Some(key_id(&signing.verifying_key().to_bytes()))
+        );
+
+        let decryptor = PeerDecryptor::new(chain, 0, signing.verifying_key().to_bytes()).unwrap();
+        let decoded = decryptor
+            .decrypt_to_gated(&container1, &dir.join("out1"), |_| Ok(()))
+            .unwrap();
+        assert_eq!(decoded.name, "first.txt");
+        assert_eq!(decoded.step, 0);
+        assert_eq!(std::fs::read(&decoded.path).unwrap(), b"first file");
+        std::fs::remove_file(&decoded.path).unwrap();
+
+        // The sender burns step 0 and uses step 1 for the next file.
+        let (next_chain, next_step) = encryptor.next_state();
+        let encryptor2 = PeerEncryptor::new(next_chain, next_step, signing.clone());
+        peer_chain(&encryptor2, &second, &container2, "second.txt");
+        let decryptor = PeerDecryptor::new(
+            decoded.next_key,
+            decoded.step + 1,
+            signing.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let decoded = decryptor
+            .decrypt_to_gated(&container2, &dir.join("out2"), |_| Ok(()))
+            .unwrap();
+        assert_eq!(decoded.name, "second.txt");
+        assert_eq!(decoded.step, 1);
+        assert_eq!(
+            std::fs::read(&decoded.path).unwrap(),
+            vec![3u8; MIN_CHUNK_SIZE as usize + 9]
+        );
+        std::fs::remove_file(&decoded.path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_containers_reject_the_wrong_identity_and_tampering() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let chain = [4u8; 32];
+        let input = dir.join("input.bin");
+        std::fs::write(&input, b"payload").unwrap();
+        let container = dir.join("peer.kalo");
+        let encryptor = PeerEncryptor::new(chain, 0, signing.clone());
+        encryptor
+            .encrypt_file(&input, &container, "payload.txt")
+            .unwrap();
+
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        let wrong = PeerDecryptor::new(chain, 0, other.verifying_key().to_bytes()).unwrap();
+        assert!(
+            wrong
+                .decrypt_to_gated(&container, &dir.join("out"), |_| Ok(()))
+                .is_err()
+        );
+
+        let mut bytes = std::fs::read(&container).unwrap();
+        bytes[PEER_PREFIX - 1] ^= 0x01;
+        std::fs::write(&container, &bytes).unwrap();
+        let decryptor = PeerDecryptor::new(chain, 0, signing.verifying_key().to_bytes()).unwrap();
+        assert!(
+            decryptor
+                .decrypt_to_gated(&container, &dir.join("out"), |_| Ok(()))
+                .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_containers_reject_replays_and_far_future_steps() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let input = dir.join("input.bin");
+        std::fs::write(&input, b"payload").unwrap();
+        let container = dir.join("step0.kalo");
+        PeerEncryptor::new([5u8; 32], 0, signing.clone())
+            .encrypt_file(&input, &container, "payload.txt")
+            .unwrap();
+
+        // A receiver that already consumed step 0 must reject the replay.
+        let chain_after = {
+            let encryptor = PeerEncryptor::new([5u8; 32], 0, signing.clone());
+            encryptor.next_state().0
+        };
+        let replay =
+            PeerDecryptor::new(chain_after, 1, signing.verifying_key().to_bytes()).unwrap();
+        let error = replay
+            .decrypt_to_gated(&container, &dir.join("out"), |_| Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("replay"), "{error:#}");
+
+        let far = dir.join("far.kalo");
+        PeerEncryptor::new([5u8; 32], MAX_CHAIN_SKIP + 1, signing.clone())
+            .encrypt_file(&input, &far, "payload.txt")
+            .unwrap();
+        let decryptor =
+            PeerDecryptor::new([5u8; 32], 0, signing.verifying_key().to_bytes()).unwrap();
+        let error = decryptor
+            .decrypt_to_gated(&far, &dir.join("out"), |_| Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("too far"), "{error:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_decryption_gates_the_authenticated_size_before_plaintext() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let input = dir.join("input.bin");
+        std::fs::write(&input, b"secret").unwrap();
+        let container = dir.join("peer.kalo");
+        PeerEncryptor::new([6u8; 32], 0, signing.clone())
+            .encrypt_file(&input, &container, "secret.txt")
+            .unwrap();
+        let out = dir.join("out");
+        let mut seen = None;
+        let error = PeerDecryptor::new([6u8; 32], 0, signing.verifying_key().to_bytes())
+            .unwrap()
+            .decrypt_to_gated(&container, &out, |size| {
+                seen = Some(size);
+                Err(anyhow!("deliberately no room"))
+            })
+            .unwrap_err();
+        assert_eq!(seen, Some(6));
+        assert!(format!("{error:#}").contains("deliberately no room"));
+        assert!(!out.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

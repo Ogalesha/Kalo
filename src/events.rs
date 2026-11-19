@@ -148,6 +148,14 @@ pub enum Event {
     },
     /// State of the receiver (OBEX agent).
     ReceiverState(ReceiverStatus),
+    /// A Kalo pairing completed or failed. `ok` is false for an expected
+    /// protocol error; the message is safe to show and never contains keys.
+    Pairing {
+        address: String,
+        name: String,
+        ok: bool,
+        message: String,
+    },
 }
 
 /// Fan-out sink for background events. A broadcast channel lets the UI

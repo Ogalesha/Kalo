@@ -6,6 +6,7 @@
 //! - `app`      — Iced UI (devices, send, receiver state, log)
 //! - `crypto`   — optional Kalo-to-Kalo authenticated file encryption
 //! - `events`   — shared event bus between background work and the UI
+//! - `identity` — device identity, SPAKE2 pairing and reciprocal trust
 //! - `sanitize` — filename safety for untrusted names
 //! - `security` — malware-hash checks, private files, free-space policy
 //! - `selection` — multi-file and folder send selection
@@ -34,6 +35,7 @@ mod app;
 mod bluez;
 mod crypto;
 mod events;
+mod identity;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "linux")]
@@ -147,6 +149,21 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
             );
             let events = events::EventSink::new(256);
             let mut rx = events.subscribe();
+            let (trust, trust_warning) = trust::TrustStore::load();
+            if let Some(warning) = trust_warning {
+                eprintln!("warning: {warning}");
+            }
+            let pairing = match identity::DeviceIdentity::load_or_create() {
+                Ok(identity) => Some(identity::PairingManager::new(
+                    identity,
+                    trust.clone(),
+                    events.clone(),
+                )),
+                Err(error) => {
+                    eprintln!("warning: paired-device encryption is unavailable: {error:#}");
+                    None
+                }
+            };
             let printer = tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
@@ -174,8 +191,17 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
                 }
             });
             let (_cancel_handle, cancel) = transfer::Cancel::new();
-            let summary =
-                platform::send(&mac, &selection.files, &events, 0, cancel, &encryption).await;
+            let summary = platform::send(
+                &mac,
+                &selection.files,
+                &events,
+                0,
+                cancel,
+                &encryption,
+                &trust,
+                pairing.as_ref(),
+            )
+            .await;
             drop(events);
             let _ = printer.await;
             match summary {

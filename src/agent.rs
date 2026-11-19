@@ -62,6 +62,9 @@ pub struct PendingTransfer {
     pub name: String,
     /// Remote device address, for logs and events.
     pub sender: String,
+    /// Friendly sender name, resolved from BlueZ when available. Used only to
+    /// choose the per-sender save folder; the address remains the identity.
+    pub sender_label: String,
     /// Size announced by the sender, when present.
     pub size: Option<u64>,
     pub path: String,
@@ -78,6 +81,8 @@ pub struct PendingTransfer {
     /// per-status stall policy uses these clocks.
     pub last_status: Option<String>,
     pub status_since: Instant,
+    /// Pairing protocol object: never shown as a file and never saved.
+    pub control: bool,
 }
 
 /// Shared registry of in-flight incoming transfers.
@@ -157,6 +162,7 @@ pub struct AgentService {
     registration: u64,
     authorizer: Authorizer,
     save_dir: SaveDir,
+    pairing: Option<crate::identity::PairingManager>,
 }
 
 #[interface(name = "org.bluez.obex.Agent1")]
@@ -204,6 +210,7 @@ impl AgentService {
                 .unwrap_or_default()
         };
         let safe_name = sanitize::filename(&base);
+        let control = crate::identity::looks_like_pairing_name(&base);
 
         let session = t.session().await.context("Transfer1.Session")?;
         let session_props = SessionPropsProxy::builder(&self.conn)
@@ -218,6 +225,11 @@ impl AgentService {
         if sender.trim().is_empty() || sender == "unknown" {
             bail!("cannot identify the sender");
         }
+        // Resolve a friendly alias for the per-sender save folder. Failure is
+        // not fatal: the normalized address is still a safe folder name.
+        let sender_label = crate::bluez::device_alias(&self.conn, &sender)
+            .await
+            .unwrap_or_else(|| sender.clone());
         let root = session_props
             .root()
             .await
@@ -225,6 +237,21 @@ impl AgentService {
         let size = t.size().await.ok();
 
         let id = Uuid::new_v4().simple().to_string();
+        if control {
+            // Pairing control objects are authenticated by SPAKE2 and the
+            // identity signatures, never saved, and never trusted on their
+            // own. They bypass the file prompt so two devices can pair, but
+            // they still respect the concurrency and size caps below.
+            if self.pairing.is_none() {
+                bail!("this Kalo installation cannot process pairing objects");
+            }
+            if !crate::trust::is_stable_key(&sender) {
+                bail!("pairing requires a stable Bluetooth address");
+            }
+            if size.is_some_and(|size| size > crate::identity::MAX_PAIR_BYTES) {
+                bail!("the pairing object is larger than the protocol allows");
+            }
+        }
         if let Err(error) = self.accept_capacity(size) {
             let reason = format!("{error:#}");
             self.events.send(Event::IncomingFailed {
@@ -236,10 +263,11 @@ impl AgentService {
             });
             bail!("{reason}");
         }
-        if let Err(reason) = self
-            .authorizer
-            .authorize(&id, &sender, &sender, &safe_name, size)
-            .await
+        if !control
+            && let Err(reason) = self
+                .authorizer
+                .authorize(&id, &sender, &sender, &safe_name, size)
+                .await
         {
             self.events.send(Event::IncomingFailed {
                 id,
@@ -280,6 +308,7 @@ impl AgentService {
                 id: id.clone(),
                 name: safe_name.clone(),
                 sender: sender.clone(),
+                sender_label,
                 size,
                 path: transfer.to_string(),
                 dest: dest.clone(),
@@ -290,14 +319,21 @@ impl AgentService {
                 last_transferred: 0,
                 last_status: None,
                 status_since: Instant::now(),
+                control,
             });
 
-        self.events.send(Event::IncomingStarted {
-            id,
-            sender,
-            name: safe_name,
-            size,
-        });
+        if control {
+            self.events.send(Event::Log(format!(
+                "pairing object from {sender}; processing it without saving"
+            )));
+        } else {
+            self.events.send(Event::IncomingStarted {
+                id,
+                sender,
+                name: safe_name,
+                size,
+            });
+        }
         Ok(dest)
     }
 
@@ -346,7 +382,12 @@ const STAGING_STALE_AGE: Duration = INCOMING_STALL_TIMEOUT;
 /// remove the now-empty `kalo-*` directories.
 ///
 /// The supervisor runs this after registration and periodically afterwards.
-fn sweep_staging(save_dir: &SaveDir, events: &EventSink, encryption: &Encryption) {
+fn sweep_staging(
+    save_dir: &SaveDir,
+    events: &EventSink,
+    encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
+) {
     let downloads = save_dir.get();
     let recovered = sweep_stale_staging(
         &staging_root(),
@@ -354,6 +395,7 @@ fn sweep_staging(save_dir: &SaveDir, events: &EventSink, encryption: &Encryption
         STAGING_STALE_AGE,
         events,
         encryption,
+        pairing,
     );
     if recovered > 0 {
         events.send(Event::Log(format!(
@@ -370,6 +412,7 @@ fn sweep_stale_staging(
     min_age: Duration,
     events: &EventSink,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -392,7 +435,7 @@ fn sweep_stale_staging(
         if !stale {
             continue;
         }
-        recovered += recover_staging_dir(&entry.path(), downloads, events, encryption);
+        recovered += recover_staging_dir(&entry.path(), downloads, events, encryption, pairing);
     }
     recovered
 }
@@ -421,6 +464,7 @@ fn recover_staging_dir(
     downloads: &Path,
     events: &EventSink,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -434,10 +478,8 @@ fn recover_staging_dir(
             continue;
         }
         let file_name = entry.file_name();
-        if file_name
-            .to_string_lossy()
-            .starts_with(crypto::DECRYPT_TEMP_PREFIX)
-        {
+        let file_label = file_name.to_string_lossy();
+        if file_label.starts_with(crypto::DECRYPT_TEMP_PREFIX) {
             let _ = std::fs::remove_file(entry.path());
             events.send(Event::Log(format!(
                 "removed a stale decrypted temporary file at {:?}",
@@ -445,13 +487,28 @@ fn recover_staging_dir(
             )));
             continue;
         }
-        match crypto::is_container(&entry.path()) {
-            Ok(true) => {
-                recovered +=
-                    recover_encrypted_staged(&entry.path(), dir, downloads, events, encryption);
+        if crate::identity::looks_like_pairing_name(&file_label) {
+            let _ = std::fs::remove_file(entry.path());
+            events.send(Event::Log(format!(
+                "removed a stale pairing object at {:?}",
+                entry.path()
+            )));
+            continue;
+        }
+        match crypto::container_kind(&entry.path()) {
+            Ok(Some(kind)) => {
+                recovered += recover_encrypted_staged(
+                    &entry.path(),
+                    dir,
+                    downloads,
+                    events,
+                    encryption,
+                    kind,
+                    pairing,
+                );
                 continue;
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => {
                 events.send(Event::Log(format!(
                     "left a stale staged file with unreadable headers at {:?}: {error:#}",
@@ -480,14 +537,15 @@ fn recover_staging_dir(
                 continue;
             }
         }
-        if let Err(e) = std::fs::create_dir_all(downloads) {
+        let recovered_dir = sanitize::sender_dir(downloads, "Recovered");
+        if let Err(e) = std::fs::create_dir_all(&recovered_dir) {
             events.send(Event::Log(format!(
                 "cannot recover staged files into {downloads:?}: {e}"
             )));
             break;
         }
         let name = sanitize::filename(&entry.file_name().to_string_lossy());
-        let mut dest = sanitize::unique_in_dir(downloads, &name);
+        let mut dest = sanitize::unique_in_dir(&recovered_dir, &name);
         loop {
             match sanitize::move_file(&entry.path(), &dest) {
                 Ok(()) => {
@@ -501,7 +559,7 @@ fn recover_staging_dir(
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    dest = sanitize::unique_in_dir(downloads, &name);
+                    dest = sanitize::unique_in_dir(&recovered_dir, &name);
                 }
                 Err(e) => {
                     events.send(Event::Log(format!(
@@ -532,38 +590,120 @@ fn recover_encrypted_staged(
     downloads: &Path,
     events: &EventSink,
     encryption: &Encryption,
+    kind: crypto::ContainerKind,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> usize {
-    let Some(decryptor) = encryption.decryptor() else {
-        let _ = std::fs::remove_file(container);
-        events.send(Event::Log(format!(
-            "deleted a stale encrypted container at {:?}: no passphrase is configured",
-            container
-        )));
-        return 0;
-    };
     let mut out_of_space = false;
-    let decrypted = match decryptor.decrypt_to_gated(container, staging_dir, |size| {
-        match security::ensure_free_space(staging_dir, Some(size)) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                out_of_space = true;
-                Err(error.context("make room for the decrypted file in staging"))
+    let gate = |size: u64| match security::ensure_free_space(staging_dir, Some(size)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            out_of_space = true;
+            Err(error.context("make room for the decrypted file in staging"))
+        }
+    };
+
+    let decrypted: crypto::Decrypted = match kind {
+        crypto::ContainerKind::Passphrase => {
+            let Some(decryptor) = encryption.decryptor() else {
+                let _ = std::fs::remove_file(container);
+                events.send(Event::Log(format!(
+                    "deleted a stale encrypted container at {:?}: no passphrase is configured",
+                    container
+                )));
+                return 0;
+            };
+            match decryptor.decrypt_to_gated(container, staging_dir, gate) {
+                Ok(decrypted) => decrypted,
+                Err(error) if out_of_space => {
+                    events.send(Event::Log(format!(
+                        "cannot recover a stale encrypted file yet: {error:#}"
+                    )));
+                    return 0;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(container);
+                    events.send(Event::Log(format!(
+                        "deleted a stale encrypted container that could not be decrypted: {error:#}"
+                    )));
+                    return 0;
+                }
             }
         }
-    }) {
-        Ok(decrypted) => decrypted,
-        Err(error) if out_of_space => {
-            events.send(Event::Log(format!(
-                "cannot recover a stale encrypted file yet: {error:#}"
-            )));
-            return 0;
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(container);
-            events.send(Event::Log(format!(
-                "deleted a stale encrypted container that could not be decrypted: {error:#}"
-            )));
-            return 0;
+        crypto::ContainerKind::Peer => {
+            let Some(pairing) = pairing else {
+                events.send(Event::Log(format!(
+                    "kept a stale paired-device container at {:?}: pairing is unavailable",
+                    container
+                )));
+                return 0;
+            };
+            let selected = crypto::peer_key_id(container)
+                .ok()
+                .flatten()
+                .and_then(|key_id| pairing.trust().peer_by_key_id(&key_id))
+                .and_then(|(address, _)| {
+                    pairing
+                        .trust()
+                        .incoming_chain(&address)
+                        .zip(pairing.trust().peer_public(&address))
+                        .map(|(chain, public)| (address, chain, public))
+                });
+            let Some((address, chain, public)) = selected else {
+                let _ = std::fs::remove_file(container);
+                events.send(Event::Log(format!(
+                    "deleted a stale paired-device container at {:?}: the sending device is \
+                     no longer paired",
+                    container
+                )));
+                return 0;
+            };
+            let decryptor = match crypto::PeerDecryptor::new(chain.key, chain.step, public) {
+                Ok(decryptor) => decryptor,
+                Err(error) => {
+                    let _ = std::fs::remove_file(container);
+                    events.send(Event::Log(format!(
+                        "deleted a stale paired-device container with an invalid pinned \
+                         identity: {error:#}"
+                    )));
+                    return 0;
+                }
+            };
+            match decryptor.decrypt_to_gated(container, staging_dir, gate) {
+                Ok(decrypted) => {
+                    if let Err(error) = pairing.trust().commit_incoming(
+                        &address,
+                        decrypted.step,
+                        decrypted.next_key,
+                    ) {
+                        let _ = std::fs::remove_file(&decrypted.path);
+                        let _ = std::fs::remove_file(container);
+                        events.send(Event::Log(format!(
+                            "deleted a stale paired-device container because its key chain \
+                             could not be saved: {error:#}"
+                        )));
+                        return 0;
+                    }
+                    crypto::Decrypted {
+                        path: decrypted.path,
+                        name: decrypted.name,
+                        size: decrypted.size,
+                    }
+                }
+                Err(error) if out_of_space => {
+                    events.send(Event::Log(format!(
+                        "cannot recover a stale paired-device file yet: {error:#}"
+                    )));
+                    return 0;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(container);
+                    events.send(Event::Log(format!(
+                        "deleted a stale paired-device container that could not be decrypted: \
+                         {error:#}"
+                    )));
+                    return 0;
+                }
+            }
         }
     };
     let name = sanitize::filename(&decrypted.name);
@@ -590,18 +730,19 @@ fn recover_encrypted_staged(
             return 0;
         }
     }
-    if let Err(error) = std::fs::create_dir_all(downloads)
-        .with_context(|| format!("create Downloads dir {downloads:?}"))
-        .and_then(|()| security::ensure_free_space(downloads, Some(decrypted.size)))
+    let recovered_dir = sanitize::sender_dir(downloads, "Recovered");
+    if let Err(error) = std::fs::create_dir_all(&recovered_dir)
+        .with_context(|| format!("create recovered folder {recovered_dir:?}"))
+        .and_then(|()| security::ensure_free_space(&recovered_dir, Some(decrypted.size)))
     {
         let _ = std::fs::remove_file(&decrypted.path);
         events.send(Event::Log(format!(
-            "cannot recover an encrypted file into {downloads:?}: {error:#}"
+            "cannot recover an encrypted file into {recovered_dir:?}: {error:#}"
         )));
         return 0;
     }
 
-    let mut dest = sanitize::unique_in_dir(downloads, &name);
+    let mut dest = sanitize::unique_in_dir(&recovered_dir, &name);
     loop {
         match sanitize::move_file(&decrypted.path, &dest) {
             Ok(()) => {
@@ -619,7 +760,7 @@ fn recover_encrypted_staged(
                 return 1;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                dest = sanitize::unique_in_dir(downloads, &name);
+                dest = sanitize::unique_in_dir(&recovered_dir, &name);
             }
             Err(error) => {
                 let _ = std::fs::remove_file(&decrypted.path);
@@ -793,13 +934,14 @@ fn handle_object_gone(
     events: &EventSink,
     reason: impl Into<String>,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) {
     if p.dest.exists() {
         events.send(Event::Log(format!(
             "{}: transfer object disappeared; recovering staged file",
             p.dest.display()
         )));
-        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption) {
+        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption, pairing) {
             fail(
                 events,
                 p,
@@ -822,13 +964,14 @@ fn recover_failed_transfer(
     events: &EventSink,
     error: &str,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) {
     if p.dest.exists() {
         events.send(Event::Log(format!(
             "{}: {error}; keeping the staged partial file",
             p.dest.display()
         )));
-        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption) {
+        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption, pairing) {
             fail(
                 events,
                 p,
@@ -880,6 +1023,7 @@ pub async fn poll_pending(
     save_dir: &SaveDir,
     events: &EventSink,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) {
     let list = pending.lock().expect("pending lock").clone();
     if list.is_empty() {
@@ -909,6 +1053,7 @@ pub async fn poll_pending(
                 events,
                 &format!("not enough free disk space for the incoming file: {error:#}"),
                 encryption,
+                pairing,
             );
             finished.push(p.id.clone());
             continue;
@@ -932,6 +1077,7 @@ pub async fn poll_pending(
                         events,
                         format!("transfer object unavailable: {e}"),
                         encryption,
+                        pairing,
                     );
                     finished.push(p.id.clone());
                     continue;
@@ -953,6 +1099,7 @@ pub async fn poll_pending(
                     events,
                     format!("transfer object unavailable: {e}"),
                     encryption,
+                    pairing,
                 );
                 finished.push(p.id.clone());
                 continue;
@@ -980,6 +1127,7 @@ pub async fn poll_pending(
                     events,
                     format!("transfer object disappeared before completion: {e}"),
                     encryption,
+                    pairing,
                 );
                 finished.push(p.id.clone());
                 continue;
@@ -993,7 +1141,8 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir: it may hold the old file
                 }
-                if let Err(e) = finalize_transfer(p, &downloads, events, false, encryption) {
+                if let Err(e) = finalize_transfer(p, &downloads, events, false, encryption, pairing)
+                {
                     // Keep the staged source: a failed move must not destroy
                     // the only copy of the received file.
                     fail(
@@ -1017,6 +1166,7 @@ pub async fn poll_pending(
                     events,
                     "transfer reported error",
                     encryption,
+                    pairing,
                 );
                 finished.push(p.id.clone());
             }
@@ -1026,7 +1176,14 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                recover_failed_transfer(p, &downloads, events, "transfer was canceled", encryption);
+                recover_failed_transfer(
+                    p,
+                    &downloads,
+                    events,
+                    "transfer was canceled",
+                    encryption,
+                    pairing,
+                );
                 finished.push(p.id.clone());
             }
             _ => {
@@ -1035,7 +1192,7 @@ pub async fn poll_pending(
                 let idle =
                     record_progress(pending, &p.id, transferred.unwrap_or(p.last_transferred));
                 if let Some(reason) = incoming_stall_reason(&status, status_since, idle) {
-                    handle_object_gone(p, &downloads, events, reason, encryption);
+                    handle_object_gone(p, &downloads, events, reason, encryption, pairing);
                     finished.push(p.id.clone());
                     continue;
                 }
@@ -1065,8 +1222,9 @@ fn finalize_transfer(
     events: &EventSink,
     interrupted: bool,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> Result<()> {
-    finish_transfer(p, downloads, events, interrupted, encryption)?;
+    finish_transfer(p, downloads, events, interrupted, encryption, pairing)?;
     cleanup_staging(&p.staging_dir);
     Ok(())
 }
@@ -1077,9 +1235,14 @@ fn finish_transfer(
     events: &EventSink,
     interrupted: bool,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> Result<()> {
-    std::fs::create_dir_all(downloads)
-        .with_context(|| format!("create Downloads dir {downloads:?}"))?;
+    if p.control {
+        return finish_pairing_transfer(p, events, encryption, pairing);
+    }
+    let target_dir = sanitize::sender_dir(downloads, &p.sender_label);
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("create sender folder {target_dir:?}"))?;
     let bytes = std::fs::metadata(&p.dest)
         .with_context(|| format!("read staged file {:?}", p.dest))?
         .len();
@@ -1096,8 +1259,17 @@ fn finish_transfer(
         });
         return Ok(());
     }
-    if crypto::is_container(&p.dest)? {
-        return finish_encrypted_transfer(p, downloads, events, interrupted, bytes, encryption);
+    if let Some(kind) = crypto::container_kind(&p.dest)? {
+        return finish_encrypted_transfer(
+            p,
+            downloads,
+            events,
+            interrupted,
+            bytes,
+            encryption,
+            pairing,
+            kind,
+        );
     }
     let base = p
         .dest
@@ -1125,18 +1297,18 @@ fn finish_transfer(
         });
         return Ok(());
     }
-    security::ensure_free_space(downloads, Some(bytes))?;
+    security::ensure_free_space(&target_dir, Some(bytes))?;
 
     // Retry the numbered name if another writer wins the race between
     // `unique_in_dir` and the no-overwrite move.
-    let mut final_path = sanitize::unique_in_dir(downloads, &name);
+    let mut final_path = sanitize::unique_in_dir(&target_dir, &name);
     loop {
         match sanitize::move_file(&p.dest, &final_path) {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                final_path = sanitize::unique_in_dir(downloads, &name);
+                final_path = sanitize::unique_in_dir(&target_dir, &name);
             }
-            Err(e) => return Err(e).context("move into Downloads"),
+            Err(e) => return Err(e).context("move into the sender folder"),
         }
     }
     if let Err(error) = security::harden_received_file(&final_path) {
@@ -1169,10 +1341,75 @@ fn finish_transfer(
     Ok(())
 }
 
+/// Finish a pairing control object: process it, delete it, and optionally
+/// send the next protocol object back over a fresh OPP session.
+fn finish_pairing_transfer(
+    p: &PendingTransfer,
+    events: &EventSink,
+    encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
+) -> Result<()> {
+    let Some(pairing) = pairing else {
+        let _ = std::fs::remove_file(&p.dest);
+        cleanup_staging(&p.staging_dir);
+        events.send(Event::Pairing {
+            address: p.sender.clone(),
+            name: p.sender.clone(),
+            ok: false,
+            message: "pairing is unavailable on this installation".into(),
+        });
+        return Ok(());
+    };
+    let Some(passphrase) = encryption.passphrase() else {
+        let _ = std::fs::remove_file(&p.dest);
+        cleanup_staging(&p.staging_dir);
+        events.send(Event::Pairing {
+            address: p.sender.clone(),
+            name: p.sender.clone(),
+            ok: false,
+            message: "set a shared passphrase before pairing".into(),
+        });
+        return Ok(());
+    };
+    let result = pairing.handle_file(&p.sender, &p.dest, &passphrase);
+    let _ = std::fs::remove_file(&p.dest);
+    cleanup_staging(&p.staging_dir);
+    match result {
+        Ok(outcome) => {
+            events.send(Event::Log(format!(
+                "pairing object from {}: {}",
+                p.sender, outcome.message
+            )));
+            if let Some(reply) = outcome.reply {
+                let peer = p.sender.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = crate::platform::send_control(&peer, &reply, &events).await
+                    {
+                        events.send(Event::Log(format!(
+                            "could not deliver a pairing reply to {peer}: {error:#}"
+                        )));
+                    }
+                });
+            }
+        }
+        Err(error) => {
+            events.send(Event::Pairing {
+                address: p.sender.clone(),
+                name: p.sender.clone(),
+                ok: false,
+                message: format!("{error:#}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Decrypt a completed Kalo container, scan the plaintext and save it under
 /// its authenticated original name. Repeated hashing is intentional: the
 /// malware list must see the bytes the user will actually open, not the
 /// ciphertext.
+#[allow(clippy::too_many_arguments)]
 fn finish_encrypted_transfer(
     p: &PendingTransfer,
     downloads: &Path,
@@ -1180,20 +1417,12 @@ fn finish_encrypted_transfer(
     interrupted: bool,
     container_bytes: u64,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
+    kind: crypto::ContainerKind,
 ) -> Result<()> {
-    let Some(decryptor) = encryption.decryptor() else {
-        let _ = std::fs::remove_file(&p.dest);
-        events.send(Event::IncomingFailed {
-            id: p.id.clone(),
-            sender: p.sender.clone(),
-            name: p.name.clone(),
-            error: "received an encrypted Kalo file but no encryption passphrase is configured; \
-                    the container was deleted"
-                .into(),
-            staged_at: None,
-        });
-        return Ok(());
-    };
+    let target_dir = sanitize::sender_dir(downloads, &p.sender_label);
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("create sender folder {target_dir:?}"))?;
     if interrupted {
         let _ = std::fs::remove_file(&p.dest);
         events.send(Event::IncomingFailed {
@@ -1208,32 +1437,161 @@ fn finish_encrypted_transfer(
     }
 
     let mut out_of_space = false;
-    let decrypted = match decryptor.decrypt_to_gated(&p.dest, &p.staging_dir, |size| {
-        match security::ensure_free_space(&p.staging_dir, Some(size)) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                out_of_space = true;
-                Err(error.context("make room for the decrypted file in staging"))
+    let gate = |size: u64| match security::ensure_free_space(&p.staging_dir, Some(size)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            out_of_space = true;
+            Err(error.context("make room for the decrypted file in staging"))
+        }
+    };
+
+    let decrypted: crypto::Decrypted = match kind {
+        crypto::ContainerKind::Passphrase => {
+            let Some(decryptor) = encryption.decryptor() else {
+                let _ = std::fs::remove_file(&p.dest);
+                events.send(Event::IncomingFailed {
+                    id: p.id.clone(),
+                    sender: p.sender.clone(),
+                    name: p.name.clone(),
+                    error: "received an encrypted Kalo file but no encryption passphrase is \
+                            configured; the container was deleted"
+                        .into(),
+                    staged_at: None,
+                });
+                return Ok(());
+            };
+            match decryptor.decrypt_to_gated(&p.dest, &p.staging_dir, gate) {
+                Ok(decrypted) => decrypted,
+                // A full disk is not a bad container: keep it for the
+                // recovery sweep instead of destroying the only copy.
+                Err(error) if out_of_space => return Err(error),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&p.dest);
+                    events.send(Event::IncomingFailed {
+                        id: p.id.clone(),
+                        sender: p.sender.clone(),
+                        name: p.name.clone(),
+                        error: format!(
+                            "cannot decrypt the incoming file (wrong passphrase or corrupted \
+                             container): {error:#}; the container was deleted"
+                        ),
+                        staged_at: None,
+                    });
+                    return Ok(());
+                }
             }
         }
-    }) {
-        Ok(decrypted) => decrypted,
-        // A full disk is not a bad container: keep it for the recovery sweep
-        // instead of destroying the only copy of the file.
-        Err(error) if out_of_space => return Err(error),
-        Err(error) => {
-            let _ = std::fs::remove_file(&p.dest);
-            events.send(Event::IncomingFailed {
-                id: p.id.clone(),
-                sender: p.sender.clone(),
-                name: p.name.clone(),
-                error: format!(
-                    "cannot decrypt the incoming file (wrong passphrase or corrupted container): \
-                     {error:#}; the container was deleted"
-                ),
-                staged_at: None,
-            });
-            return Ok(());
+        crypto::ContainerKind::Peer => {
+            let Some(pairing) = pairing else {
+                let _ = std::fs::remove_file(&p.dest);
+                events.send(Event::IncomingFailed {
+                    id: p.id.clone(),
+                    sender: p.sender.clone(),
+                    name: p.name.clone(),
+                    error: "received a paired-device container but pairing is unavailable; \
+                            the container was deleted"
+                        .into(),
+                    staged_at: None,
+                });
+                return Ok(());
+            };
+            // Prefer the sender address, then fall back to the pinned key id.
+            // The key id is covered by the signature, so it only selects a
+            // pinned peer; it never authenticates one by itself.
+            let selected = pairing
+                .trust()
+                .incoming_chain(&p.sender)
+                .zip(pairing.trust().peer_public(&p.sender))
+                .map(|(chain, public)| (p.sender.clone(), chain, public))
+                .or_else(|| {
+                    crypto::peer_key_id(&p.dest)
+                        .ok()
+                        .flatten()
+                        .and_then(|key_id| pairing.trust().peer_by_key_id(&key_id))
+                        .and_then(|(address, _)| {
+                            pairing
+                                .trust()
+                                .incoming_chain(&address)
+                                .zip(pairing.trust().peer_public(&address))
+                                .map(|(chain, public)| (address, chain, public))
+                        })
+                });
+            let Some((address, chain, public)) = selected else {
+                let _ = std::fs::remove_file(&p.dest);
+                events.send(Event::IncomingFailed {
+                    id: p.id.clone(),
+                    sender: p.sender.clone(),
+                    name: p.name.clone(),
+                    error: "received a paired-device container from a device that is not \
+                            paired with this Kalo installation; the container was deleted"
+                        .into(),
+                    staged_at: None,
+                });
+                return Ok(());
+            };
+            let decryptor = match crypto::PeerDecryptor::new(chain.key, chain.step, public) {
+                Ok(decryptor) => decryptor,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&p.dest);
+                    events.send(Event::IncomingFailed {
+                        id: p.id.clone(),
+                        sender: p.sender.clone(),
+                        name: p.name.clone(),
+                        error: format!(
+                            "cannot use the pinned identity for {address}: {error:#}; \
+                             the container was deleted"
+                        ),
+                        staged_at: None,
+                    });
+                    return Ok(());
+                }
+            };
+            match decryptor.decrypt_to_gated(&p.dest, &p.staging_dir, gate) {
+                Ok(decrypted) => {
+                    // Burn the ratchet step before any further processing.
+                    // A replay of this container must fail even if the file is
+                    // later rejected by the malware scan.
+                    if let Err(error) = pairing.trust().commit_incoming(
+                        &address,
+                        decrypted.step,
+                        decrypted.next_key,
+                    ) {
+                        let _ = std::fs::remove_file(&decrypted.path);
+                        let _ = std::fs::remove_file(&p.dest);
+                        events.send(Event::IncomingFailed {
+                            id: p.id.clone(),
+                            sender: p.sender.clone(),
+                            name: p.name.clone(),
+                            error: format!(
+                                "the incoming paired-device key chain could not be saved: \
+                                 {error:#}; the container was deleted"
+                            ),
+                            staged_at: None,
+                        });
+                        return Ok(());
+                    }
+                    crypto::Decrypted {
+                        path: decrypted.path,
+                        name: decrypted.name,
+                        size: decrypted.size,
+                    }
+                }
+                Err(error) if out_of_space => return Err(error),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&p.dest);
+                    events.send(Event::IncomingFailed {
+                        id: p.id.clone(),
+                        sender: p.sender.clone(),
+                        name: p.name.clone(),
+                        error: format!(
+                            "cannot decrypt the paired-device container (wrong identity, \
+                             replayed or corrupted file): {error:#}; the container was deleted"
+                        ),
+                        staged_at: None,
+                    });
+                    return Ok(());
+                }
+            }
         }
     };
     let name = sanitize::filename(&decrypted.name);
@@ -1277,23 +1635,23 @@ fn finish_encrypted_transfer(
         });
         return Ok(());
     }
-    if let Err(error) = security::ensure_free_space(downloads, Some(decrypted.size)) {
+    if let Err(error) = security::ensure_free_space(&target_dir, Some(decrypted.size)) {
         // Keep the container for a later sweep, but never leave plaintext in
         // staging where the recovery walk could mistake it for a normal file.
         let _ = std::fs::remove_file(&decrypted.path);
         return Err(error).context("make room for the decrypted file");
     }
 
-    let mut final_path = sanitize::unique_in_dir(downloads, &name);
+    let mut final_path = sanitize::unique_in_dir(&target_dir, &name);
     loop {
         match sanitize::move_file(&decrypted.path, &final_path) {
             Ok(()) => break,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                final_path = sanitize::unique_in_dir(downloads, &name);
+                final_path = sanitize::unique_in_dir(&target_dir, &name);
             }
             Err(error) => {
                 let _ = std::fs::remove_file(&decrypted.path);
-                return Err(error).context("move decrypted file into Downloads");
+                return Err(error).context("move decrypted file into the sender folder");
             }
         }
     }
@@ -1350,6 +1708,7 @@ async fn register_receiver(
     events: EventSink,
     authorizer: Authorizer,
     save_dir: SaveDir,
+    pairing: Option<crate::identity::PairingManager>,
 ) -> Result<String> {
     let registration = handle.begin_registration();
     let path = registration_path(registration);
@@ -1362,6 +1721,7 @@ async fn register_receiver(
         registration,
         authorizer,
         save_dir,
+        pairing,
     };
     export_agent(conn, &path, service).await?;
 
@@ -1435,6 +1795,7 @@ pub async fn run_receiver(
     events: EventSink,
     authorizer: Authorizer,
     encryption: Encryption,
+    pairing: Option<crate::identity::PairingManager>,
 ) -> ! {
     loop {
         match Connection::session().await {
@@ -1447,6 +1808,7 @@ pub async fn run_receiver(
                     &events,
                     &authorizer,
                     &encryption,
+                    pairing.as_ref(),
                 )
                 .await
                 {
@@ -1464,6 +1826,7 @@ pub async fn run_receiver(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receiver_session(
     conn: &Connection,
     handle: &ReceiverHandle,
@@ -1472,6 +1835,7 @@ async fn receiver_session(
     events: &EventSink,
     authorizer: &Authorizer,
     encryption: &Encryption,
+    pairing: Option<&crate::identity::PairingManager>,
 ) -> Result<()> {
     let mut owner_changes = match obexd_owner_changes(conn).await {
         Ok(changes) => Some(changes),
@@ -1489,11 +1853,12 @@ async fn receiver_session(
         events.clone(),
         authorizer.clone(),
         save_dir.clone(),
+        pairing.cloned(),
     )
     .await
     {
         Ok(path) => {
-            sweep_staging(save_dir, events, encryption);
+            sweep_staging(save_dir, events, encryption, pairing);
             Some(path)
         }
         Err(e) => {
@@ -1550,7 +1915,7 @@ async fn receiver_session(
                 }
             }
             _ = poll.tick(), if exported => {
-                poll_pending(conn, pending, save_dir, events, encryption).await;
+                poll_pending(conn, pending, save_dir, events, encryption, pairing).await;
                 if conn.is_closed() {
                     bail!("session bus connection closed");
                 }
@@ -1563,6 +1928,7 @@ async fn receiver_session(
                     events.clone(),
                     authorizer.clone(),
                     save_dir.clone(),
+                    pairing.cloned(),
                 )
                 .await
                 {
@@ -1575,7 +1941,7 @@ async fn receiver_session(
                         }
                         exported = true;
                         last_registration_error = None;
-                        sweep_staging(save_dir, events, encryption);
+                        sweep_staging(save_dir, events, encryption, pairing);
                     }
                     Err(e) => {
                         let reason = registration_error(&e);
@@ -1592,7 +1958,7 @@ async fn receiver_session(
                 }
             }
             _ = sweep.tick(), if handle.is_active() => {
-                sweep_staging(save_dir, events, encryption);
+                sweep_staging(save_dir, events, encryption, pairing);
             }
         }
     }
@@ -1605,7 +1971,7 @@ pub async fn agent_check() -> Result<()> {
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
     let authorizer = Authorizer::new(TrustStore::in_memory(), events.clone(), false);
-    let check_save = SaveDir::new(paths::downloads_dir());
+    let check_save = SaveDir::new(paths::default_save_dir());
     let path = register_receiver(
         &conn,
         handle,
@@ -1613,6 +1979,7 @@ pub async fn agent_check() -> Result<()> {
         events.clone(),
         authorizer,
         check_save,
+        None,
     )
     .await?;
     let manager = AgentManagerProxy::new(&conn).await?;
@@ -1643,7 +2010,7 @@ pub async fn receive() -> Result<()> {
         settings
             .save_dir
             .clone()
-            .unwrap_or_else(paths::downloads_dir),
+            .unwrap_or_else(paths::default_save_dir),
     );
     let encryption = Encryption::new(
         settings.encrypt_sends,
@@ -1653,7 +2020,7 @@ pub async fn receive() -> Result<()> {
     if let Some(warning) = trust_warning {
         eprintln!("warning: {warning}");
     }
-    let authorizer = Authorizer::new(trust, events.clone(), false);
+    let authorizer = Authorizer::new(trust.clone(), events.clone(), false);
 
     println!(
         "listening… (Ctrl-C to stop); new senders are rejected in the CLI — approve \
@@ -1671,7 +2038,21 @@ pub async fn receive() -> Result<()> {
         }
     });
 
-    run_receiver(handle, pending, save_dir, events, authorizer, encryption).await
+    let identity = match crate::identity::DeviceIdentity::load_or_create() {
+        Ok(identity) => Some(crate::identity::PairingManager::new(
+            identity,
+            trust.clone(),
+            events.clone(),
+        )),
+        Err(error) => {
+            eprintln!("warning: paired-device encryption is unavailable: {error:#}");
+            None
+        }
+    };
+    run_receiver(
+        handle, pending, save_dir, events, authorizer, encryption, identity,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1696,6 +2077,7 @@ mod tests {
             id: "id-1".into(),
             name: "photo.jpg".into(),
             sender: "AA:BB".into(),
+            sender_label: "Pixel 8".into(),
             size,
             path: "/org/bluez/obex/session/transfer1".into(),
             dest,
@@ -1706,6 +2088,7 @@ mod tests {
             last_transferred: 0,
             last_status: None,
             status_since: Instant::now(),
+            control: false,
         }
     }
 
@@ -1731,7 +2114,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        assert!(finalize_transfer(&p, &downloads, &events, false, &no_encryption()).is_err());
+        assert!(finalize_transfer(&p, &downloads, &events, false, &no_encryption(), None).is_err());
         assert!(dest.exists(), "staged source must be kept on save failure");
         let _ = rx.try_recv();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1748,7 +2131,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption(), None).unwrap();
         assert!(!dest.exists());
         assert!(!staging.exists());
         let event = rx.try_recv().unwrap();
@@ -1829,11 +2212,15 @@ mod tests {
 
         // A sender can finish between two polls; finalization is the last
         // gate before the save folder.
-        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption(), None).unwrap();
 
         assert!(!dest.exists());
         assert!(!staging.exists());
-        assert!(!downloads.join("photo.jpg").exists());
+        assert!(
+            !sanitize::sender_dir(&downloads, "Pixel 8")
+                .join("photo.jpg")
+                .exists()
+        );
         match rx.try_recv().unwrap() {
             Event::IncomingFailed { error, .. } => {
                 assert!(error.contains("announced"), "unexpected error: {error}");
@@ -1855,7 +2242,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, Some(10));
 
-        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption(), None).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, bytes, .. } => {
                 assert_eq!(bytes, 5);
@@ -1877,7 +2264,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, None);
 
-        finalize_transfer(&p, &downloads, &events, true, &no_encryption()).unwrap();
+        finalize_transfer(&p, &downloads, &events, true, &no_encryption(), None).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, .. } => assert!(partial),
             other => panic!("unexpected event: {other:?}"),
@@ -1904,6 +2291,7 @@ mod tests {
             &events,
             "transfer reported error",
             &no_encryption(),
+            None,
         );
 
         match rx
@@ -1919,7 +2307,11 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
-        assert!(downloads.join("photo.jpg").exists());
+        assert!(
+            sanitize::sender_dir(&downloads, "Pixel 8")
+                .join("photo.jpg")
+                .exists()
+        );
         assert!(!staging.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1939,6 +2331,7 @@ mod tests {
             &events,
             "transfer was canceled",
             &no_encryption(),
+            None,
         );
         match rx.try_recv().unwrap() {
             Event::IncomingFailed { error, .. } => {
@@ -2070,19 +2463,29 @@ mod tests {
         std::fs::write(staging.join("photo.jpg"), b"recovered").unwrap();
 
         let downloads = dir.join("Downloads");
-        std::fs::create_dir_all(&downloads).unwrap();
-        std::fs::write(downloads.join("photo.jpg"), b"keep").unwrap();
+        let recovered_dir = downloads.join("Recovered");
+        std::fs::create_dir_all(&recovered_dir).unwrap();
+        std::fs::write(recovered_dir.join("photo.jpg"), b"keep").unwrap();
 
         let (events, _rx) = event_sink();
-        let recovered =
-            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events, &no_encryption());
+        let recovered = sweep_stale_staging(
+            &root,
+            &downloads,
+            Duration::ZERO,
+            &events,
+            &no_encryption(),
+            None,
+        );
 
         assert_eq!(recovered, 1);
         assert!(!staging.exists(), "empty staging dir must be removed");
         // The pre-existing file is never replaced.
-        assert_eq!(std::fs::read(downloads.join("photo.jpg")).unwrap(), b"keep");
         assert_eq!(
-            std::fs::read(downloads.join("photo (1).jpg")).unwrap(),
+            std::fs::read(recovered_dir.join("photo.jpg")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(recovered_dir.join("photo_1.jpg")).unwrap(),
             b"recovered"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2109,6 +2512,7 @@ mod tests {
                 Duration::from_secs(3600),
                 &events,
                 &no_encryption(),
+                None,
             ),
             0
         );
@@ -2116,7 +2520,14 @@ mod tests {
 
         // Old enough: only Kalo's own staging is recovered.
         assert_eq!(
-            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events, &no_encryption(),),
+            sweep_stale_staging(
+                &root,
+                &downloads,
+                Duration::ZERO,
+                &events,
+                &no_encryption(),
+                None
+            ),
             1
         );
         assert!(!fresh.exists());
