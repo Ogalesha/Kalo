@@ -298,7 +298,9 @@ jobs:
         run: |
           mkdir -p release
           cp artifacts/*.deb release/kalo_amd64.deb
-          cp artifacts/*.zip release/kalo-windows-x64.zip
+          windows_zip="$(find artifacts -maxdepth 1 -name '*.zip' ! -name 'kalo-macos-universal.zip' -print -quit)"
+          test -n "$windows_zip"
+          cp "$windows_zip" release/kalo-windows-x64.zip
           cp artifacts/kalo.exe release/kalo-windows-x64.exe
           cp artifacts/kalo-macos-universal.zip release/kalo-macos-universal.zip
           cp artifacts/kalo-git-[0-9]*.pkg.tar.zst release/kalo-git-x86_64.pkg.tar.zst

@@ -93,6 +93,13 @@
       `sanitize::filename`; CI runs both for 60 seconds and uploads artifacts
       on failure. Fuzzing already caught and fixed a truncation path that could
       leave a trailing space after the 200-byte cap.
+- [ ] **Application-layer encryption for sent files.** Encrypt file contents so
+      a passive Bluetooth capture cannot read them even when the link itself is
+      not encrypted. This is possible only between two Kalo peers, which must
+      share a key or run an authenticated key exchange; stock OPP receivers
+      cannot decrypt a custom container. Filename and size would still be
+      visible to the network. Pairing already enables Bluetooth link
+      encryption, but it is not an app-layer guarantee.
 
 ## Engineering
 
