@@ -18,6 +18,7 @@ use zbus::interface;
 use zbus::proxy;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
+use crate::crypto::{self, Encryption};
 use crate::events::{Event, EventSink, TransferStatus};
 use crate::paths;
 use crate::receiver::ReceiverHandle;
@@ -345,9 +346,15 @@ const STAGING_STALE_AGE: Duration = INCOMING_STALL_TIMEOUT;
 /// remove the now-empty `kalo-*` directories.
 ///
 /// The supervisor runs this after registration and periodically afterwards.
-fn sweep_staging(save_dir: &SaveDir, events: &EventSink) {
+fn sweep_staging(save_dir: &SaveDir, events: &EventSink, encryption: &Encryption) {
     let downloads = save_dir.get();
-    let recovered = sweep_stale_staging(&staging_root(), &downloads, STAGING_STALE_AGE, events);
+    let recovered = sweep_stale_staging(
+        &staging_root(),
+        &downloads,
+        STAGING_STALE_AGE,
+        events,
+        encryption,
+    );
     if recovered > 0 {
         events.send(Event::Log(format!(
             "recovered {recovered} file(s) from an interrupted transfer"
@@ -362,6 +369,7 @@ fn sweep_stale_staging(
     downloads: &Path,
     min_age: Duration,
     events: &EventSink,
+    encryption: &Encryption,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -384,7 +392,7 @@ fn sweep_stale_staging(
         if !stale {
             continue;
         }
-        recovered += recover_staging_dir(&entry.path(), downloads, events);
+        recovered += recover_staging_dir(&entry.path(), downloads, events, encryption);
     }
     recovered
 }
@@ -408,7 +416,12 @@ fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
     newest
 }
 
-fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usize {
+fn recover_staging_dir(
+    dir: &Path,
+    downloads: &Path,
+    events: &EventSink,
+    encryption: &Encryption,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -419,6 +432,33 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         };
         if !file_type.is_file() {
             continue;
+        }
+        let file_name = entry.file_name();
+        if file_name
+            .to_string_lossy()
+            .starts_with(crypto::DECRYPT_TEMP_PREFIX)
+        {
+            let _ = std::fs::remove_file(entry.path());
+            events.send(Event::Log(format!(
+                "removed a stale decrypted temporary file at {:?}",
+                entry.path()
+            )));
+            continue;
+        }
+        match crypto::is_container(&entry.path()) {
+            Ok(true) => {
+                recovered +=
+                    recover_encrypted_staged(&entry.path(), dir, downloads, events, encryption);
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                events.send(Event::Log(format!(
+                    "left a stale staged file with unreadable headers at {:?}: {error:#}",
+                    entry.path()
+                )));
+                continue;
+            }
         }
         match security::scan_received_file(&entry.path()) {
             Ok(scan) if scan.blocked => {
@@ -481,6 +521,115 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         let _ = std::fs::remove_dir(dir);
     }
     recovered
+}
+
+/// Recover one stale encrypted container into Downloads. The container is
+/// only deleted after the plaintext has been moved; transient save failures
+/// keep it for the next sweep.
+fn recover_encrypted_staged(
+    container: &Path,
+    staging_dir: &Path,
+    downloads: &Path,
+    events: &EventSink,
+    encryption: &Encryption,
+) -> usize {
+    let Some(decryptor) = encryption.decryptor() else {
+        let _ = std::fs::remove_file(container);
+        events.send(Event::Log(format!(
+            "deleted a stale encrypted container at {:?}: no passphrase is configured",
+            container
+        )));
+        return 0;
+    };
+    let mut out_of_space = false;
+    let decrypted = match decryptor.decrypt_to_gated(container, staging_dir, |size| {
+        match security::ensure_free_space(staging_dir, Some(size)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                out_of_space = true;
+                Err(error.context("make room for the decrypted file in staging"))
+            }
+        }
+    }) {
+        Ok(decrypted) => decrypted,
+        Err(error) if out_of_space => {
+            events.send(Event::Log(format!(
+                "cannot recover a stale encrypted file yet: {error:#}"
+            )));
+            return 0;
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(container);
+            events.send(Event::Log(format!(
+                "deleted a stale encrypted container that could not be decrypted: {error:#}"
+            )));
+            return 0;
+        }
+    };
+    let name = sanitize::filename(&decrypted.name);
+    let discard = |path: &Path, container: &Path| {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(container);
+    };
+
+    match security::scan_received_file(&decrypted.path) {
+        Ok(scan) if scan.blocked => {
+            discard(&decrypted.path, container);
+            events.send(Event::Log(format!(
+                "deleted a stale decrypted file that matches the malware hash list (SHA-256 {})",
+                security::digest_hex(scan.digest)
+            )));
+            return 0;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            discard(&decrypted.path, container);
+            events.send(Event::Log(format!(
+                "deleted a stale decrypted file that could not be verified: {error:#}"
+            )));
+            return 0;
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(downloads)
+        .with_context(|| format!("create Downloads dir {downloads:?}"))
+        .and_then(|()| security::ensure_free_space(downloads, Some(decrypted.size)))
+    {
+        let _ = std::fs::remove_file(&decrypted.path);
+        events.send(Event::Log(format!(
+            "cannot recover an encrypted file into {downloads:?}: {error:#}"
+        )));
+        return 0;
+    }
+
+    let mut dest = sanitize::unique_in_dir(downloads, &name);
+    loop {
+        match sanitize::move_file(&decrypted.path, &dest) {
+            Ok(()) => {
+                if let Err(error) = security::harden_received_file(&dest) {
+                    events.send(Event::Log(format!(
+                        "warning: cannot harden {}: {error:#}",
+                        dest.display()
+                    )));
+                }
+                let _ = std::fs::remove_file(container);
+                events.send(Event::Log(format!(
+                    "recovered an encrypted file from an interrupted transfer as {:?}",
+                    dest
+                )));
+                return 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                dest = sanitize::unique_in_dir(downloads, &name);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&decrypted.path);
+                events.send(Event::Log(format!(
+                    "cannot recover an encrypted file into Downloads: {error}"
+                )));
+                return 0;
+            }
+        }
+    }
 }
 
 /// Guard against obexd reusing transfer object paths: only touch the
@@ -643,13 +792,14 @@ fn handle_object_gone(
     downloads: &Path,
     events: &EventSink,
     reason: impl Into<String>,
+    encryption: &Encryption,
 ) {
     if p.dest.exists() {
         events.send(Event::Log(format!(
             "{}: transfer object disappeared; recovering staged file",
             p.dest.display()
         )));
-        if let Err(e) = finalize_transfer(p, downloads, events, true) {
+        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption) {
             fail(
                 events,
                 p,
@@ -666,13 +816,19 @@ fn handle_object_gone(
 /// obexd reported a terminal failure. Anything it already wrote is the only
 /// copy of the received bytes, so it must be kept and moved to Downloads
 /// (marked partial) instead of deleting the staging directory.
-fn recover_failed_transfer(p: &PendingTransfer, downloads: &Path, events: &EventSink, error: &str) {
+fn recover_failed_transfer(
+    p: &PendingTransfer,
+    downloads: &Path,
+    events: &EventSink,
+    error: &str,
+    encryption: &Encryption,
+) {
     if p.dest.exists() {
         events.send(Event::Log(format!(
             "{}: {error}; keeping the staged partial file",
             p.dest.display()
         )));
-        if let Err(e) = finalize_transfer(p, downloads, events, true) {
+        if let Err(e) = finalize_transfer(p, downloads, events, true, encryption) {
             fail(
                 events,
                 p,
@@ -723,6 +879,7 @@ pub async fn poll_pending(
     pending: &PendingTransfers,
     save_dir: &SaveDir,
     events: &EventSink,
+    encryption: &Encryption,
 ) {
     let list = pending.lock().expect("pending lock").clone();
     if list.is_empty() {
@@ -751,6 +908,7 @@ pub async fn poll_pending(
                 &downloads,
                 events,
                 &format!("not enough free disk space for the incoming file: {error:#}"),
+                encryption,
             );
             finished.push(p.id.clone());
             continue;
@@ -773,6 +931,7 @@ pub async fn poll_pending(
                         &downloads,
                         events,
                         format!("transfer object unavailable: {e}"),
+                        encryption,
                     );
                     finished.push(p.id.clone());
                     continue;
@@ -793,6 +952,7 @@ pub async fn poll_pending(
                     &downloads,
                     events,
                     format!("transfer object unavailable: {e}"),
+                    encryption,
                 );
                 finished.push(p.id.clone());
                 continue;
@@ -819,6 +979,7 @@ pub async fn poll_pending(
                     &downloads,
                     events,
                     format!("transfer object disappeared before completion: {e}"),
+                    encryption,
                 );
                 finished.push(p.id.clone());
                 continue;
@@ -832,7 +993,7 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir: it may hold the old file
                 }
-                if let Err(e) = finalize_transfer(p, &downloads, events, false) {
+                if let Err(e) = finalize_transfer(p, &downloads, events, false, encryption) {
                     // Keep the staged source: a failed move must not destroy
                     // the only copy of the received file.
                     fail(
@@ -850,7 +1011,13 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                recover_failed_transfer(p, &downloads, events, "transfer reported error");
+                recover_failed_transfer(
+                    p,
+                    &downloads,
+                    events,
+                    "transfer reported error",
+                    encryption,
+                );
                 finished.push(p.id.clone());
             }
             TransferStatus::Unknown(raw) if raw.eq_ignore_ascii_case("cancelled") => {
@@ -859,7 +1026,7 @@ pub async fn poll_pending(
                     finished.push(p.id.clone());
                     continue; // keep the staging dir
                 }
-                recover_failed_transfer(p, &downloads, events, "transfer was canceled");
+                recover_failed_transfer(p, &downloads, events, "transfer was canceled", encryption);
                 finished.push(p.id.clone());
             }
             _ => {
@@ -868,7 +1035,7 @@ pub async fn poll_pending(
                 let idle =
                     record_progress(pending, &p.id, transferred.unwrap_or(p.last_transferred));
                 if let Some(reason) = incoming_stall_reason(&status, status_since, idle) {
-                    handle_object_gone(p, &downloads, events, reason);
+                    handle_object_gone(p, &downloads, events, reason, encryption);
                     finished.push(p.id.clone());
                     continue;
                 }
@@ -897,8 +1064,9 @@ fn finalize_transfer(
     downloads: &Path,
     events: &EventSink,
     interrupted: bool,
+    encryption: &Encryption,
 ) -> Result<()> {
-    finish_transfer(p, downloads, events, interrupted)?;
+    finish_transfer(p, downloads, events, interrupted, encryption)?;
     cleanup_staging(&p.staging_dir);
     Ok(())
 }
@@ -908,6 +1076,7 @@ fn finish_transfer(
     downloads: &Path,
     events: &EventSink,
     interrupted: bool,
+    encryption: &Encryption,
 ) -> Result<()> {
     std::fs::create_dir_all(downloads)
         .with_context(|| format!("create Downloads dir {downloads:?}"))?;
@@ -926,6 +1095,9 @@ fn finish_transfer(
             staged_at: None,
         });
         return Ok(());
+    }
+    if crypto::is_container(&p.dest)? {
+        return finish_encrypted_transfer(p, downloads, events, interrupted, bytes, encryption);
     }
     let base = p
         .dest
@@ -993,6 +1165,166 @@ fn finish_transfer(
         elapsed_secs,
         mbps,
         partial,
+    });
+    Ok(())
+}
+
+/// Decrypt a completed Kalo container, scan the plaintext and save it under
+/// its authenticated original name. Repeated hashing is intentional: the
+/// malware list must see the bytes the user will actually open, not the
+/// ciphertext.
+fn finish_encrypted_transfer(
+    p: &PendingTransfer,
+    downloads: &Path,
+    events: &EventSink,
+    interrupted: bool,
+    container_bytes: u64,
+    encryption: &Encryption,
+) -> Result<()> {
+    let Some(decryptor) = encryption.decryptor() else {
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: "received an encrypted Kalo file but no encryption passphrase is configured; \
+                    the container was deleted"
+                .into(),
+            staged_at: None,
+        });
+        return Ok(());
+    };
+    if interrupted {
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: "the encrypted transfer did not complete; the partial container was deleted"
+                .into(),
+            staged_at: None,
+        });
+        return Ok(());
+    }
+
+    let mut out_of_space = false;
+    let decrypted = match decryptor.decrypt_to_gated(&p.dest, &p.staging_dir, |size| {
+        match security::ensure_free_space(&p.staging_dir, Some(size)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                out_of_space = true;
+                Err(error.context("make room for the decrypted file in staging"))
+            }
+        }
+    }) {
+        Ok(decrypted) => decrypted,
+        // A full disk is not a bad container: keep it for the recovery sweep
+        // instead of destroying the only copy of the file.
+        Err(error) if out_of_space => return Err(error),
+        Err(error) => {
+            let _ = std::fs::remove_file(&p.dest);
+            events.send(Event::IncomingFailed {
+                id: p.id.clone(),
+                sender: p.sender.clone(),
+                name: p.name.clone(),
+                error: format!(
+                    "cannot decrypt the incoming file (wrong passphrase or corrupted container): \
+                     {error:#}; the container was deleted"
+                ),
+                staged_at: None,
+            });
+            return Ok(());
+        }
+    };
+    let name = sanitize::filename(&decrypted.name);
+    if name != decrypted.name {
+        events.send(Event::Log(format!(
+            "renamed encrypted file {:?} to {:?}",
+            decrypted.name, name
+        )));
+    }
+
+    let scan = match security::scan_received_file(&decrypted.path) {
+        Ok(scan) => scan,
+        Err(error) => {
+            let _ = std::fs::remove_file(&decrypted.path);
+            let _ = std::fs::remove_file(&p.dest);
+            events.send(Event::IncomingFailed {
+                id: p.id.clone(),
+                sender: p.sender.clone(),
+                name: p.name.clone(),
+                error: format!(
+                    "cannot verify the decrypted file: {error:#}; both the decrypted copy and \
+                     the container were deleted"
+                ),
+                staged_at: None,
+            });
+            return Ok(());
+        }
+    };
+    if scan.blocked {
+        let _ = std::fs::remove_file(&decrypted.path);
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: format!(
+                "the decrypted file matches a known malicious SHA-256 hash ({}); it was deleted",
+                security::digest_hex(scan.digest)
+            ),
+            staged_at: None,
+        });
+        return Ok(());
+    }
+    if let Err(error) = security::ensure_free_space(downloads, Some(decrypted.size)) {
+        // Keep the container for a later sweep, but never leave plaintext in
+        // staging where the recovery walk could mistake it for a normal file.
+        let _ = std::fs::remove_file(&decrypted.path);
+        return Err(error).context("make room for the decrypted file");
+    }
+
+    let mut final_path = sanitize::unique_in_dir(downloads, &name);
+    loop {
+        match sanitize::move_file(&decrypted.path, &final_path) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                final_path = sanitize::unique_in_dir(downloads, &name);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&decrypted.path);
+                return Err(error).context("move decrypted file into Downloads");
+            }
+        }
+    }
+    if let Err(error) = security::harden_received_file(&final_path) {
+        events.send(Event::Log(format!(
+            "warning: cannot harden {}: {error:#}",
+            final_path.display()
+        )));
+    }
+    let _ = std::fs::remove_file(&p.dest);
+
+    let elapsed_secs = p.started.elapsed().as_secs_f64();
+    let mbps = if elapsed_secs > 0.0 {
+        decrypted.size as f64 / (1024.0 * 1024.0) / elapsed_secs
+    } else {
+        0.0
+    };
+    events.send(Event::Log(format!(
+        "decrypted {name} from an encrypted container ({} on the wire, {} plaintext)",
+        crate::events::format_bytes(container_bytes),
+        crate::events::format_bytes(decrypted.size)
+    )));
+    events.send(Event::IncomingDone {
+        id: p.id.clone(),
+        sender: p.sender.clone(),
+        name,
+        saved_to: final_path,
+        bytes: decrypted.size,
+        elapsed_secs,
+        mbps,
+        partial: false,
     });
     Ok(())
 }
@@ -1102,13 +1434,21 @@ pub async fn run_receiver(
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    encryption: Encryption,
 ) -> ! {
     loop {
         match Connection::session().await {
             Ok(conn) => {
-                if let Err(e) =
-                    receiver_session(&conn, &handle, &pending, &save_dir, &events, &authorizer)
-                        .await
+                if let Err(e) = receiver_session(
+                    &conn,
+                    &handle,
+                    &pending,
+                    &save_dir,
+                    &events,
+                    &authorizer,
+                    &encryption,
+                )
+                .await
                 {
                     let reason = format!("session bus connection lost: {e}; reconnecting");
                     handle.mark_lost(&reason);
@@ -1131,6 +1471,7 @@ async fn receiver_session(
     save_dir: &SaveDir,
     events: &EventSink,
     authorizer: &Authorizer,
+    encryption: &Encryption,
 ) -> Result<()> {
     let mut owner_changes = match obexd_owner_changes(conn).await {
         Ok(changes) => Some(changes),
@@ -1152,7 +1493,7 @@ async fn receiver_session(
     .await
     {
         Ok(path) => {
-            sweep_staging(save_dir, events);
+            sweep_staging(save_dir, events, encryption);
             Some(path)
         }
         Err(e) => {
@@ -1209,7 +1550,7 @@ async fn receiver_session(
                 }
             }
             _ = poll.tick(), if exported => {
-                poll_pending(conn, pending, save_dir, events).await;
+                poll_pending(conn, pending, save_dir, events, encryption).await;
                 if conn.is_closed() {
                     bail!("session bus connection closed");
                 }
@@ -1234,7 +1575,7 @@ async fn receiver_session(
                         }
                         exported = true;
                         last_registration_error = None;
-                        sweep_staging(save_dir, events);
+                        sweep_staging(save_dir, events, encryption);
                     }
                     Err(e) => {
                         let reason = registration_error(&e);
@@ -1251,7 +1592,7 @@ async fn receiver_session(
                 }
             }
             _ = sweep.tick(), if handle.is_active() => {
-                sweep_staging(save_dir, events);
+                sweep_staging(save_dir, events, encryption);
             }
         }
     }
@@ -1304,6 +1645,10 @@ pub async fn receive() -> Result<()> {
             .clone()
             .unwrap_or_else(paths::downloads_dir),
     );
+    let encryption = Encryption::new(
+        settings.encrypt_sends,
+        settings.encryption_passphrase.clone(),
+    );
     let (trust, trust_warning) = TrustStore::load();
     if let Some(warning) = trust_warning {
         eprintln!("warning: {warning}");
@@ -1326,7 +1671,7 @@ pub async fn receive() -> Result<()> {
         }
     });
 
-    run_receiver(handle, pending, save_dir, events, authorizer).await
+    run_receiver(handle, pending, save_dir, events, authorizer, encryption).await
 }
 
 #[cfg(test)]
@@ -1339,6 +1684,10 @@ mod tests {
         let sink = EventSink::new(64);
         let rx = sink.subscribe();
         (sink, rx)
+    }
+
+    fn no_encryption() -> Encryption {
+        Encryption::new(false, String::new())
     }
 
     fn pending_transfer(dest: PathBuf, size: Option<u64>) -> PendingTransfer {
@@ -1382,7 +1731,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        assert!(finalize_transfer(&p, &downloads, &events, false).is_err());
+        assert!(finalize_transfer(&p, &downloads, &events, false, &no_encryption()).is_err());
         assert!(dest.exists(), "staged source must be kept on save failure");
         let _ = rx.try_recv();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1399,7 +1748,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest.clone(), Some(5));
 
-        finalize_transfer(&p, &downloads, &events, false).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
         assert!(!dest.exists());
         assert!(!staging.exists());
         let event = rx.try_recv().unwrap();
@@ -1480,7 +1829,7 @@ mod tests {
 
         // A sender can finish between two polls; finalization is the last
         // gate before the save folder.
-        finalize_transfer(&p, &downloads, &events, false).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
 
         assert!(!dest.exists());
         assert!(!staging.exists());
@@ -1506,7 +1855,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, Some(10));
 
-        finalize_transfer(&p, &downloads, &events, false).unwrap();
+        finalize_transfer(&p, &downloads, &events, false, &no_encryption()).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, bytes, .. } => {
                 assert_eq!(bytes, 5);
@@ -1528,7 +1877,7 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(dest, None);
 
-        finalize_transfer(&p, &downloads, &events, true).unwrap();
+        finalize_transfer(&p, &downloads, &events, true, &no_encryption()).unwrap();
         match rx.try_recv().unwrap() {
             Event::IncomingDone { partial, .. } => assert!(partial),
             other => panic!("unexpected event: {other:?}"),
@@ -1549,7 +1898,13 @@ mod tests {
 
         // SM-01 regression: an obexd error after some bytes were written must
         // move the partial file to Downloads instead of deleting it.
-        recover_failed_transfer(&p, &downloads, &events, "transfer reported error");
+        recover_failed_transfer(
+            &p,
+            &downloads,
+            &events,
+            "transfer reported error",
+            &no_encryption(),
+        );
 
         match rx
             .try_recv()
@@ -1578,7 +1933,13 @@ mod tests {
         let (events, mut rx) = event_sink();
         let p = pending_transfer(staging.join("photo.jpg"), Some(10));
 
-        recover_failed_transfer(&p, &downloads, &events, "transfer was canceled");
+        recover_failed_transfer(
+            &p,
+            &downloads,
+            &events,
+            "transfer was canceled",
+            &no_encryption(),
+        );
         match rx.try_recv().unwrap() {
             Event::IncomingFailed { error, .. } => {
                 assert_eq!(error, "transfer was canceled");
@@ -1713,7 +2074,8 @@ mod tests {
         std::fs::write(downloads.join("photo.jpg"), b"keep").unwrap();
 
         let (events, _rx) = event_sink();
-        let recovered = sweep_stale_staging(&root, &downloads, Duration::ZERO, &events);
+        let recovered =
+            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events, &no_encryption());
 
         assert_eq!(recovered, 1);
         assert!(!staging.exists(), "empty staging dir must be removed");
@@ -1741,14 +2103,20 @@ mod tests {
 
         // A recent directory may belong to another live receiver.
         assert_eq!(
-            sweep_stale_staging(&root, &downloads, Duration::from_secs(3600), &events),
+            sweep_stale_staging(
+                &root,
+                &downloads,
+                Duration::from_secs(3600),
+                &events,
+                &no_encryption(),
+            ),
             0
         );
         assert!(fresh.join("b.bin").exists());
 
         // Old enough: only Kalo's own staging is recovered.
         assert_eq!(
-            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events),
+            sweep_stale_staging(&root, &downloads, Duration::ZERO, &events, &no_encryption(),),
             1
         );
         assert!(!fresh.exists());

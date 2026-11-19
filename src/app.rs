@@ -8,11 +8,12 @@ use std::time::Duration;
 use futures_util::SinkExt;
 use iced::widget::{
     button, column, container, image as image_widget, progress_bar, row, rule, scrollable, space,
-    text,
+    text, text_input,
 };
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Padding, Subscription, Task};
 use tokio::sync::broadcast;
 
+use crate::crypto::{Encryption, MIN_PASSPHRASE_CHARS};
 use crate::events::{
     Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
 };
@@ -33,6 +34,7 @@ struct EventBus {
     pending: PendingTransfers,
     save_dir: SaveDir,
     authorizer: Authorizer,
+    encryption: Encryption,
     /// Screenshot mode: never touch Bluetooth or the user's config.
     demo: bool,
 }
@@ -52,6 +54,7 @@ impl EventBus {
             self.save_dir.clone(),
             self.sink.clone(),
             self.authorizer.clone(),
+            self.encryption.clone(),
         ));
     }
 }
@@ -77,6 +80,10 @@ pub enum Message {
         result: Result<String, String>,
     },
     ToggleTheme,
+    ToggleEncryption,
+    EncryptionPassphraseChanged(String),
+    SaveEncryptionPassphrase,
+    ClearEncryptionPassphrase,
     PickSaveFolder,
     SaveFolderPicked(Option<PathBuf>),
     OpenPath(PathBuf),
@@ -175,6 +182,10 @@ struct App {
     trust: TrustStore,
     authorizer: Authorizer,
     save_dir: SaveDir,
+    encryption: Encryption,
+    /// New passphrase typed in the settings row. The saved secret stays in
+    /// the shared handle and never returns to the text field.
+    passphrase_draft: String,
     picking_folder: bool,
     pending_authorizations: Vec<AuthPromptUi>,
     last_saved: Option<SavedUi>,
@@ -227,6 +238,8 @@ fn demo_settings() -> Settings {
     Settings {
         theme,
         save_dir: Some(PathBuf::from("/home/you/Downloads")),
+        encrypt_sends: false,
+        encryption_passphrase: String::new(),
     }
 }
 
@@ -308,6 +321,10 @@ pub fn run() -> iced::Result {
             .clone()
             .unwrap_or_else(paths::downloads_dir),
     );
+    let encryption = Encryption::new(
+        settings.encrypt_sends,
+        settings.encryption_passphrase.clone(),
+    );
     let authorizer = Authorizer::new(trust.clone(), sink.clone(), true);
     let receiver = ReceiverHandle::new(sink.clone());
     if EVENT_BUS
@@ -317,6 +334,7 @@ pub fn run() -> iced::Result {
             pending: new_pending(),
             save_dir: save_dir.clone(),
             authorizer: authorizer.clone(),
+            encryption: encryption.clone(),
             demo,
         })
         .is_err()
@@ -334,6 +352,13 @@ pub fn run() -> iced::Result {
             }
             if let Some(note) = trust_note.clone() {
                 log.push(note);
+            }
+            if settings.encrypt_sends && !encryption.enabled() {
+                log.push(
+                    "Outgoing encryption is off because the saved passphrase is missing or too \
+                     short; set a valid passphrase to enable it."
+                        .to_string(),
+                );
             }
             let start = startup(bus, demo, log);
             let app = App {
@@ -361,6 +386,8 @@ pub fn run() -> iced::Result {
                 trust: trust.clone(),
                 authorizer: authorizer.clone(),
                 save_dir: save_dir.clone(),
+                encryption: encryption.clone(),
+                passphrase_draft: String::new(),
                 picking_folder: false,
                 pending_authorizations: if demo {
                     vec![AuthPromptUi {
@@ -578,9 +605,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.send_result = None;
 
             let tx = app.tx.clone();
+            let encryption = app.encryption.clone();
             Task::perform(
                 async move {
-                    platform::send(&mac, &files, &tx, send_id, cancel)
+                    platform::send(&mac, &files, &tx, send_id, cancel, &encryption)
                         .await
                         .map(|summary| {
                             if summary.files == 1 {
@@ -659,6 +687,62 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             };
             app.persist_settings();
             app.log(format!("{label} theme enabled"));
+            Task::none()
+        }
+        Message::ToggleEncryption => {
+            let enable = !app.encryption.enabled();
+            if enable && !app.encryption.has_strong_passphrase() {
+                app.log(format!(
+                    "Set a shared passphrase of at least {MIN_PASSPHRASE_CHARS} characters \
+                     before enabling encryption."
+                ));
+                return Task::none();
+            }
+            app.encryption.set_enabled(enable);
+            app.settings.encrypt_sends = enable;
+            app.persist_settings();
+            app.log(if enable {
+                "Outgoing encryption on: Kalo receivers with the same passphrase can open these files."
+                    .to_string()
+            } else {
+                "Outgoing encryption off: files are sent as standard OPP objects.".to_string()
+            });
+            Task::none()
+        }
+        Message::EncryptionPassphraseChanged(passphrase) => {
+            app.passphrase_draft = passphrase;
+            Task::none()
+        }
+        Message::SaveEncryptionPassphrase => {
+            let passphrase = std::mem::take(&mut app.passphrase_draft);
+            if passphrase.is_empty() {
+                app.log("Type a shared passphrase first, or use Clear to remove the saved one.");
+                return Task::none();
+            }
+            if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+                app.passphrase_draft = passphrase;
+                app.log(format!(
+                    "The encryption passphrase must be at least {MIN_PASSPHRASE_CHARS} characters."
+                ));
+                return Task::none();
+            }
+            app.encryption.set_passphrase(passphrase.clone());
+            app.settings.encryption_passphrase = passphrase;
+            app.settings.encrypt_sends = app.encryption.enabled();
+            app.persist_settings();
+            app.log(
+                "Encryption passphrase saved. Incoming Kalo containers are decrypted automatically.",
+            );
+            Task::none()
+        }
+        Message::ClearEncryptionPassphrase => {
+            app.passphrase_draft.clear();
+            app.encryption.set_passphrase(String::new());
+            app.encryption.set_enabled(false);
+            app.settings.encryption_passphrase.clear();
+            app.settings.encrypt_sends = false;
+            app.persist_settings();
+            app.log("Encryption passphrase cleared; outgoing encryption is off.");
             Task::none()
         }
         Message::PickSaveFolder => {
@@ -1302,6 +1386,7 @@ fn view(app: &App) -> Element<'_, Message> {
         incoming_body = incoming_body.push(saved_banner(saved, p));
     }
     incoming_body = incoming_body.push(save_folder_row(&app.save_dir.get(), app.picking_folder, p));
+    incoming_body = incoming_body.push(encryption_row(&app.encryption, &app.passphrase_draft, p));
     if app.show_trust {
         incoming_body = incoming_body.push(trust_panel(
             app.trust.entries(),
@@ -1972,6 +2057,96 @@ fn save_folder_row<'a>(save_dir: &Path, picking: bool, p: &ui::Palette) -> Eleme
     .into()
 }
 
+fn encryption_row<'a>(
+    encryption: &Encryption,
+    draft: &'a str,
+    p: &ui::Palette,
+) -> Element<'a, Message> {
+    let enabled = encryption.enabled();
+    let configured = encryption.is_configured();
+    let field = text_input(
+        if configured {
+            "Replace the shared passphrase…"
+        } else {
+            "Shared passphrase (12+ characters)"
+        },
+        draft,
+    )
+    .secure(true)
+    .on_input(Message::EncryptionPassphraseChanged)
+    .on_submit(Message::SaveEncryptionPassphrase)
+    .padding([5, 8])
+    .size(10.5)
+    .width(Length::Fill)
+    .style(ui::text_field);
+
+    let mut actions = row![
+        text("Outgoing encryption")
+            .size(9.5)
+            .color(p.text_muted)
+            .width(Length::Fill),
+        button(
+            text(if enabled { "On" } else { "Off" })
+                .size(10)
+                .font(ui::MEDIUM)
+        )
+        .padding([3, 8])
+        .style(ui::policy_button(enabled))
+        .on_press(Message::ToggleEncryption),
+        button(text("Save").size(10).font(ui::MEDIUM))
+            .padding([3, 8])
+            .style(ui::secondary_button)
+            .on_press(Message::SaveEncryptionPassphrase),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if configured {
+        actions = actions.push(
+            button(text("Clear").size(10).font(ui::MEDIUM))
+                .padding([3, 8])
+                .style(ui::secondary_button)
+                .on_press(Message::ClearEncryptionPassphrase),
+        );
+    }
+
+    container(
+        column![
+            row![
+                text("File encryption")
+                    .size(10.5)
+                    .font(ui::SEMIBOLD)
+                    .color(p.text),
+                text(if configured {
+                    "passphrase set"
+                } else {
+                    "no passphrase"
+                })
+                .size(9.5)
+                .color(if configured {
+                    p.success_text
+                } else {
+                    p.text_muted
+                }),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            field,
+            actions,
+            text(
+                "Kalo-to-Kalo only: both devices need the same passphrase. Standard OPP \
+                 receivers cannot open encrypted files."
+            )
+            .size(9.5)
+            .color(p.text_muted),
+        ]
+        .spacing(6),
+    )
+    .padding([7, 9])
+    .width(Length::Fill)
+    .style(ui::inset)
+    .into()
+}
+
 fn trust_panel(
     entries: Vec<(String, crate::trust::TrustEntry)>,
     policy: IncomingPolicy,
@@ -2254,7 +2429,7 @@ mod ui {
     use iced::font::Weight;
     use iced::gradient;
     use iced::theme::Base;
-    use iced::widget::{button, container, progress_bar, rule};
+    use iced::widget::{button, container, progress_bar, rule, text_input};
     use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
     use crate::settings::ThemeKind;
@@ -2671,6 +2846,27 @@ mod ui {
         }
     }
 
+    pub fn text_field(theme: &Theme, status: text_input::Status) -> text_input::Style {
+        let p = palette_for(theme);
+        let border = match status {
+            text_input::Status::Focused { .. } => p.accent,
+            text_input::Status::Hovered => p.border_strong,
+            _ => p.border,
+        };
+        text_input::Style {
+            background: Background::Color(p.surface_alt),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: 7.0.into(),
+            },
+            icon: p.text_muted,
+            placeholder: p.text_muted,
+            value: p.text,
+            selection: p.accent_dim,
+        }
+    }
+
     pub fn policy_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         move |theme, status| {
             let p = palette_for(theme);
@@ -2950,6 +3146,8 @@ mod tests {
             authorizer: Authorizer::new(trust.clone(), sink, true),
             trust,
             save_dir: SaveDir::new(PathBuf::from("/tmp/kalo-downloads")),
+            encryption: Encryption::new(false, String::new()),
+            passphrase_draft: String::new(),
             picking_folder: false,
             pending_authorizations: Vec::new(),
             last_saved: None,

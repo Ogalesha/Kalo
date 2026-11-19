@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
+use crate::crypto::Encryption;
 use crate::events::EventSink;
 use crate::receiver::ReceiverHandle;
 use crate::settings::SaveDir;
@@ -38,6 +39,7 @@ pub async fn run_receiver(
     _save_dir: SaveDir,
     events: EventSink,
     _authorizer: Authorizer,
+    _encryption: Encryption,
 ) -> ! {
     handle.mark_lost(REASON);
     events.send(crate::events::Event::Log(REASON.to_string()));

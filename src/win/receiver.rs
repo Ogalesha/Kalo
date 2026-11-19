@@ -27,6 +27,7 @@ use windows::Networking::Sockets::{
 
 use super::rfcomm::RfcommStream;
 use super::{ComGuard, format_mac, hstring, run_blocking};
+use crate::crypto::{self, Encryption};
 use crate::events::{Event, EventSink};
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
@@ -71,6 +72,10 @@ pub async fn receive() -> Result<()> {
             .clone()
             .unwrap_or_else(crate::paths::downloads_dir),
     );
+    let encryption = Encryption::new(
+        settings.encrypt_sends,
+        settings.encryption_passphrase.clone(),
+    );
     let (trust, trust_warning) = TrustStore::load();
     if let Some(warning) = trust_warning {
         eprintln!("warning: {warning}");
@@ -93,7 +98,7 @@ pub async fn receive() -> Result<()> {
         }
     });
 
-    run_receiver(handle, pending, save_dir, events, authorizer).await
+    run_receiver(handle, pending, save_dir, events, authorizer, encryption).await
 }
 
 /// Supervise the advertised RFCOMM OPP service. Advertising failures (radio
@@ -104,15 +109,23 @@ pub async fn run_receiver(
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    encryption: Encryption,
 ) -> ! {
     loop {
-        sweep_staging(&save_dir.get(), &events);
+        sweep_staging(&save_dir.get(), &events, &encryption);
         let start_save_dir = save_dir.clone();
         let start_events = events.clone();
         let start_authorizer = authorizer.clone();
-        let started =
-            run_blocking(move || start_advertising(start_save_dir, start_events, start_authorizer))
-                .await;
+        let start_encryption = encryption.clone();
+        let started = run_blocking(move || {
+            start_advertising(
+                start_save_dir,
+                start_events,
+                start_authorizer,
+                start_encryption,
+            )
+        })
+        .await;
         match started {
             Ok(service) => {
                 let registration = handle.begin_registration();
@@ -125,7 +138,7 @@ pub async fn run_receiver(
                 let _service = service;
                 loop {
                     tokio::time::sleep(SWEEP_INTERVAL).await;
-                    sweep_staging(&save_dir.get(), &events);
+                    sweep_staging(&save_dir.get(), &events, &encryption);
                     if !handle.is_active() {
                         break;
                     }
@@ -183,6 +196,7 @@ struct ConnectionContext {
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    encryption: Encryption,
     /// Bounded number of simultaneous incoming connections.
     active: Arc<AtomicUsize>,
 }
@@ -213,6 +227,7 @@ fn start_advertising(
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    encryption: Encryption,
 ) -> Result<ReceiverService> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
@@ -225,13 +240,14 @@ fn start_advertising(
                 return;
             }
         };
-        let (provider, listener, _handler) = match advertise(save_dir, events, authorizer) {
-            Ok(parts) => parts,
-            Err(error) => {
-                let _ = ready_tx.send(Err(format!("{error:#}")));
-                return;
-            }
-        };
+        let (provider, listener, _handler) =
+            match advertise(save_dir, events, authorizer, encryption) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("{error:#}")));
+                    return;
+                }
+            };
         if let Err(error) = provider.StartAdvertising(&listener) {
             let _ = ready_tx.send(Err(format!(
                 "advertise the OBEX Object Push service: {error}"
@@ -258,6 +274,7 @@ fn advertise(
     save_dir: SaveDir,
     events: EventSink,
     authorizer: Authorizer,
+    encryption: Encryption,
 ) -> Result<(
     RfcommServiceProvider,
     StreamSocketListener,
@@ -273,6 +290,7 @@ fn advertise(
         save_dir,
         events,
         authorizer,
+        encryption,
         active: Arc::new(AtomicUsize::new(0)),
     });
     let handler: ConnectionHandler = TypedEventHandler::new(
@@ -473,7 +491,12 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
 
                 if last_chunk {
                     let transfer = incoming.take().expect("incoming exists");
-                    match finish_transfer(transfer, &context.save_dir.get(), &context.events) {
+                    match finish_transfer(
+                        transfer,
+                        &context.save_dir.get(),
+                        &context.events,
+                        &context.encryption,
+                    ) {
                         Ok(SaveOutcome::Saved) => {
                             if let Err(error) =
                                 stream.write_response(&Response::new(ResponseCode::Success))
@@ -484,7 +507,7 @@ fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
                                 break;
                             }
                         }
-                        Ok(SaveOutcome::Blocked) => {
+                        Ok(SaveOutcome::Blocked | SaveOutcome::Rejected) => {
                             let _ = stream.write_response(&Response::new(ResponseCode::Forbidden));
                             break;
                         }
@@ -655,6 +678,7 @@ fn start_transfer(
 enum SaveOutcome {
     Saved,
     Blocked,
+    Rejected,
 }
 
 /// Move a completed file into Downloads and report the transfer.
@@ -662,6 +686,7 @@ fn finish_transfer(
     mut transfer: Incoming,
     downloads: &Path,
     events: &EventSink,
+    encryption: &Encryption,
 ) -> Result<SaveOutcome> {
     transfer.close();
     // The incremental hash must cover exactly the bytes written to disk.
@@ -671,6 +696,9 @@ fn finish_transfer(
             transfer.hasher.bytes(),
             transfer.bytes
         );
+    }
+    if crypto::is_container(&transfer.dest)? {
+        return finish_encrypted_transfer(transfer, downloads, events, encryption);
     }
     let digest = std::mem::take(&mut transfer.hasher).finish();
     if security::is_blocked(digest) {
@@ -761,9 +789,195 @@ fn finish_transfer(
     Ok(SaveOutcome::Saved)
 }
 
+/// Decrypt a completed Kalo container, scan the plaintext and save it under
+/// its authenticated original name.
+fn finish_encrypted_transfer(
+    transfer: Incoming,
+    downloads: &Path,
+    events: &EventSink,
+    encryption: &Encryption,
+) -> Result<SaveOutcome> {
+    let Some(decryptor) = encryption.decryptor() else {
+        let _ = std::fs::remove_file(&transfer.dest);
+        let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+        events.send(Event::IncomingFailed {
+            id: transfer.id,
+            sender: transfer.sender,
+            name: transfer.name,
+            error: "received an encrypted Kalo file but no encryption passphrase is configured; \
+                    the container was deleted"
+                .into(),
+            staged_at: None,
+        });
+        return Ok(SaveOutcome::Rejected);
+    };
+    let mut out_of_space = false;
+    let decrypted =
+        match decryptor.decrypt_to_gated(&transfer.dest, &transfer.staging_dir, |size| {
+            match security::ensure_free_space(&transfer.staging_dir, Some(size)) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    out_of_space = true;
+                    Err(error.context("make room for the decrypted file in staging"))
+                }
+            }
+        }) {
+            Ok(decrypted) => decrypted,
+            // Keep the container when the disk is full; the recovery sweep can
+            // retry once space is available.
+            Err(error) if out_of_space => {
+                events.send(Event::IncomingFailed {
+                    id: transfer.id,
+                    sender: transfer.sender,
+                    name: transfer.name,
+                    error: format!("{error:#}"),
+                    staged_at: Some(transfer.dest),
+                });
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&transfer.dest);
+                let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+                events.send(Event::IncomingFailed {
+                    id: transfer.id,
+                    sender: transfer.sender,
+                    name: transfer.name,
+                    error: format!(
+                        "cannot decrypt the incoming file (wrong passphrase or corrupted \
+                         container): {error:#}; the container was deleted"
+                    ),
+                    staged_at: None,
+                });
+                return Ok(SaveOutcome::Rejected);
+            }
+        };
+    let name = sanitize::filename(&decrypted.name);
+    if name != decrypted.name {
+        events.send(Event::Log(format!(
+            "renamed encrypted file {:?} to {:?}",
+            decrypted.name, name
+        )));
+    }
+
+    let scan = match security::scan_received_file(&decrypted.path) {
+        Ok(scan) => scan,
+        Err(error) => {
+            let _ = std::fs::remove_file(&decrypted.path);
+            let _ = std::fs::remove_file(&transfer.dest);
+            let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+            events.send(Event::IncomingFailed {
+                id: transfer.id,
+                sender: transfer.sender,
+                name: transfer.name,
+                error: format!(
+                    "cannot verify the decrypted file: {error:#}; both the decrypted copy and \
+                     the container were deleted"
+                ),
+                staged_at: None,
+            });
+            return Ok(SaveOutcome::Rejected);
+        }
+    };
+    if scan.blocked {
+        let _ = std::fs::remove_file(&decrypted.path);
+        let _ = std::fs::remove_file(&transfer.dest);
+        let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+        events.send(Event::IncomingFailed {
+            id: transfer.id,
+            sender: transfer.sender,
+            name: transfer.name,
+            error: format!(
+                "the decrypted file matches a known malicious SHA-256 hash ({}); it was deleted",
+                security::digest_hex(scan.digest)
+            ),
+            staged_at: None,
+        });
+        return Ok(SaveOutcome::Blocked);
+    }
+
+    let persisted = (|| -> Result<(PathBuf, u64)> {
+        std::fs::create_dir_all(downloads)
+            .with_context(|| format!("create Downloads directory {downloads:?}"))?;
+        security::ensure_free_space(downloads, Some(decrypted.size))?;
+        let mut final_path = sanitize::unique_in_dir(downloads, &name);
+        loop {
+            match sanitize::move_file(&decrypted.path, &final_path) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    final_path = sanitize::unique_in_dir(downloads, &name);
+                }
+                Err(error) => return Err(error).context("move decrypted file into Downloads"),
+            }
+        }
+        Ok((final_path, decrypted.size))
+    })();
+
+    let (final_path, bytes) = match persisted {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            // Keep the ciphertext container for the recovery sweep, but never
+            // leave a plaintext copy where the plain-file walk could pick it
+            // up as an ordinary transfer.
+            let _ = std::fs::remove_file(&decrypted.path);
+            events.send(Event::IncomingFailed {
+                id: transfer.id,
+                sender: transfer.sender,
+                name: transfer.name,
+                error: format!("{error:#}"),
+                staged_at: Some(transfer.dest),
+            });
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = security::harden_received_file(&final_path) {
+        events.send(Event::Log(format!(
+            "warning: cannot harden {}: {error:#}",
+            final_path.display()
+        )));
+    }
+    let container_bytes = transfer.bytes;
+    let elapsed_secs = transfer.started.elapsed().as_secs_f64();
+    let mbps = if elapsed_secs > 0.0 {
+        bytes as f64 / (1024.0 * 1024.0) / elapsed_secs
+    } else {
+        0.0
+    };
+    events.send(Event::Log(format!(
+        "decrypted {name} from an encrypted container ({} on the wire, {} plaintext)",
+        crate::events::format_bytes(container_bytes),
+        crate::events::format_bytes(bytes)
+    )));
+    events.send(Event::IncomingDone {
+        id: transfer.id,
+        sender: transfer.sender,
+        name,
+        saved_to: final_path,
+        bytes,
+        elapsed_secs,
+        mbps,
+        partial: false,
+    });
+    let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+    Ok(SaveOutcome::Saved)
+}
+
 /// Keep a usable partial file in staging and tell the UI where it is.
 fn fail_keep(mut transfer: Incoming, events: &EventSink, error: String) {
     transfer.close();
+    // A partial encrypted container can never be decrypted; keeping it only
+    // leaves unreadable bytes and plaintext-free clutter behind.
+    if crypto::is_container(&transfer.dest).unwrap_or(false) {
+        let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+        events.send(Event::IncomingFailed {
+            id: transfer.id,
+            sender: transfer.sender,
+            name: transfer.name,
+            error: format!("{error}; the partial encrypted container was deleted"),
+            staged_at: None,
+        });
+        return;
+    }
     events.send(Event::IncomingFailed {
         id: transfer.id,
         sender: transfer.sender,
@@ -851,7 +1065,7 @@ fn staging_root() -> PathBuf {
 }
 
 /// Recover files left behind by an interrupted Kalo run.
-fn sweep_staging(downloads: &Path, events: &EventSink) {
+fn sweep_staging(downloads: &Path, events: &EventSink, encryption: &Encryption) {
     let root = staging_root();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
@@ -868,7 +1082,7 @@ fn sweep_staging(downloads: &Path, events: &EventSink) {
         if !stale {
             continue;
         }
-        recovered += recover_staging_dir(&entry.path(), downloads, events);
+        recovered += recover_staging_dir(&entry.path(), downloads, events, encryption);
     }
     if recovered > 0 {
         events.send(Event::Log(format!(
@@ -892,7 +1106,12 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
     newest
 }
 
-fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usize {
+fn recover_staging_dir(
+    dir: &Path,
+    downloads: &Path,
+    events: &EventSink,
+    encryption: &Encryption,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -904,6 +1123,33 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
             .unwrap_or(false)
         {
             continue;
+        }
+        let file_name = entry.file_name();
+        if file_name
+            .to_string_lossy()
+            .starts_with(crypto::DECRYPT_TEMP_PREFIX)
+        {
+            let _ = std::fs::remove_file(entry.path());
+            events.send(Event::Log(format!(
+                "removed a stale decrypted temporary file at {:?}",
+                entry.path()
+            )));
+            continue;
+        }
+        match crypto::is_container(&entry.path()) {
+            Ok(true) => {
+                recovered +=
+                    recover_encrypted_staged(&entry.path(), dir, downloads, events, encryption);
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                events.send(Event::Log(format!(
+                    "left a stale staged file with unreadable headers at {:?}: {error:#}",
+                    entry.path()
+                )));
+                continue;
+            }
         }
         match security::scan_received_file(&entry.path()) {
             Ok(scan) if scan.blocked => {
@@ -964,4 +1210,115 @@ fn recover_staging_dir(dir: &Path, downloads: &Path, events: &EventSink) -> usiz
         let _ = std::fs::remove_dir(dir);
     }
     recovered
+}
+
+/// Recover one stale encrypted container into Downloads. The container is
+/// only deleted after the plaintext has been moved; transient save failures
+/// keep it for the next sweep.
+fn recover_encrypted_staged(
+    container: &Path,
+    staging_dir: &Path,
+    downloads: &Path,
+    events: &EventSink,
+    encryption: &Encryption,
+) -> usize {
+    let Some(decryptor) = encryption.decryptor() else {
+        let _ = std::fs::remove_file(container);
+        events.send(Event::Log(format!(
+            "deleted a stale encrypted container at {:?}: no passphrase is configured",
+            container
+        )));
+        return 0;
+    };
+    let mut out_of_space = false;
+    let decrypted = match decryptor.decrypt_to_gated(container, staging_dir, |size| {
+        match security::ensure_free_space(staging_dir, Some(size)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                out_of_space = true;
+                Err(error.context("make room for the decrypted file in staging"))
+            }
+        }
+    }) {
+        Ok(decrypted) => decrypted,
+        Err(error) if out_of_space => {
+            events.send(Event::Log(format!(
+                "cannot recover a stale encrypted file yet: {error:#}"
+            )));
+            return 0;
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(container);
+            events.send(Event::Log(format!(
+                "deleted a stale encrypted container that could not be decrypted: {error:#}"
+            )));
+            return 0;
+        }
+    };
+    let name = sanitize::filename(&decrypted.name);
+
+    match security::scan_received_file(&decrypted.path) {
+        Ok(scan) if scan.blocked => {
+            let _ = std::fs::remove_file(&decrypted.path);
+            let _ = std::fs::remove_file(container);
+            events.send(Event::Log(format!(
+                "deleted a stale decrypted file that matches the malware hash list (SHA-256 {})",
+                security::digest_hex(scan.digest)
+            )));
+            return 0;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&decrypted.path);
+            let _ = std::fs::remove_file(container);
+            events.send(Event::Log(format!(
+                "deleted a stale decrypted file that could not be verified: {error:#}"
+            )));
+            return 0;
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(downloads) {
+        let _ = std::fs::remove_file(&decrypted.path);
+        events.send(Event::Log(format!(
+            "cannot recover an encrypted file into {downloads:?}: {error}"
+        )));
+        return 0;
+    }
+    if let Err(error) = security::ensure_free_space(downloads, Some(decrypted.size)) {
+        let _ = std::fs::remove_file(&decrypted.path);
+        events.send(Event::Log(format!(
+            "cannot recover an encrypted file into {downloads:?}: {error:#}"
+        )));
+        return 0;
+    }
+
+    let mut dest = sanitize::unique_in_dir(downloads, &name);
+    loop {
+        match sanitize::move_file(&decrypted.path, &dest) {
+            Ok(()) => {
+                if let Err(error) = security::harden_received_file(&dest) {
+                    events.send(Event::Log(format!(
+                        "warning: cannot harden {}: {error:#}",
+                        dest.display()
+                    )));
+                }
+                let _ = std::fs::remove_file(container);
+                events.send(Event::Log(format!(
+                    "recovered an encrypted file from an interrupted transfer as {:?}",
+                    dest
+                )));
+                return 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                dest = sanitize::unique_in_dir(downloads, &name);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&decrypted.path);
+                events.send(Event::Log(format!(
+                    "cannot recover an encrypted file into Downloads: {error}"
+                )));
+                return 0;
+            }
+        }
+    }
 }

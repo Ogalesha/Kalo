@@ -6,11 +6,13 @@
 //! the only thing backends must agree on.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
-use crate::events::{Event, EventSink};
+use crate::crypto::{Encryption, TempContainer};
+use crate::events::{Event, EventSink, format_bytes};
 use crate::security;
 use crate::transfer::{BatchSummary, Cancel};
 
@@ -55,15 +57,35 @@ pub async fn send(
     events: &EventSink,
     send_id: u64,
     cancel: Cancel,
+    encryption: &Encryption,
 ) -> Result<BatchSummary> {
     if files.is_empty() {
         bail!("no files to send");
     }
-    if let Some(error) = files
-        .iter()
-        .find_map(|file| security::check_send_file(file).err())
-    {
-        return Err(error);
+    let mut sizes = Vec::with_capacity(files.len());
+    for file in files {
+        sizes.push(security::check_send_file(file)?);
+    }
+    // Derive the batch key once, then validate every container size before
+    // anything moves. Argon2id is deliberately expensive, so keep it off the
+    // async runtime thread; a failure here still stops the batch before the
+    // receiver has anything to undo.
+    let encryption = encryption.clone();
+    let encryptor = tokio::task::spawn_blocking(move || encryption.encryptor())
+        .await
+        .context("encryption setup task failed")??
+        .map(Arc::new);
+    if let Some(encryptor) = &encryptor {
+        for (file, size) in files.iter().zip(&sizes) {
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| file.display().to_string());
+            encryptor
+                .container_len(*size, &name)
+                .with_context(|| format!("cannot encrypt {}", file.display()))?;
+        }
     }
     if cancel.is_cancelled() {
         bail!("send canceled");
@@ -85,11 +107,50 @@ pub async fn send(
             send_id,
             index: position + 1,
             total,
-            name,
+            name: name.clone(),
         });
-        let summary = send_one(mac, file, events, send_id, &cancel).await?;
+
+        let container = match &encryptor {
+            Some(encryptor) => {
+                events.send(Event::Log(format!(
+                    "encrypting {name} for Kalo-to-Kalo delivery…"
+                )));
+                let container = TempContainer::new()?;
+                let source = file.clone();
+                let target = container.path().to_path_buf();
+                let metadata_name = name.clone();
+                let encryptor = encryptor.clone();
+                let encrypted = tokio::task::spawn_blocking(move || {
+                    encryptor.encrypt_file(&source, &target, &metadata_name)
+                })
+                .await
+                .context("encryption task failed")??;
+                if cancel.is_cancelled() {
+                    bail!("send canceled");
+                }
+                events.send(Event::Log(format!(
+                    "encrypted {name} ({} container); the receiver needs the same passphrase",
+                    format_bytes(encrypted)
+                )));
+                Some(container)
+            }
+            None => None,
+        };
+        let send_path = container
+            .as_ref()
+            .map(|container| container.path())
+            .unwrap_or(file);
+        let summary = send_one(mac, send_path, events, send_id, &cancel).await?;
         events.send(Event::Log(summary.line()));
-        bytes += summary.bytes;
+        // Report the user's plaintext size in the batch summary; the backend
+        // line above still shows the actual ciphertext bytes on the wire.
+        bytes += if encryptor.is_some() {
+            sizes[position]
+        } else {
+            summary.bytes
+        };
+        // Drop the plaintext-equivalent temp container before the next file.
+        drop(container);
     }
 
     Ok(BatchSummary::new(

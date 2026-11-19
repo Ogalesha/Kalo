@@ -4,6 +4,7 @@
 //! - `platform` — platform facade (BlueZ/obexd, WinRT, IOBluetooth)
 //! - `receiver` — shared receiver status contract
 //! - `app`      — Iced UI (devices, send, receiver state, log)
+//! - `crypto`   — optional Kalo-to-Kalo authenticated file encryption
 //! - `events`   — shared event bus between background work and the UI
 //! - `sanitize` — filename safety for untrusted names
 //! - `security` — malware-hash checks, private files, free-space policy
@@ -31,6 +32,7 @@ mod agent;
 mod app;
 #[cfg(target_os = "linux")]
 mod bluez;
+mod crypto;
 mod events;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -135,6 +137,14 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
             for note in &selection.notes {
                 eprintln!("note: {note}");
             }
+            let (settings, settings_warning) = settings::Settings::load();
+            if let Some(warning) = settings_warning {
+                eprintln!("warning: {warning}");
+            }
+            let encryption = crypto::Encryption::new(
+                settings.encrypt_sends,
+                settings.encryption_passphrase.clone(),
+            );
             let events = events::EventSink::new(256);
             let mut rx = events.subscribe();
             let printer = tokio::spawn(async move {
@@ -164,7 +174,8 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
                 }
             });
             let (_cancel_handle, cancel) = transfer::Cancel::new();
-            let summary = platform::send(&mac, &selection.files, &events, 0, cancel).await;
+            let summary =
+                platform::send(&mac, &selection.files, &events, 0, cancel, &encryption).await;
             drop(events);
             let _ = printer.await;
             match summary {

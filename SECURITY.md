@@ -16,11 +16,12 @@ Kalo considers these adversaries:
 - A remote Bluetooth peer that offers or accepts files.
 - A malicious or accidentally selected local file.
 - An unknown sender trying to push a file to this computer.
+- A passive observer capturing Bluetooth traffic.
 - A compromised or unavailable malware-hash feed endpoint.
 - A local user or process reading Kalo's configuration and transfer data.
 
-The assets to protect are the user's files, the integrity of the host, and the
-privacy of transfer metadata.
+The assets to protect are the user's files, the integrity of the host, the
+privacy of transfer metadata, and the confidentiality of transferred content.
 
 ## What Kalo guarantees
 
@@ -94,6 +95,39 @@ privacy of transfer metadata.
   completes and the scan passes. Partial data is recovered only when the
   protocol and filesystem state make that safe.
 
+### Optional application-layer encryption
+
+Encryption is off by default. When it is enabled on both ends of a
+Kalo-to-Kalo transfer, the following applies:
+
+- Outgoing content is wrapped in a `KALOENC1` container. The original
+  filename and plaintext size are encrypted; the outer name is random and
+  non-identifying. The Bluetooth peer can still see that random name and the
+  ciphertext length.
+- The passphrase is stretched with Argon2id using 64 MiB of memory, three
+  iterations, one lane, and a fresh random 128-bit salt for each sending
+  batch. A memorable passphrase of at least 12 characters is required.
+- File data is split into 1 MiB records and sealed with XChaCha20-Poly1305.
+  Every record uses a fresh random 192-bit nonce and is bound to the container
+  header, its index, and its length. A final authenticated record covers the
+  chunk count and total plaintext size, so tampering, reordering, truncation,
+  and trailing data are all rejected.
+- One key is derived per outgoing batch and reused across its files; the
+  receiver caches up to eight derived keys keyed by salt and parameters.
+- A missing or wrong passphrase, an authentication failure, or a size
+  mismatch deletes the container instead of saving it.
+- Successfully decrypted plaintext is written to a private temporary file
+  inside the private staging directory, hashed against the malware
+  blocklist, checked against the authenticated size and available space, and
+  only then moved into the save folder under its sanitized original name.
+- Outgoing containers are created under the system temporary directory in a
+  private `kalo/outgoing` directory with random names. They are removed when
+  the send completes, is canceled, or returns an error; an abrupt process kill
+  can leave a temporary ciphertext file behind.
+- Container parsing validates the version, algorithms, KDF bounds, chunk
+  size, metadata bounds, and reserved flags before deriving a key, so a
+  malicious container cannot request an unbounded or absurdly cheap KDF.
+
 ### Malware hash blocklist
 
 - Sources: the bundled baseline in `assets/malware-sha256.txt` and the
@@ -126,6 +160,9 @@ privacy of transfer metadata.
 - Kalo's config directory is created with owner-only permissions (`0700` on
   Unix), and `settings.json`, `trust.json`, and the hash cache are written with
   `0600`. Writes go through a temporary file and an atomic rename.
+- `settings.json` stores the encryption passphrase in plaintext so the
+  receiver can decrypt without prompting every time. Treat read access to that
+  file as equivalent to knowledge of the passphrase.
 - Received files are private to the account that runs Kalo.
 
 ## What Kalo does not guarantee
@@ -134,10 +171,26 @@ privacy of transfer metadata.
   A malicious file with an unknown hash is not detected. Do not treat Kalo as a
   substitute for an operating-system security update, an antivirus product, or
   cautious behavior.
-- **No end-to-end encryption beyond Bluetooth.** OPP does not add an
-  application-layer encryption envelope. Pairing can enable link encryption,
-  but Kalo does not claim confidentiality against a compromised peer or a
-  compromised Bluetooth stack.
+- **Encryption is optional and Kalo-only.** With encryption off, OPP adds no
+  application-layer envelope; confidentiality depends on Bluetooth link
+  encryption from pairing and the operating system. Kalo does not claim
+  confidentiality against a compromised peer or a compromised Bluetooth
+  stack. A stock OPP receiver cannot open a Kalo container and saves it as an
+  opaque file; Apple's Bluetooth Sharing behaves the same way.
+- **Encryption has no forward secrecy, key rotation, or sender
+  authentication.** One shared passphrase protects all containers. Anyone who
+  learns the passphrase can decrypt previously captured containers and can
+  create containers the receiver will accept. There is no per-transfer key
+  exchange, revocation, or proof of which device sent a file. Argon2id slows
+  guessing but cannot make a weak passphrase safe.
+- **Encrypted outer metadata is visible.** The peer sees a random `.kalo`
+  name and the ciphertext size. The original filename and plaintext size are
+  encrypted. Once saved, decrypted content is ordinary plaintext at rest.
+- **The passphrase is stored in plaintext in Kalo's settings file.** On Unix
+  the file is mode `0600`; on Windows it lives in the private per-user
+  application-data directory. Any local process or user able to read that
+  file can recover the passphrase. OS keyring storage and a passphrase
+  prompt per session remain future work.
 - **No protection from operating-system or firmware vulnerabilities.** A flaw
   in the Bluetooth driver, the OBEX implementation, or the OS file APIs is
   outside Kalo's control. Keep the OS and Bluetooth stack updated.
@@ -162,6 +215,10 @@ privacy of transfer metadata.
   addresses you do not recognize.
 - Keep the save folder on a local filesystem with enough free space.
 - Review received files before opening them, even when they pass the blocklist.
+- Use encryption when sending between Kalo devices, with a long passphrase
+  that is unique to that pair or group. Turn it off when the receiver is a
+  stock OPP device, including a Mac using Bluetooth Sharing; an encrypted
+  container is opaque to those receivers.
 - On Linux, do not run a second OBEX agent at the same time; it can interfere
   with receiver registration.
 - On macOS, use Bluetooth Sharing only while you need it, and review its

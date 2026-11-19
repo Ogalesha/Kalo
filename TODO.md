@@ -93,13 +93,21 @@
       `sanitize::filename`; CI runs both for 60 seconds and uploads artifacts
       on failure. Fuzzing already caught and fixed a truncation path that could
       leave a trailing space after the 200-byte cap.
-- [ ] **Application-layer encryption for sent files.** Encrypt file contents so
-      a passive Bluetooth capture cannot read them even when the link itself is
-      not encrypted. This is possible only between two Kalo peers, which must
-      share a key or run an authenticated key exchange; stock OPP receivers
-      cannot decrypt a custom container. Filename and size would still be
-      visible to the network. Pairing already enables Bluetooth link
-      encryption, but it is not an app-layer guarantee.
+- [x] **Application-layer encryption for sent files.** Optional Kalo-to-Kalo
+      containers with a shared passphrase: Argon2id (64 MiB, 3 passes) plus
+      XChaCha20-Poly1305, encrypted filename and size metadata, authenticated
+      1 MiB chunks and a final record, fresh nonces, private temporary
+      containers, decrypt-scan-move on receive, and documented limits in
+      README and SECURITY. Off by default because stock OPP receivers cannot
+      open a container; the outer random name and ciphertext size remain
+      visible to the Bluetooth peer.
+- [ ] **Keyring-backed passphrase storage.** Replace the plaintext passphrase
+      in `settings.json` with an OS keyring entry and a per-session unlock,
+      avoiding secret storage in a readable config file.
+- [ ] **Authenticated per-device key exchange.** Replace the shared passphrase
+      with a paired-device handshake (for example a PAKE) to gain forward
+      secrecy, sender authentication, key rotation, and revocation while
+      keeping compatibility with Kalo peers.
 
 ## Engineering
 

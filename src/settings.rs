@@ -34,12 +34,36 @@ impl ThemeKind {
 
 /// Persisted preferences. Missing fields fall back to the defaults, so a
 /// future version can add settings without rejecting an older file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeKind,
     /// `None` means the platform Downloads directory.
     pub save_dir: Option<PathBuf>,
+    /// Encrypt outgoing files for Kalo receivers sharing the passphrase.
+    pub encrypt_sends: bool,
+    /// Shared passphrase. It is stored in the private settings file and is
+    /// also used to decrypt incoming Kalo containers even when outgoing
+    /// encryption is off.
+    pub encryption_passphrase: String,
+}
+
+/// Never include the passphrase in debug output. Settings can end up in a
+/// failed assertion or a diagnostic log, and the secret must not follow.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let passphrase = if self.encryption_passphrase.is_empty() {
+            "<unset>"
+        } else {
+            "<set>"
+        };
+        f.debug_struct("Settings")
+            .field("theme", &self.theme)
+            .field("save_dir", &self.save_dir)
+            .field("encrypt_sends", &self.encrypt_sends)
+            .field("encryption_passphrase", &passphrase)
+            .finish()
+    }
 }
 
 impl Settings {
@@ -172,6 +196,8 @@ mod tests {
         let settings = Settings {
             theme: ThemeKind::Light,
             save_dir: Some(dir.join("Received")),
+            encrypt_sends: true,
+            encryption_passphrase: "a long shared passphrase".into(),
         };
         settings.save_to(&path).unwrap();
 
@@ -179,6 +205,18 @@ mod tests {
         assert!(warning.is_none());
         assert_eq!(loaded, settings);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn debug_output_redacts_the_passphrase() {
+        let settings = Settings {
+            encrypt_sends: true,
+            encryption_passphrase: "a very secret shared passphrase".into(),
+            ..Settings::default()
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("very secret"));
+        assert!(debug.contains("<set>"));
     }
 
     #[test]
