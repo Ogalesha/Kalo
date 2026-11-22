@@ -47,6 +47,11 @@ pub(crate) const MAX_PAIR_BYTES: u64 = 64 * 1024;
 /// A pending pairing is abandoned after this long. The two OPP transfers that
 /// carry the request and the response each have their own deadlines.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+/// Incoming pairing requests bypass the file prompt, so a nearby device can
+/// create pending state without user interaction. Bound that state: each
+/// request is small, but an attacker must not be able to allocate an
+/// unbounded map by spoofing many Bluetooth addresses.
+const MAX_PENDING_PAIRINGS: usize = 32;
 const MAX_NAME_BYTES: usize = 200;
 
 /// Identify the pairing exchange without relying on a Bluetooth address: the
@@ -99,9 +104,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// again when the receiver chooses a folder; this copy is only for the UI and
 /// trust store.
 fn clean_name(name: &str) -> String {
-    let name: String = name
+    let name: String = crate::sanitize::strip_unsafe_text(name)
         .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .filter(|c| *c != '/' && *c != '\\')
         .collect();
     let mut name = name.trim().to_string();
     if name.len() > MAX_NAME_BYTES {
@@ -670,19 +675,45 @@ impl PairingManager {
         if self.trust.is_paired(&key) {
             bail!("this device is already paired; remove it from the trust list first");
         }
+        {
+            // Expire abandoned handshakes before accepting a new object, so a
+            // timed-out response or confirmation is never processed.
+            let mut pending = self.pending.lock().expect("pairing lock");
+            pending.cleanup();
+        }
         let parsed = parse_pair(bytes)?;
         match parsed.wire.kind.as_str() {
             "request" => {
                 {
-                    let mut pending = self.pending.lock().expect("pairing lock");
-                    pending.cleanup();
+                    let pending = self.pending.lock().expect("pairing lock");
                     if pending.outgoing.contains_key(&key) {
                         bail!("both devices started pairing at the same time; try again");
+                    }
+                    if pending.incoming.contains_key(&key) {
+                        bail!(
+                            "a pairing request from this device is already in progress; \
+                             wait for it to finish or expire"
+                        );
+                    }
+                    if pending.incoming.len() >= MAX_PENDING_PAIRINGS {
+                        bail!("too many pairing requests are already in progress; try again later");
                     }
                 }
                 let (response, state) = accept_request(&self.identity, passphrase, bytes)?;
                 {
                     let mut pending = self.pending.lock().expect("pairing lock");
+                    // Re-check under the lock: a concurrent request may have
+                    // inserted its state while this one was being built. Never
+                    // let a second request replace an in-flight handshake.
+                    if pending.incoming.contains_key(&key) {
+                        bail!(
+                            "a pairing request from this device is already in progress; \
+                             wait for it to finish or expire"
+                        );
+                    }
+                    if pending.incoming.len() >= MAX_PENDING_PAIRINGS {
+                        bail!("too many pairing requests are already in progress; try again later");
+                    }
                     pending.incoming.insert(
                         key.clone(),
                         Pending {
@@ -884,7 +915,7 @@ impl PairingFile {
             bytes.len() as u64 <= MAX_PAIR_BYTES,
             "the pairing object is too large"
         );
-        let dir = std::env::temp_dir().join("kalo").join("pairing");
+        let dir = paths::config_dir().join("pairing");
         security::create_private_dir(&dir)
             .with_context(|| format!("create pairing staging directory {}", dir.display()))?;
         let path = dir.join(format!("kalo-pair-{}.kalopair", Uuid::new_v4().simple()));
@@ -1042,6 +1073,54 @@ mod tests {
             bob_trust.outgoing_chain("AA:BB").unwrap().key,
             alice_trust.incoming_chain("AA:BB").unwrap().key
         );
+    }
+
+    #[test]
+    fn a_second_request_cannot_replace_an_in_flight_handshake() {
+        let alice = identity("Alice");
+        let bob = identity("Bob");
+        let trust = TrustStore::in_memory();
+        let manager = PairingManager::new(bob, trust, EventSink::new(32));
+
+        let (request1, alice_state) = start_pairing(&alice, PASSPHRASE).unwrap();
+        let response1 = manager
+            .handle_bytes("AA:BB", &request1, PASSPHRASE)
+            .unwrap()
+            .reply
+            .unwrap();
+
+        let (request2, _) = start_pairing(&alice, PASSPHRASE).unwrap();
+        let error = match manager.handle_bytes("AA:BB", &request2, PASSPHRASE) {
+            Ok(_) => panic!("a second pairing request must not replace the first"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("already in progress"));
+
+        // The first handshake is still intact and can be completed.
+        let (confirm, _) = finish_initiator(&alice, alice_state, &response1).unwrap();
+        manager.handle_bytes("AA:BB", &confirm, PASSPHRASE).unwrap();
+    }
+
+    #[test]
+    fn pending_pairing_requests_are_bounded() {
+        let alice = identity("Alice");
+        let bob = identity("Bob");
+        let manager = PairingManager::new(bob, TrustStore::in_memory(), EventSink::new(32));
+
+        // Each spoofed address starts a request that never gets a
+        // confirmation, so all states stay pending.
+        for index in 0..MAX_PENDING_PAIRINGS {
+            let (request, _) = start_pairing(&alice, PASSPHRASE).unwrap();
+            manager
+                .handle_bytes(&format!("AA:BB:{index:02X}"), &request, PASSPHRASE)
+                .unwrap();
+        }
+        let (request, _) = start_pairing(&alice, PASSPHRASE).unwrap();
+        let error = match manager.handle_bytes("AA:BB:FF", &request, PASSPHRASE) {
+            Ok(_) => panic!("a full pending set must reject another request"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("too many pairing requests"));
     }
 
     #[test]

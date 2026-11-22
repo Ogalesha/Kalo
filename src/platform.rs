@@ -83,14 +83,18 @@ pub async fn send(
     // A paired device always uses the authenticated per-device container.
     // Never downgrade a paired sender to the shared passphrase or plaintext:
     // that would silently weaken a channel the user explicitly paired.
-    let peer = if trust.is_paired(mac) {
+    // Fail closed on the pinned key, not on both directions being intact: a
+    // damaged incoming chain must not turn a paired send into a plaintext or
+    // shared-passphrase one that the peer would reject (or an impersonator
+    // could read).
+    let peer = if trust.is_pinned(mac) {
         let pairing = pairing.context(
             "this device is paired, but the local pairing identity is unavailable; \
              refusing to send without per-device encryption",
         )?;
         let chain = trust
             .outgoing_chain(mac)
-            .context("the paired device has no outgoing key chain")?;
+            .context("the paired device has no outgoing key chain; pair it again")?;
         Some((pairing.identity().signing_key(), chain.key, chain.step))
     } else {
         None

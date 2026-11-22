@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::paths;
 use crate::security;
 
 /// First eight bytes of every passphrase-encrypted Kalo container.
@@ -938,7 +939,12 @@ pub struct PeerDecrypted {
     pub path: PathBuf,
     pub name: String,
     pub size: u64,
-    pub step: u64,
+    /// Chain step the receiver held before decrypting this container.
+    pub from_step: u64,
+    /// Step the receiver must store as the next expected one. It can be more
+    /// than one step ahead of `from_step` when earlier sends were lost or
+    /// cancelled.
+    pub next_step: u64,
     pub next_key: [u8; 32],
 }
 
@@ -1145,7 +1151,8 @@ impl PeerDecryptor {
             path: output_path,
             name,
             size: plaintext_size,
-            step,
+            from_step: self.step,
+            next_step: parsed.step.saturating_add(1),
             next_key: chain_next(&chain, step),
         })
     }
@@ -1476,7 +1483,10 @@ pub struct TempContainer {
 
 impl TempContainer {
     pub fn new() -> Result<Self> {
-        let dir = std::env::temp_dir().join("kalo").join("outgoing");
+        // Keep staging inside Kalo's private per-user directory. A shared
+        // `/tmp/kalo` would let another local user pre-create the directory
+        // and deny encryption with permissions or symlink tricks.
+        let dir = paths::config_dir().join("outgoing");
         security::create_private_dir(&dir)
             .with_context(|| format!("create outgoing staging directory {}", dir.display()))?;
         Ok(Self {
@@ -1705,7 +1715,8 @@ mod tests {
             .decrypt_to_gated(&container1, &dir.join("out1"), |_| Ok(()))
             .unwrap();
         assert_eq!(decoded.name, "first.txt");
-        assert_eq!(decoded.step, 0);
+        assert_eq!(decoded.from_step, 0);
+        assert_eq!(decoded.next_step, 1);
         assert_eq!(std::fs::read(&decoded.path).unwrap(), b"first file");
         std::fs::remove_file(&decoded.path).unwrap();
 
@@ -1715,7 +1726,7 @@ mod tests {
         peer_chain(&encryptor2, &second, &container2, "second.txt");
         let decryptor = PeerDecryptor::new(
             decoded.next_key,
-            decoded.step + 1,
+            decoded.next_step,
             signing.verifying_key().to_bytes(),
         )
         .unwrap();
@@ -1723,12 +1734,77 @@ mod tests {
             .decrypt_to_gated(&container2, &dir.join("out2"), |_| Ok(()))
             .unwrap();
         assert_eq!(decoded.name, "second.txt");
-        assert_eq!(decoded.step, 1);
+        assert_eq!(decoded.from_step, 1);
+        assert_eq!(decoded.next_step, 2);
         assert_eq!(
             std::fs::read(&decoded.path).unwrap(),
             vec![3u8; MIN_CHUNK_SIZE as usize + 9]
         );
         std::fs::remove_file(&decoded.path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_containers_can_skip_failed_send_steps() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let base = [11u8; 32];
+        let mut chain = base;
+        let mut step = 0;
+        for _ in 0..3 {
+            let (next, next_step) = PeerEncryptor::new(chain, step, signing.clone()).next_state();
+            chain = next;
+            step = next_step;
+        }
+
+        let input = dir.join("input.bin");
+        std::fs::write(&input, b"after three burned steps").unwrap();
+        let container = dir.join("skipped.kalo");
+        PeerEncryptor::new(chain, step, signing.clone())
+            .encrypt_file(&input, &container, "skipped.txt")
+            .unwrap();
+
+        let decryptor = PeerDecryptor::new(base, 0, signing.verifying_key().to_bytes()).unwrap();
+        let decoded = decryptor
+            .decrypt_to_gated(&container, &dir.join("out"), |_| Ok(()))
+            .unwrap();
+        assert_eq!(decoded.from_step, 0);
+        assert_eq!(decoded.next_step, 4);
+        assert_eq!(decoded.next_key, chain_next(&chain, step));
+        assert_eq!(
+            std::fs::read(&decoded.path).unwrap(),
+            b"after three burned steps"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_container_at_the_maximum_skip_reports_a_committable_next_step() {
+        let dir = temp_dir();
+        let signing = peer_signing();
+        let base = [12u8; 32];
+        let mut chain = base;
+        let mut step = 0;
+        for _ in 0..MAX_CHAIN_SKIP {
+            let (next, next_step) = PeerEncryptor::new(chain, step, signing.clone()).next_state();
+            chain = next;
+            step = next_step;
+        }
+        assert_eq!(step, MAX_CHAIN_SKIP);
+
+        let input = dir.join("input.bin");
+        std::fs::write(&input, b"boundary").unwrap();
+        let container = dir.join("boundary.kalo");
+        PeerEncryptor::new(chain, step, signing.clone())
+            .encrypt_file(&input, &container, "boundary.txt")
+            .unwrap();
+
+        let decryptor = PeerDecryptor::new(base, 0, signing.verifying_key().to_bytes()).unwrap();
+        let decoded = decryptor
+            .decrypt_to_gated(&container, &dir.join("out"), |_| Ok(()))
+            .unwrap();
+        assert_eq!(decoded.from_step, 0);
+        assert_eq!(decoded.next_step, MAX_CHAIN_SKIP + 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

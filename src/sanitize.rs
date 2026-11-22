@@ -20,7 +20,7 @@ const WINDOWS_RESERVED: [&str; 22] = [
 pub fn filename(input: &str) -> String {
     let cleaned: String = input
         .chars()
-        .filter(|c| *c != '/' && *c != '\\' && !c.is_control())
+        .filter(|c| *c != '/' && *c != '\\' && !c.is_control() && !is_format_control(*c))
         .map(|c| {
             if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '_'
@@ -43,17 +43,54 @@ pub fn filename(input: &str) -> String {
     // Cap length (most filesystems allow 255 bytes per component). Cutting
     // the string can expose a trailing dot/space or leave a reserved name, so
     // re-apply those checks to the truncated result.
-    while name.len() > 200 {
-        name.pop();
-    }
-    let mut name = name.trim_end_matches(['.', ' ']).to_string();
+    truncate_name(&mut name);
     if name.is_empty() {
         name = "received-file".to_string();
     }
     if is_windows_reserved(&name) {
         name.insert(0, '_');
+        // The prefix is added after the cap check, so a 200-byte reserved
+        // name would otherwise become 201 bytes.
+        truncate_name(&mut name);
+        if name.is_empty() {
+            name = "received-file".to_string();
+        }
     }
     name
+}
+
+fn truncate_name(name: &mut String) {
+    while name.len() > 200 {
+        name.pop();
+    }
+    *name = name.trim_end_matches(['.', ' ']).to_string();
+}
+
+/// Unicode formatting controls are not `char::is_control`, but a remote name
+/// that contains a bidi override, a zero-width joiner, or a line separator can
+/// still display as a different filename than the one written to disk. Keep
+/// them out of filenames and peer-provided labels.
+pub fn is_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Remove control and format characters from a label that came from another
+/// device, while preserving ordinary punctuation and spaces for display.
+pub fn strip_unsafe_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_control(*c))
+        .collect()
 }
 
 fn is_windows_reserved(name: &str) -> bool {
@@ -101,6 +138,15 @@ pub fn unique_in_dir(dir: &Path, name: &str) -> PathBuf {
 /// cross-device), copy into a freshly created destination and only then
 /// remove the source. A failed copy removes its partial destination.
 pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
+    // A hard link shares the source inode, so the destination would briefly
+    // inherit whatever mode the staging file had. Tighten the source first;
+    // if permissions cannot be set, fail before the file enters a shared
+    // folder instead of relying on a later hardening step.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(src, std::fs::Permissions::from_mode(0o600))?;
+    }
     match std::fs::hard_link(src, dst) {
         Ok(()) => {
             if let Err(e) = std::fs::remove_file(src) {
@@ -128,7 +174,7 @@ fn link_fallback(e: &io::Error) -> bool {
 
 fn copy_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
-    let mut output = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let mut output = create_private_destination(dst)?;
     if let Err(e) = io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
         let _ = std::fs::remove_file(dst);
         return Err(e);
@@ -138,6 +184,20 @@ fn copy_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Create a new destination that is owner-only from the first byte, so the
+/// cross-device copy fallback never exposes received content under the
+/// process umask before `harden_received_file` runs.
+fn create_private_destination(dst: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(dst)
 }
 
 #[cfg(test)]
@@ -198,6 +258,29 @@ mod tests {
     }
 
     #[test]
+    fn reserved_name_prefix_cannot_exceed_the_length_cap() {
+        // 200 bytes when truncated, and still has a reserved stem before the
+        // dot, so the old code prefixed `_` and returned 201 bytes.
+        let input = format!("nUl{} .x", " ".repeat(194));
+        assert_eq!(input.len(), 200);
+        let name = filename(&input);
+        assert!(name.len() <= 200, "reserved prefix overflowed: {name:?}");
+        assert!(name.starts_with('_'), "reserved name was not neutralized");
+    }
+
+    #[test]
+    fn filename_strips_bidi_and_invisible_formatting() {
+        // A bidi override can make an executable extension render as if it
+        // were part of the visible name; zero-width characters can hide a
+        // dot entirely.
+        assert_eq!(filename("photo\u{202E}gnp.exe"), "photognp.exe");
+        assert_eq!(filename("report\u{200B}.pdf"), "report.pdf");
+        assert_eq!(filename("a\u{2028}b"), "ab");
+        assert_eq!(filename("nul\u{FEFF}"), "_nul");
+        assert_eq!(strip_unsafe_text("Pixel\u{202E} 8\n"), "Pixel 8");
+    }
+
+    #[test]
     fn unique_in_dir_numbers_collisions() {
         let dir = std::env::temp_dir().join(format!("kalo-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -247,6 +330,44 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"new");
         assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_file_tightens_permissions_before_linking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("kalo-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        std::fs::write(&src, b"received").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        move_file(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_fallback_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("kalo-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        std::fs::write(&src, b"secret").unwrap();
+        copy_no_replace(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

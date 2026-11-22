@@ -5,6 +5,7 @@
 //! UI; the CLI receiver accepts remembered senders only.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,11 @@ const REGISTRATION_RETRY: Duration = Duration::from_secs(15);
 const SESSION_BUS_RETRY: Duration = Duration::from_secs(5);
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STAGING_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Pairing replies open a fresh OPP connection from a background task. Bound
+/// the number of concurrent replies so a flood of control objects cannot pile
+/// up unbounded senders.
+static PAIRING_REPLY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// One in-flight incoming transfer.
 #[derive(Debug, Clone)]
@@ -157,6 +163,9 @@ fn opath(s: &str) -> zbus::Result<OwnedObjectPath> {
 pub struct AgentService {
     conn: Connection,
     pending: PendingTransfers,
+    /// Slots taken by requests that are still waiting for authorization and
+    /// are not yet present in `pending`.
+    reserved: Arc<AtomicUsize>,
     events: EventSink,
     handle: ReceiverHandle,
     registration: u64,
@@ -252,17 +261,20 @@ impl AgentService {
                 bail!("the pairing object is larger than the protocol allows");
             }
         }
-        if let Err(error) = self.accept_capacity(size) {
-            let reason = format!("{error:#}");
-            self.events.send(Event::IncomingFailed {
-                id: id.clone(),
-                sender: sender.clone(),
-                name: safe_name.clone(),
-                error: reason.clone(),
-                staged_at: None,
-            });
-            bail!("{reason}");
-        }
+        let reservation = match self.accept_capacity(size) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.events.send(Event::IncomingFailed {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    name: safe_name.clone(),
+                    error: reason.clone(),
+                    staged_at: None,
+                });
+                bail!("{reason}");
+            }
+        };
         if !control
             && let Err(reason) = self
                 .authorizer
@@ -301,10 +313,9 @@ impl AgentService {
         }
         let dest = staging_dir.join(&safe_name);
 
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .push(PendingTransfer {
+        {
+            let mut pending = self.pending.lock().expect("pending lock");
+            pending.push(PendingTransfer {
                 id: id.clone(),
                 name: safe_name.clone(),
                 sender: sender.clone(),
@@ -321,6 +332,11 @@ impl AgentService {
                 status_since: Instant::now(),
                 control,
             });
+            // The pending entry now counts toward the cap; release the
+            // pre-authorization reservation while the lock is held so a
+            // concurrent request cannot briefly exceed the limit.
+            drop(reservation);
+        }
 
         if control {
             self.events.send(Event::Log(format!(
@@ -339,18 +355,47 @@ impl AgentService {
 
     /// Refuse work this machine cannot safely accept: an object beyond the
     /// OPP cap, more than the bounded number of simultaneous pushes, or a
-    /// transfer that cannot fit on disk.
-    fn accept_capacity(&self, size: Option<u64>) -> Result<()> {
+    /// transfer that cannot fit on disk. The returned reservation covers the
+    /// window before the pending entry exists (including the user prompt).
+    fn accept_capacity(&self, size: Option<u64>) -> Result<CapacityReservation> {
         security::check_announced_size(size)?;
-        let active = self.pending.lock().expect("pending lock").len();
-        if active >= security::MAX_CONCURRENT_INCOMING {
-            bail!(
-                "too many simultaneous incoming transfers (limit {})",
-                security::MAX_CONCURRENT_INCOMING
-            );
-        }
-        security::ensure_free_space(&self.save_dir.get(), size)
+        let reservation = reserve_capacity(&self.pending, &self.reserved)?;
+        security::ensure_free_space(&self.save_dir.get(), size)?;
+        Ok(reservation)
     }
+}
+
+/// One reserved incoming slot. Dropping it releases the slot, including on
+/// every early-error path of the authorization flow.
+struct CapacityReservation {
+    reserved: Arc<AtomicUsize>,
+}
+
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        self.reserved.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_capacity(
+    pending: &PendingTransfers,
+    reserved: &Arc<AtomicUsize>,
+) -> Result<CapacityReservation> {
+    // Checking and reserving under the pending lock makes the total
+    // (registered entries + waiting requests) consistent even when transfers
+    // complete concurrently.
+    let list = pending.lock().expect("pending lock");
+    let active = list.len().saturating_add(reserved.load(Ordering::SeqCst));
+    if active >= security::MAX_CONCURRENT_INCOMING {
+        bail!(
+            "too many simultaneous incoming transfers (limit {})",
+            security::MAX_CONCURRENT_INCOMING
+        );
+    }
+    reserved.fetch_add(1, Ordering::SeqCst);
+    Ok(CapacityReservation {
+        reserved: reserved.clone(),
+    })
 }
 
 /// obexd's default root (`-r`), used only if `Session1.Root` cannot be read.
@@ -672,7 +717,8 @@ fn recover_encrypted_staged(
                 Ok(decrypted) => {
                     if let Err(error) = pairing.trust().commit_incoming(
                         &address,
-                        decrypted.step,
+                        decrypted.from_step,
+                        decrypted.next_step,
                         decrypted.next_key,
                     ) {
                         let _ = std::fs::remove_file(&decrypted.path);
@@ -1259,7 +1305,21 @@ fn finish_transfer(
         });
         return Ok(());
     }
+    let paired_sender = pairing.is_some_and(|pairing| pairing.trust().is_pinned(&p.sender));
     if let Some(kind) = crypto::container_kind(&p.dest)? {
+        if paired_sender && kind != crypto::ContainerKind::Peer {
+            let _ = std::fs::remove_file(&p.dest);
+            events.send(Event::IncomingFailed {
+                id: p.id.clone(),
+                sender: p.sender.clone(),
+                name: p.name.clone(),
+                error: "this sender is paired, so only authenticated per-device containers are \
+                        accepted; the shared-passphrase container was deleted"
+                    .into(),
+                staged_at: None,
+            });
+            return Ok(());
+        }
         return finish_encrypted_transfer(
             p,
             downloads,
@@ -1270,6 +1330,22 @@ fn finish_transfer(
             pairing,
             kind,
         );
+    }
+    if paired_sender {
+        // A paired device authenticates every file with its pinned identity.
+        // Accepting plaintext from its address would let an impersonator, or
+        // a downgraded sender, bypass that guarantee.
+        let _ = std::fs::remove_file(&p.dest);
+        events.send(Event::IncomingFailed {
+            id: p.id.clone(),
+            sender: p.sender.clone(),
+            name: p.name.clone(),
+            error: "this sender is paired, so plaintext files are not accepted; send from Kalo \
+                    with per-device encryption. The plaintext file was deleted"
+                .into(),
+            staged_at: None,
+        });
+        return Ok(());
     }
     let base = p
         .dest
@@ -1381,9 +1457,18 @@ fn finish_pairing_transfer(
                 p.sender, outcome.message
             )));
             if let Some(reply) = outcome.reply {
+                let Ok(permit) = PAIRING_REPLY_SLOTS.try_acquire() else {
+                    events.send(Event::Log(format!(
+                        "a pairing reply to {} was not sent because too many replies are \
+                         already in flight; retry pairing",
+                        p.sender
+                    )));
+                    return Ok(());
+                };
                 let peer = p.sender.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = crate::platform::send_control(&peer, &reply, &events).await
                     {
                         events.send(Event::Log(format!(
@@ -1553,7 +1638,8 @@ fn finish_encrypted_transfer(
                     // later rejected by the malware scan.
                     if let Err(error) = pairing.trust().commit_incoming(
                         &address,
-                        decrypted.step,
+                        decrypted.from_step,
+                        decrypted.next_step,
                         decrypted.next_key,
                     ) {
                         let _ = std::fs::remove_file(&decrypted.path);
@@ -1716,6 +1802,7 @@ async fn register_receiver(
     let service = AgentService {
         conn: conn.clone(),
         pending,
+        reserved: Arc::new(AtomicUsize::new(0)),
         events: events.clone(),
         handle: handle.clone(),
         registration,
@@ -2096,6 +2183,96 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kalo-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn paired_manager(dir: &Path) -> crate::identity::PairingManager {
+        let identity =
+            crate::identity::DeviceIdentity::load_from(&dir.join("identity.json")).unwrap();
+        let manager = crate::identity::PairingManager::new(
+            identity,
+            crate::trust::TrustStore::in_memory(),
+            EventSink::new(8),
+        );
+        manager
+            .trust()
+            .pin_peer("AA:BB", "Pixel 8", [1u8; 32], [2u8; 32], [3u8; 32])
+            .unwrap();
+        manager
+    }
+
+    #[test]
+    fn a_paired_sender_cannot_downgrade_to_plaintext() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.jpg");
+        std::fs::write(&dest, b"plaintext").unwrap();
+        let downloads = dir.join("Downloads");
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(dest.clone(), Some(9));
+        let pairing = paired_manager(&dir);
+
+        finalize_transfer(
+            &p,
+            &downloads,
+            &events,
+            false,
+            &no_encryption(),
+            Some(&pairing),
+        )
+        .unwrap();
+        assert!(
+            !dest.exists(),
+            "plaintext from a paired sender must be deleted"
+        );
+        assert!(
+            !sanitize::sender_dir(&downloads, "Pixel 8")
+                .join("photo.jpg")
+                .exists()
+        );
+        match rx.try_recv().unwrap() {
+            Event::IncomingFailed { error, .. } => {
+                assert!(error.contains("paired"), "unexpected error: {error}");
+                assert!(error.contains("plaintext"), "unexpected error: {error}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paired_sender_cannot_downgrade_to_the_shared_passphrase() {
+        let dir = temp_dir();
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let dest = staging.join("photo.kalo");
+        std::fs::write(&dest, b"KALOENC1 not a real container").unwrap();
+        let downloads = dir.join("Downloads");
+        let (events, mut rx) = event_sink();
+        let p = pending_transfer(dest.clone(), None);
+        let pairing = paired_manager(&dir);
+
+        finalize_transfer(
+            &p,
+            &downloads,
+            &events,
+            false,
+            &no_encryption(),
+            Some(&pairing),
+        )
+        .unwrap();
+        assert!(!dest.exists(), "passphrase container must be deleted");
+        match rx.try_recv().unwrap() {
+            Event::IncomingFailed { error, .. } => {
+                assert!(error.contains("paired"), "unexpected error: {error}");
+                assert!(
+                    error.contains("shared-passphrase"),
+                    "unexpected error: {error}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2611,6 +2788,24 @@ mod tests {
             Some("queued")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn waiting_authorizations_count_toward_the_incoming_limit() {
+        let pending = new_pending();
+        let reserved = Arc::new(AtomicUsize::new(0));
+        let mut held = Vec::new();
+        for _ in 0..security::MAX_CONCURRENT_INCOMING {
+            held.push(reserve_capacity(&pending, &reserved).unwrap());
+        }
+        assert!(reserve_capacity(&pending, &reserved).is_err());
+
+        held.pop();
+        let _next = reserve_capacity(&pending, &reserved).unwrap();
+        assert_eq!(
+            reserved.load(Ordering::SeqCst),
+            security::MAX_CONCURRENT_INCOMING
+        );
     }
 
     #[test]

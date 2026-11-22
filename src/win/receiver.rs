@@ -51,6 +51,19 @@ const STAGING_STALE_AGE: Duration = Duration::from_secs(30 * 60);
 const INCOMING_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Pairing replies open a fresh OPP connection from a detached worker. Keep
+/// the number of workers bounded so a flood of control objects cannot create
+/// threads without limit.
+const MAX_PAIRING_REPLY_THREADS: usize = 4;
+static PAIRING_REPLY_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+struct PairingReplyGuard;
+
+impl Drop for PairingReplyGuard {
+    fn drop(&mut self) {
+        PAIRING_REPLY_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 /// Re-check free space every 64 MiB while a sender writes, so a long or
 /// unknown-size transfer cannot fill the disk between the upfront check and
 /// completion.
@@ -319,7 +332,19 @@ fn advertise(
               args: windows::core::Ref<'_, StreamSocketListenerConnectionReceivedEventArgs>| {
             let socket = args.ok()?.Socket()?;
             let context = context.clone();
+            // Claim the slot before spawning the worker. A nearby device can
+            // open connections faster than they are served; spawning a thread
+            // first would let every rejected connection still consume a
+            // thread stack.
+            let Some(slot) = IncomingSlot::acquire(context.active.clone()) else {
+                context.events.send(Event::Log(format!(
+                    "rejected incoming connection: {} transfers are already active",
+                    security::MAX_CONCURRENT_INCOMING
+                )));
+                return Ok(());
+            };
             std::thread::spawn(move || {
+                let _slot = slot;
                 let _com = match ComGuard::new() {
                     Ok(com) => com,
                     Err(error) => {
@@ -340,13 +365,6 @@ fn advertise(
 
 /// Serve one accepted RFCOMM connection until it disconnects or fails.
 fn handle_connection(socket: StreamSocket, context: Arc<ConnectionContext>) {
-    let Some(_slot) = IncomingSlot::acquire(context.active.clone()) else {
-        context.events.send(Event::Log(format!(
-            "rejected incoming connection: {} transfers are already active",
-            security::MAX_CONCURRENT_INCOMING
-        )));
-        return;
-    };
     let sender = remote_sender(&socket);
     if sender.stable {
         context.events.send(Event::Log(format!(
@@ -765,8 +783,39 @@ fn finish_transfer(
     if transfer.control {
         return finish_pairing_transfer(transfer, events, encryption, pairing);
     }
+    let paired_sender = pairing.is_some_and(|pairing| pairing.trust().is_pinned(&transfer.address));
     if let Some(kind) = crypto::container_kind(&transfer.dest)? {
+        if paired_sender && kind != crypto::ContainerKind::Peer {
+            let _ = std::fs::remove_file(&transfer.dest);
+            let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+            events.send(Event::IncomingFailed {
+                id: transfer.id,
+                sender: transfer.sender,
+                name: transfer.name,
+                error: "this sender is paired, so only authenticated per-device containers are \
+                        accepted; the shared-passphrase container was deleted"
+                    .into(),
+                staged_at: None,
+            });
+            return Ok(SaveOutcome::Rejected);
+        }
         return finish_encrypted_transfer(transfer, downloads, events, encryption, pairing, kind);
+    }
+    if paired_sender {
+        // Never accept an unauthenticated plaintext file from the address of
+        // a paired device: that is exactly the downgrade pairing prevents.
+        let _ = std::fs::remove_file(&transfer.dest);
+        let _ = std::fs::remove_dir_all(&transfer.staging_dir);
+        events.send(Event::IncomingFailed {
+            id: transfer.id,
+            sender: transfer.sender,
+            name: transfer.name,
+            error: "this sender is paired, so plaintext files are not accepted; send from Kalo \
+                    with per-device encryption. The plaintext file was deleted"
+                .into(),
+            staged_at: None,
+        });
+        return Ok(SaveOutcome::Rejected);
     }
     let digest = std::mem::take(&mut transfer.hasher).finish();
     if security::is_blocked(digest) {
@@ -884,9 +933,20 @@ fn finish_pairing_transfer(
                 transfer.sender, outcome.message
             )));
             if let Some(reply) = outcome.reply {
+                if PAIRING_REPLY_THREADS.fetch_add(1, Ordering::SeqCst) >= MAX_PAIRING_REPLY_THREADS
+                {
+                    PAIRING_REPLY_THREADS.fetch_sub(1, Ordering::SeqCst);
+                    events.send(Event::Log(format!(
+                        "a pairing reply to {} was not sent because too many replies are \
+                         already in flight; retry pairing",
+                        transfer.address
+                    )));
+                    return Ok(SaveOutcome::Saved);
+                }
                 let peer = transfer.address.clone();
                 let events = events.clone();
                 std::thread::spawn(move || {
+                    let _guard = PairingReplyGuard;
                     let file = match crate::identity::PairingFile::new(&reply) {
                         Ok(file) => file,
                         Err(error) => {
@@ -1051,7 +1111,8 @@ fn finish_encrypted_transfer(
                 Ok(decrypted) => {
                     if let Err(error) = pairing.trust().commit_incoming(
                         &address,
-                        decrypted.step,
+                        decrypted.from_step,
+                        decrypted.next_step,
                         decrypted.next_key,
                     ) {
                         let _ = std::fs::remove_file(&decrypted.path);
@@ -1307,16 +1368,21 @@ fn remote_name(host: &HostName) -> Option<String> {
         .into_iter()
         .flatten()
     {
-        let name = hstring(name);
-        if !name.trim().is_empty() {
-            return Some(name);
+        let name = sanitize::strip_unsafe_text(&hstring(name));
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
         }
     }
     None
 }
 
 fn staging_root() -> PathBuf {
-    std::env::temp_dir().join("kalo").join("staging")
+    // Keep incoming staging in Kalo's per-user configuration directory rather
+    // than a shared temp path. `%TEMP%` is normally per-user, but a redirected
+    // or shared TEMP must not let another account pre-create the staging
+    // directory or read half-received files.
+    crate::paths::config_dir().join("staging")
 }
 
 /// Recover files left behind by an interrupted Kalo run.
@@ -1578,7 +1644,8 @@ fn recover_encrypted_staged(
                 Ok(decrypted) => {
                     if let Err(error) = pairing.trust().commit_incoming(
                         &address,
-                        decrypted.step,
+                        decrypted.from_step,
+                        decrypted.next_step,
                         decrypted.next_key,
                     ) {
                         let _ = std::fs::remove_file(&decrypted.path);

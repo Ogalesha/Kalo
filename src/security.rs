@@ -382,12 +382,12 @@ pub fn refresh() -> Result<usize> {
     }
 
     let mut hashes = bundled_hashes();
-    hashes.extend_from_slice(&public);
+    hashes.extend(previous);
     sort_and_dedup(&mut hashes);
     // Keep hashes learned earlier even after the upstream feed stops listing
     // them. A compromised endpoint can add false positives, but it cannot
     // silently remove detection of a sample this machine already knows.
-    merge_previous(&mut hashes, previous, MAX_ACTIVE_HASHES);
+    merge_fresh(&mut hashes, public, MAX_ACTIVE_HASHES);
 
     let path = cache_file();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -457,25 +457,27 @@ fn download_feed(agent: &ureq::Agent, feed: &Feed) -> Result<Vec<u8>> {
     )
 }
 
-/// Add the previously active hashes to a fresh snapshot without exceeding
-/// `cap`. The fresh feed is kept in full first, so an update cannot evict the
-/// hashes it just supplied when the cap is reached; older hashes only fill the
-/// room that is left.
-fn merge_previous(hashes: &mut Vec<[u8; 32]>, mut previous: Vec<[u8; 32]>, cap: usize) {
-    sort_and_dedup(hashes);
-    sort_and_dedup(&mut previous);
-    if hashes.len() >= cap {
-        hashes.truncate(cap);
+/// Add fresh feed hashes to the known list without dropping any cached one.
+/// Known hashes win the cap; an oversized feed can only delay new additions,
+/// never evict a detection the machine already had.
+fn merge_fresh(known: &mut Vec<[u8; 32]>, mut fresh: Vec<[u8; 32]>, cap: usize) {
+    sort_and_dedup(known);
+    sort_and_dedup(&mut fresh);
+    if known.len() >= cap {
+        // Never evict a hash the machine already had, even when the bundled
+        // baseline pushed the list a few entries past the cap. The load path
+        // bounds the cache, so this overflow stays bounded by the bundled
+        // list rather than growing with the feed.
         return;
     }
-    let room = cap - hashes.len();
-    let extra = previous
+    let room = cap - known.len();
+    let extra = fresh
         .into_iter()
-        .filter(|digest| hashes.binary_search(digest).is_err())
+        .filter(|digest| known.binary_search(digest).is_err())
         .take(room)
         .collect::<Vec<_>>();
-    hashes.extend(extra);
-    sort_and_dedup(hashes);
+    known.extend(extra);
+    sort_and_dedup(known);
 }
 
 /// Create a directory that only the current user can access.
@@ -751,20 +753,27 @@ mod tests {
     }
 
     #[test]
-    fn merge_previous_keeps_history_and_respects_the_cap() {
+    fn merge_fresh_keeps_history_and_respects_the_cap() {
         let mut hashes = vec![[1u8; 32], [2u8; 32]];
-        merge_previous(&mut hashes, vec![[2u8; 32], [3u8; 32]], 3);
+        merge_fresh(&mut hashes, vec![[2u8; 32], [3u8; 32]], 3);
         assert_eq!(hashes, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
 
+        // A full known list is never evicted to make room for fresh hashes.
         let mut capped = vec![[1u8; 32], [2u8; 32]];
-        merge_previous(&mut capped, vec![[3u8; 32]], 2);
+        merge_fresh(&mut capped, vec![[3u8; 32]], 2);
         assert_eq!(capped, vec![[1u8; 32], [2u8; 32]]);
 
-        // The fresh snapshot wins the cap; old hashes only fill the room
-        // that is left, even when they sort before the fresh ones.
-        let mut fresh = vec![[3u8; 32], [4u8; 32]];
-        merge_previous(&mut fresh, vec![[1u8; 32], [2u8; 32]], 3);
-        assert_eq!(fresh, vec![[1u8; 32], [3u8; 32], [4u8; 32]]);
+        // Fresh hashes fill the room that is left, even when they sort before
+        // known ones; the overflow is dropped, not the earlier detections.
+        let mut known = vec![[1u8; 32], [2u8; 32]];
+        merge_fresh(&mut known, vec![[3u8; 32], [4u8; 32]], 3);
+        assert_eq!(known, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+
+        // The bundled baseline can push a full cache slightly over the cap;
+        // that bounded overflow must not drop an existing detection.
+        let mut over = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        merge_fresh(&mut over, vec![[4u8; 32]], 2);
+        assert_eq!(over, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
     }
 
     #[test]

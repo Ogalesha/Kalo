@@ -4,6 +4,7 @@
 //! The file is written atomically so an interrupted save cannot leave a
 //! truncated preference behind.
 
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -250,7 +251,15 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).context("serialize config")?;
     let temporary = parent.join(format!(".kalo-{}.tmp", Uuid::new_v4().simple()));
     let write = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&temporary)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
             .with_context(|| format!("create {}", temporary.display()))?;
         crate::security::restrict_file_permissions(&temporary)?;
         file.write_all(&bytes)
@@ -313,6 +322,21 @@ mod tests {
         let (loaded, warning) = Settings::load_from(&path);
         assert!(warning.is_none());
         assert_eq!(loaded, settings);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        write_json(&path, &Settings::default()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

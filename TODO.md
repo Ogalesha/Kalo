@@ -149,7 +149,7 @@ weaken crypto, validation, authorization, or permissions to get a green
 build; never expose secrets in reports or logs; use isolated or mocked
 environments for destructive tests; do not probe unrelated devices.
 
-- [ ] **Phase 1 — Reconnaissance and threat model.** Map every module under
+- [x] **Phase 1 — Reconnaissance and threat model.** Map every module under
       `src/`, the BlueZ/obexd and WinRT/RFCOMM/OBEX stacks, send/receive and
       staging pipelines, filename handling, trust/authorization, crypto and
       secret storage, async tasks, GUI/CLI lifecycle, packaging (Ubuntu,
@@ -158,7 +158,7 @@ environments for destructive tests; do not probe unrelated devices.
       security-sensitive state transitions. Model assets, attacker
       capabilities (especially a nearby Bluetooth device), local and remote
       surfaces, abuse scenarios, existing controls, and gaps.
-- [ ] **Phase 2 — Deep audit.** Review Bluetooth/OBEX/RFCOMM authorization,
+- [x] **Phase 2 — Deep audit.** Review Bluetooth/OBEX/RFCOMM authorization,
       packet parsing, lengths/overflow, state transitions, replays,
       disconnects, resource exhaustion, cancellation, receiver restarts and
       registration conflicts. Review filesystem handling for traversal,
@@ -178,7 +178,7 @@ environments for destructive tests; do not probe unrelated devices.
       security indicators. Audit packaging permissions, scripts, download
       integrity, artifact contamination, privilege requirements, and release
       provenance.
-- [ ] **Phase 2 special — incoming authorization.** Verify whether
+- [x] **Phase 2 special — incoming authorization.** Verify whether
       accept-all incoming authorization still exists. If it does, implement
       explicit consent and/or trusted devices, default-deny unsolicited
       transfers, do not silently trust every paired device, keep CLI and GUI
@@ -186,14 +186,14 @@ environments for destructive tests; do not probe unrelated devices.
       and prevent bypass across receiver restarts or races. Handle an
       unavailable UI safely. Add negative tests proving unauthorized
       transfers are rejected.
-- [ ] **Phase 3 — Automatic remediation.** For each finding: root cause,
+- [x] **Phase 3 — Automatic remediation.** For each finding: root cause,
       exploitability/impact, justified severity (Critical/High/Medium/Low/
       Informational), affected files/functions, smallest robust fix,
       implementation, focused regression test, checks, patch inspection, and
       documentation updates. Prioritize Critical and High, then Medium and
       Low. Report limitations precisely instead of claiming a fix that was
       not validated.
-- [ ] **Phase 4 — Adversarial tests.** Add deterministic tests for malicious
+- [x] **Phase 4 — Adversarial tests.** Add deterministic tests for malicious
       filenames, traversal, Unicode/path edges, symlink and collision races,
       corrupt/truncated OBEX frames, inconsistent lengths, oversized inputs,
       unauthorized transfers, interrupted connections, repeated
@@ -202,26 +202,26 @@ environments for destructive tests; do not probe unrelated devices.
       and resource exhaustion. Use property-based testing and fuzzing where
       meaningful; keep protocol-level mocks and isolated adapters. Separate
       simulated coverage from hardware validation.
-- [ ] **Phase 5 — Validation.** Run `cargo fmt --all -- --check`,
+- [x] **Phase 5 — Validation.** Run `cargo fmt --all -- --check`,
       `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`,
       `cargo build --release`, and `cargo audit`. Add target-specific checks;
       validate Linux and Windows separately; cross-compile when hardware is
       unavailable without claiming physical-device testing. Record every
       failure and distinguish defects from missing tooling.
-- [ ] **Phase 6 — Second independent audit.** Re-review the modified code
+- [x] **Phase 6 — Second independent audit.** Re-review the modified code
       for incomplete fixes, new authorization bypasses, races, regressions,
       functionality loss, cross-platform divergence, unhandled failures,
       permissive fallbacks, new vulnerable dependencies, and configuration
       changes. Remediate and retest until no additional actionable issue is
       found or a clear blocker is documented. Never claim zero
       vulnerabilities.
-- [ ] **Phase 7 — Permanent hardening.** Add practical CI security checks,
+- [x] **Phase 7 — Permanent hardening.** Add practical CI security checks,
       dependency advisory scanning, formatting/lint gates, security
       regression tests, cross-platform build checks, safe dependency update
       workflow, fuzz targets for parsers, maintain `SECURITY.md`, and
       document trust boundaries, authorization behavior, and residual
       limitations without excessive CI cost or unmaintainable complexity.
-- [ ] **Deliverables.** Implement the actual code changes; create
+- [x] **Deliverables.** Implement the actual code changes; create
       `SECURITY_AUDIT.md` (scope, threat model, methodology/tools, findings
       and evidence, severity rationale, affected files, exploitability,
       remediation, tests, verification, residual risks, platform limits);

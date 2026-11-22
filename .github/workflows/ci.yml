@@ -19,15 +19,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install system dependencies
         run: |
@@ -52,7 +52,7 @@ jobs:
         run: ./packaging/ubuntu/build-deb.sh
 
       - name: Upload Ubuntu package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-deb
           path: dist/*.deb
@@ -63,15 +63,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -92,14 +92,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Windows ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-zip
           path: dist/*.zip
           if-no-files-found: error
 
       - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-exe
           path: target/release/kalo.exe
@@ -110,16 +110,16 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run Clippy
         shell: bash
@@ -189,7 +189,7 @@ jobs:
           ./dist/Kalo.app/Contents/MacOS/kalo --help
 
       - name: Upload macOS app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-app
           path: dist/kalo-macos-universal.zip
@@ -200,13 +200,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fuzz
 
@@ -221,11 +221,27 @@ jobs:
 
       - name: Upload fuzz artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.23.0 --locked
+
+      - name: Audit dependencies
+        run: cargo audit
 
   arch:
     name: Arch Linux
@@ -239,7 +255,7 @@ jobs:
           pacman -S --needed --noconfirm git namcap rust cargo sudo
 
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -273,7 +289,7 @@ jobs:
           cp /home/builder/pkg/kalo-git-[0-9]*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
 
       - name: Upload Arch package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arch-package
           path: ${{ github.workspace }}/dist/*.pkg.tar.zst
@@ -282,13 +298,13 @@ jobs:
   release:
     name: Publish latest builds
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux, windows, macos, arch, fuzz]
+    needs: [linux, windows, macos, arch, fuzz, security]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: "{linux-deb,windows-zip,windows-exe,macos-app,arch-package}"
           merge-multiple: true
@@ -309,7 +325,7 @@ jobs:
           ls -lh
 
       - name: Publish the rolling latest release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: latest
           name: Latest build

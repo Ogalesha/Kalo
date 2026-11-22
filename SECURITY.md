@@ -64,14 +64,18 @@ privacy of transfer metadata, and the confidentiality of transferred content.
 - Trust decisions are keyed by normalized Bluetooth address. Windows identities
   that only expose a name are never persisted.
 - Incoming files land in a private staging directory, not directly in the save
-  folder.
+  folder. Linux stages under the obexd session root; Windows stages under
+  Kalo's private local-app-data directory.
 - Remote filenames are sanitized before use: path separators and control
-  characters are removed; Windows-hostile characters (`: * ? " < > |`),
-  trailing dots and spaces, and reserved DOS device names (`CON`, `PRN`, `AUX`,
-  `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`) are neutralized so they cannot create an
-  NTFS alternate data stream or target a device. The checks are applied again
-  after length truncation, so a cut cannot expose a trailing dot/space or a
-  device name.
+  characters are removed, along with Unicode bidi overrides, zero-width
+  joiners, line separators, and other invisible formatting that could make a
+  file render as a different name than the one on disk. Windows-hostile
+  characters (`: * ? " < > |`), trailing dots and spaces, and reserved DOS
+  device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`) are
+  neutralized so they cannot create an NTFS alternate data stream or target a
+  device. The checks are applied again after length truncation, so a cut cannot
+  expose a trailing dot/space, a device name, or a name longer than the
+  200-byte cap.
 - The Windows OBEX packet parser and the filename sanitizer have libFuzzer
   targets under `fuzz/`; CI runs both on every push so malformed peer input is
   exercised continuously.
@@ -126,10 +130,11 @@ Kalo-to-Kalo transfer, the following applies:
   inside the private staging directory, hashed against the malware
   blocklist, checked against the authenticated size and available space, and
   only then moved into the save folder under its sanitized original name.
-- Outgoing containers are created under the system temporary directory in a
-  private `kalo/outgoing` directory with random names. They are removed when
-  the send completes, is canceled, or returns an error; an abrupt process kill
-  can leave a temporary ciphertext file behind.
+- Outgoing containers and pairing objects are created under Kalo's private
+  per-user configuration directory with random names, never in a shared
+  `/tmp/kalo` directory. They are removed when the send completes, is
+  canceled, or returns an error; an abrupt process kill can leave a temporary
+  ciphertext file behind.
 - Container parsing validates the version, algorithms, KDF bounds, chunk
   size, metadata bounds, and reserved flags before deriving a key, so a
   malicious container cannot request an unbounded or absurdly cheap KDF.
@@ -157,7 +162,9 @@ devices. It is the only mode that proves which device sent a file.
   saved to the save folder and are deleted after processing. They are bounded
   to 64 KiB, must be regular files, and stale objects are removed by recovery.
   A control object from a sender without a stable Bluetooth address is
-  rejected. Pairing is unavailable in the CLI receiver only when the identity
+  rejected. At most 32 incoming pairing requests may be pending at once, so a
+  nearby device cannot allocate unbounded handshake state by spoofing
+  addresses. Pairing is unavailable in the CLI receiver only when the identity
   or passphrase is missing; the UI and receiver share the same manager.
 - Paired transfers use a `KALOENC2` container. The header carries the sender's
   8-byte key identifier; the payload is encrypted with a directional
@@ -165,6 +172,10 @@ devices. It is the only mode that proves which device sent a file.
   The receiver looks up the pinned identity, verifies the signature, checks the
   step number, and commits the next incoming chain key only after successful
   decryption.
+- A sender address recorded as paired is accepted only with a `KALOENC2`
+  container. A plaintext file or a shared-passphrase `KALOENC1` container from
+  that address is deleted without being scanned or saved, so an impersonator
+  or an older sender cannot downgrade a paired channel.
 - Outgoing and incoming chains are independent. A step is never reused: the
   sender commits its outgoing ratchet after every attempted file, including
   failures and cancellation, and the receiver commits the incoming ratchet

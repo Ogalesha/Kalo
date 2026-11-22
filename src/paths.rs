@@ -30,11 +30,11 @@ pub fn config_dir() -> PathBuf {
 pub fn config_dir() -> PathBuf {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
-        FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+        FOLDERID_LocalAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
     };
 
     let known = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG(0), None)
+        SHGetKnownFolderPath(&FOLDERID_LocalAppData, KNOWN_FOLDER_FLAG(0), None)
             .ok()
             .and_then(|ptr| {
                 let path = ptr.to_string().ok();
@@ -44,7 +44,7 @@ pub fn config_dir() -> PathBuf {
     };
     known
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Kalo")
 }

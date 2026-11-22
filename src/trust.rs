@@ -299,6 +299,15 @@ impl TrustStore {
         })
     }
 
+    /// True when the device has a pinned identity, even if one of its ratchet
+    /// directions is missing or corrupt. Receivers use this to fail closed:
+    /// a partially damaged pairing entry must never turn into permission for
+    /// plaintext or shared-passphrase downgrade.
+    pub fn is_pinned(&self, address: &str) -> bool {
+        self.entry(address)
+            .is_some_and(|entry| entry.decision == TrustDecision::Allow && entry.peer_key.is_some())
+    }
+
     pub fn peer_public(&self, address: &str) -> Option<[u8; 32]> {
         parse_key32(self.entry(address)?.peer_key.as_deref()?)
     }
@@ -382,8 +391,26 @@ impl TrustStore {
     }
 
     /// Advance the incoming ratchet after a container authenticated at
-    /// `expected_step`. Replays and stale completions are refused.
-    pub fn commit_incoming(&self, address: &str, expected_step: u64, next: [u8; 32]) -> Result<()> {
+    /// `next_step`. `from_step` must still be current, so a replay or a stale
+    /// completion cannot rewind the chain. A container can skip ahead when
+    /// earlier sends were lost or cancelled.
+    pub fn commit_incoming(
+        &self,
+        address: &str,
+        from_step: u64,
+        next_step: u64,
+        next: [u8; 32],
+    ) -> Result<()> {
+        if next_step <= from_step {
+            anyhow::bail!("the incoming key chain must advance");
+        }
+        // `next_step` is one past the authenticated container step, so a
+        // container exactly MAX_CHAIN_SKIP steps ahead advances the stored
+        // chain by MAX_CHAIN_SKIP + 1. Keep this bound in sync with
+        // `PeerDecryptor`, which accepts that same boundary.
+        if next_step - from_step > crate::crypto::MAX_CHAIN_SKIP.saturating_add(1) {
+            anyhow::bail!("the incoming key chain skipped too far ahead");
+        }
         let key = normalize_key(address);
         {
             let mut data = self.inner.data.lock().expect("trust lock");
@@ -391,11 +418,11 @@ impl TrustStore {
                 .devices
                 .get_mut(&key)
                 .context("the sender is no longer paired")?;
-            if entry.recv_step != expected_step || entry.recv_chain.is_none() {
+            if entry.recv_step != from_step || entry.recv_chain.is_none() {
                 anyhow::bail!("the incoming key chain advanced concurrently; retry the receive");
             }
             entry.recv_chain = Some(hex::encode(next));
-            entry.recv_step = expected_step + 1;
+            entry.recv_step = next_step;
         }
         self.persist()
     }
@@ -417,8 +444,12 @@ impl TrustStore {
         let Some(path) = self.inner.path.as_deref() else {
             return Ok(());
         };
-        let data = self.inner.data.lock().expect("trust lock").clone();
-        crate::settings::write_json(path, &data).context("save trust store")
+        // Keep the lock held while serializing and writing. Cloning the state
+        // first would let a slower writer replace the file with an older
+        // snapshot, potentially restoring a ratchet step that was already
+        // consumed.
+        let data = self.inner.data.lock().expect("trust lock");
+        crate::settings::write_json(path, &*data).context("save trust store")
     }
 }
 
@@ -731,6 +762,112 @@ mod tests {
             reloaded.decision("aa:bb:cc:dd:ee:ff"),
             Some(TrustDecision::Allow)
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pinned_identity_is_visible_without_ratchet_chains() {
+        let dir = std::env::temp_dir().join(format!("kalo-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trust.json");
+        let peer_key = hex::encode([1u8; 32]);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"devices":{{"AA:BB":{{"name":"Phone","decision":"allow","peer_key":"{peer_key}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let (store, warning) = TrustStore::load_from(path.clone());
+        assert!(warning.is_none());
+        // A damaged entry keeps its pinned identity visible, so receivers
+        // reject downgrades even though full pairing state is incomplete.
+        assert!(store.is_pinned("AA:BB"));
+        assert!(!store.is_paired("AA:BB"));
+        assert!(store.outgoing_chain("AA:BB").is_none());
+        assert!(store.incoming_chain("AA:BB").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incoming_ratchet_accepts_forward_skips_and_rejects_rewinds() {
+        let (store, path) = temp_store();
+        store
+            .pin_peer("AA:BB", "Phone", [1u8; 32], [2u8; 32], [3u8; 32])
+            .unwrap();
+        assert_eq!(store.incoming_chain("AA:BB").unwrap().step, 0);
+
+        // The sender burned steps 0 and 1, so this container authenticates
+        // at step 2. Committing it must move the receiver to step 3.
+        store.commit_incoming("AA:BB", 0, 3, [9u8; 32]).unwrap();
+        assert_eq!(store.incoming_chain("AA:BB").unwrap().step, 3);
+
+        // A delayed container from an older step can no longer rewind or
+        // reuse the chain, and a stale completion is refused.
+        assert!(store.commit_incoming("AA:BB", 0, 1, [8u8; 32]).is_err());
+        assert!(store.commit_incoming("AA:BB", 2, 3, [8u8; 32]).is_err());
+        assert!(store.commit_incoming("AA:BB", 3, 3, [8u8; 32]).is_err());
+        assert_eq!(store.incoming_chain("AA:BB").unwrap().step, 3);
+
+        // A container authenticated at exactly the maximum skip must be
+        // committable; the decryptor accepts that boundary too. Advancing any
+        // further is refused.
+        store
+            .commit_incoming("AA:BB", 3, 3 + crate::crypto::MAX_CHAIN_SKIP + 1, [7u8; 32])
+            .unwrap();
+        assert_eq!(
+            store.incoming_chain("AA:BB").unwrap().step,
+            3 + crate::crypto::MAX_CHAIN_SKIP + 1
+        );
+        let current = 3 + crate::crypto::MAX_CHAIN_SKIP + 1;
+        assert!(
+            store
+                .commit_incoming(
+                    "AA:BB",
+                    current,
+                    current + crate::crypto::MAX_CHAIN_SKIP + 2,
+                    [6u8; 32],
+                )
+                .is_err()
+        );
+        assert_eq!(store.incoming_chain("AA:BB").unwrap().step, current);
+
+        // The advanced state is durable.
+        let (reloaded, warning) = TrustStore::load_from(path.clone());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.incoming_chain("AA:BB").unwrap().step, current);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_trust_writes_do_not_lose_entries() {
+        let (store, path) = temp_store();
+        let workers = 8;
+        let per_worker = 20;
+        let handles = (0..workers)
+            .map(|worker| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for index in 0..per_worker {
+                        store
+                            .remember(
+                                &format!("AA:BB:{worker:02X}:{index:02X}"),
+                                "Phone",
+                                TrustDecision::Allow,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (reloaded, warning) = TrustStore::load_from(path.clone());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.entries().len(), workers * per_worker);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
