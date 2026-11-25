@@ -122,14 +122,23 @@ pub async fn receive() -> Result<()> {
         }
     });
 
+    let (_lease, lease_control) = crate::lease::LeaseHandle::new(events.clone());
     run_receiver(
-        handle, pending, save_dir, events, authorizer, encryption, pairing,
+        handle,
+        pending,
+        save_dir,
+        events,
+        authorizer,
+        encryption,
+        pairing,
+        lease_control,
     )
     .await
 }
 
 /// Supervise the advertised RFCOMM OPP service. Advertising failures (radio
 /// off, another receiver owning the service) retry without ending the app.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_receiver(
     handle: ReceiverHandle,
     _pending: PendingTransfers,
@@ -138,6 +147,7 @@ pub async fn run_receiver(
     authorizer: Authorizer,
     encryption: Encryption,
     pairing: Option<crate::identity::PairingManager>,
+    _lease: crate::lease::LeaseControl,
 ) -> ! {
     loop {
         sweep_staging(&save_dir.get(), &events, &encryption, pairing.as_ref());

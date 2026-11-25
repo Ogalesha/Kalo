@@ -1,9 +1,9 @@
 //! Iced UI for the Kalo spike: devices, send with progress, receiver state, log.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use iced::widget::{
@@ -15,11 +15,14 @@ use tokio::sync::broadcast;
 
 use crate::crypto::{Encryption, MIN_PASSPHRASE_CHARS};
 use crate::events::{
-    Event, EventSink, ReceiverStatus, format_bytes, send_progress_summary, transfer_fraction,
+    Event, EventSink, LeaseStatus, ReceiverStatus, format_bytes, send_progress_summary,
+    transfer_fraction,
 };
 use crate::identity::{DeviceIdentity, PairingManager};
 use crate::paths;
-use crate::platform::{self, DeviceInfo, PendingTransfers, ReceiverHandle, new_pending};
+use crate::platform::{
+    self, DeviceInfo, LeaseControl, LeaseHandle, PendingTransfers, ReceiverHandle, new_pending,
+};
 use crate::selection::Selection;
 use crate::settings::{SaveDir, Settings, ThemeKind};
 use crate::transfer::{Cancel, CancelHandle, batch_position};
@@ -37,6 +40,10 @@ struct EventBus {
     authorizer: Authorizer,
     encryption: Encryption,
     pairing: Option<PairingManager>,
+    lease: LeaseHandle,
+    /// Taken exactly once by the receiver supervisor. The mutex keeps the
+    /// bus usable from the `OnceLock` while still moving a non-Clone receiver.
+    lease_control: Mutex<Option<LeaseControl>>,
     /// Screenshot mode: never touch Bluetooth or the user's config.
     demo: bool,
 }
@@ -50,6 +57,14 @@ impl EventBus {
         if self.demo || STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
+        let lease = self
+            .lease_control
+            .lock()
+            .expect("lease control lock")
+            .take();
+        let Some(lease) = lease else {
+            return;
+        };
         tokio::spawn(platform::run_receiver(
             self.receiver.clone(),
             self.pending.clone(),
@@ -58,6 +73,7 @@ impl EventBus {
             self.authorizer.clone(),
             self.encryption.clone(),
             self.pairing.clone(),
+            lease,
         ));
     }
 }
@@ -105,6 +121,10 @@ pub enum Message {
     RemoveTrustedSender(String),
     SetIncomingPolicy(IncomingPolicy),
     ToggleTrustList,
+    /// Open the explicit 10-minute window that borrows Blueman's agent slot.
+    ArmReceiveWindow,
+    /// Close the window now, after any in-flight transfer finishes.
+    ReleaseReceiveWindow,
     PollTray,
     TrayShow,
     TrayQuit,
@@ -188,6 +208,7 @@ struct App {
     send_result: Option<SendResultUi>,
     incoming: Vec<IncomingUi>,
     receiver_state: ReceiverStatus,
+    lease: LeaseStatus,
     settings: Settings,
     trust: TrustStore,
     authorizer: Authorizer,
@@ -244,6 +265,7 @@ struct Startup {
     log: Vec<String>,
     incoming: Vec<IncomingUi>,
     receiver_state: ReceiverStatus,
+    lease: LeaseStatus,
 }
 
 fn demo_enabled() -> bool {
@@ -307,6 +329,7 @@ fn startup(bus: &EventBus, demo: bool, mut log: Vec<String>) -> Startup {
                 size: Some(3_400_000),
             }],
             receiver_state: ReceiverStatus::Active,
+            lease: LeaseStatus::Idle,
         };
     }
 
@@ -318,6 +341,7 @@ fn startup(bus: &EventBus, demo: bool, mut log: Vec<String>) -> Startup {
         log,
         incoming: Vec::new(),
         receiver_state: bus.receiver.status(),
+        lease: bus.lease.status(),
     }
 }
 
@@ -363,6 +387,7 @@ pub fn run() -> iced::Result {
     );
     let authorizer = Authorizer::new(trust.clone(), sink.clone(), true);
     let receiver = ReceiverHandle::new(sink.clone());
+    let (lease, lease_control) = LeaseHandle::new(sink.clone());
     if EVENT_BUS
         .set(EventBus {
             sink: sink.clone(),
@@ -372,6 +397,8 @@ pub fn run() -> iced::Result {
             authorizer: authorizer.clone(),
             encryption: encryption.clone(),
             pairing: pairing.clone(),
+            lease,
+            lease_control: Mutex::new(Some(lease_control)),
             demo,
         })
         .is_err()
@@ -422,6 +449,7 @@ pub fn run() -> iced::Result {
                 send_result: None,
                 incoming: start.incoming,
                 receiver_state: start.receiver_state,
+                lease: start.lease,
                 settings: settings.clone(),
                 trust: trust.clone(),
                 authorizer: authorizer.clone(),
@@ -988,6 +1016,41 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.show_trust = !app.show_trust;
             Task::none()
         }
+        Message::ArmReceiveWindow => {
+            if app.demo {
+                return Task::none();
+            }
+            let Some(bus) = EVENT_BUS.get() else {
+                return Task::none();
+            };
+            match bus.lease.request_arm() {
+                Ok(()) => {
+                    app.lease = bus.lease.status();
+                    app.log(
+                        "Opening a 10-minute receive window; asking Blueman to pause its \
+                         transfer service.",
+                    );
+                }
+                Err(error) => app.log(format!("Couldn't open the receive window: {error}")),
+            }
+            Task::none()
+        }
+        Message::ReleaseReceiveWindow => {
+            if app.demo {
+                return Task::none();
+            }
+            let Some(bus) = EVENT_BUS.get() else {
+                return Task::none();
+            };
+            match bus.lease.request_release() {
+                Ok(()) => {
+                    app.lease = bus.lease.status();
+                    app.log("Closing the receive window after any in-flight transfer.");
+                }
+                Err(error) => app.log(format!("Couldn't close the receive window: {error}")),
+            }
+            Task::none()
+        }
         Message::PollTray => {
             let tasks: Vec<Task<Message>> = crate::tray::poll()
                 .into_iter()
@@ -1179,6 +1242,32 @@ fn handle_event(app: &mut App, event: Event) -> Task<Message> {
             app.receiver_state = state;
             app.log(line);
         }
+        Event::LeaseState(state) => {
+            if app.lease == state {
+                return Task::none();
+            }
+            let line = match &state {
+                LeaseStatus::Idle => "Receive window closed.".to_string(),
+                LeaseStatus::Arming { .. } => {
+                    "Receive window: pausing Blueman's transfer service…".to_string()
+                }
+                LeaseStatus::Armed { expires_at } => format!(
+                    "Receive window open for {}. Kalo is receiving with its security checks.",
+                    format_remaining(*expires_at)
+                ),
+                LeaseStatus::Stopping { reason } => {
+                    format!("Closing receive window: {reason}.")
+                }
+                LeaseStatus::Restoring { .. } => {
+                    "Restoring Blueman's transfer service…".to_string()
+                }
+                LeaseStatus::Error(reason) => {
+                    format!("Receive window failed: {reason}")
+                }
+            };
+            app.lease = state;
+            app.log(line);
+        }
         Event::Pairing {
             address,
             name,
@@ -1227,6 +1316,14 @@ fn subscription(app: &App) -> Subscription<Message> {
                 let initial = bus.receiver.status();
                 if out
                     .send(Message::Event(Event::ReceiverState(initial)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let initial_lease = bus.lease.status();
+                if out
+                    .send(Message::Event(Event::LeaseState(initial_lease)))
                     .await
                     .is_err()
                 {
@@ -1294,7 +1391,7 @@ fn view(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center),
         space().width(Length::Fill),
         theme_button,
-        receiver_summary(&app.receiver_state, &app.save_dir.get(), p),
+        receiver_summary(&app.receiver_state, &app.lease, &app.save_dir.get(), p),
     ]
     .spacing(10)
     .width(Length::Fill)
@@ -1533,7 +1630,20 @@ fn view(app: &App) -> Element<'_, Message> {
     for prompt in &app.pending_authorizations {
         incoming_body = incoming_body.push(auth_prompt(prompt, p));
     }
-    if let ReceiverStatus::Off(reason) = &app.receiver_state {
+    let lease_control = receive_window(&app.lease, &app.receiver_state, p);
+    let lease_control_shown = lease_control.is_some();
+    if let Some(control) = lease_control {
+        incoming_body = incoming_body.push(control);
+    }
+    // While the receive-window control is on screen it already explains the
+    // state; the generic "unavailable" notice would only repeat it. The notice
+    // still appears on platforms without the handoff.
+    let show_unavailable_notice = matches!(app.receiver_state, ReceiverStatus::Off(_))
+        && matches!(app.lease, LeaseStatus::Idle | LeaseStatus::Error(_))
+        && !lease_control_shown;
+    if let ReceiverStatus::Off(reason) = &app.receiver_state
+        && show_unavailable_notice
+    {
         incoming_body = incoming_body.push(receiver_notice(reason, p));
     }
     if app.incoming.is_empty() {
@@ -1750,36 +1860,72 @@ fn transfer_orb<'a>(p: &ui::Palette) -> Element<'a, Message> {
 
 fn receiver_summary(
     state: &ReceiverStatus,
+    lease: &LeaseStatus,
     save_dir: &Path,
     p: &ui::Palette,
 ) -> Element<'static, Message> {
-    let (label, detail, dot, tint, text_color) = match state {
-        ReceiverStatus::Starting => (
-            "Starting Bluetooth receiver",
-            "Incoming files will be ready shortly".to_string(),
-            p.warning,
-            p.warning_tint,
-            p.warning_text,
-        ),
-        ReceiverStatus::Active => (
-            "Ready to receive",
-            format!("Files save to {}", folder_label(save_dir)),
+    let (label, detail, dot, tint, text_color, detail_color) = match lease {
+        LeaseStatus::Armed { expires_at } if matches!(state, ReceiverStatus::Active) => (
+            "Receiving with Kalo",
+            format!("Blueman paused · {} left", format_remaining(*expires_at)),
             p.success,
             p.success_tint,
             p.success_text,
+            p.text_muted,
         ),
-        ReceiverStatus::Off(_) => (
-            "Receiving unavailable",
-            "Incoming files are unavailable".to_string(),
-            p.danger,
-            p.danger_tint,
-            p.danger_text,
+        LeaseStatus::Armed { expires_at } => (
+            "Receive window open",
+            format!(
+                "Reconnecting the Bluetooth receiver · {} left",
+                format_remaining(*expires_at)
+            ),
+            p.warning,
+            p.warning_tint,
+            p.warning_text,
+            p.text_muted,
         ),
-    };
-    let detail_color = if matches!(state, ReceiverStatus::Off(_)) {
-        p.danger_text
-    } else {
-        p.text_muted
+        LeaseStatus::Arming { .. } => (
+            "Opening receive window",
+            "Asking Blueman to pause its transfer service".to_string(),
+            p.warning,
+            p.warning_tint,
+            p.warning_text,
+            p.text_muted,
+        ),
+        LeaseStatus::Stopping { .. } | LeaseStatus::Restoring { .. } => (
+            "Closing receive window",
+            "Restoring Blueman's transfer service".to_string(),
+            p.warning,
+            p.warning_tint,
+            p.warning_text,
+            p.text_muted,
+        ),
+        _ => match state {
+            ReceiverStatus::Starting => (
+                "Starting Bluetooth receiver",
+                "Incoming files will be ready shortly".to_string(),
+                p.warning,
+                p.warning_tint,
+                p.warning_text,
+                p.text_muted,
+            ),
+            ReceiverStatus::Active => (
+                "Ready to receive",
+                format!("Files save to {}", folder_label(save_dir)),
+                p.success,
+                p.success_tint,
+                p.success_text,
+                p.text_muted,
+            ),
+            ReceiverStatus::Off(_) => (
+                "Receiving unavailable",
+                "Incoming files are unavailable".to_string(),
+                p.danger,
+                p.danger_tint,
+                p.danger_text,
+                p.danger_text,
+            ),
+        },
     };
 
     container(
@@ -1931,6 +2077,179 @@ fn device_empty_state<'a>(
         .width(Length::Fill)
         .style(ui::inset)
         .into()
+}
+
+fn format_remaining(expires_at: Instant) -> String {
+    format_remaining_at(expires_at, Instant::now())
+}
+
+fn format_remaining_at(expires_at: Instant, now: Instant) -> String {
+    let seconds = expires_at.saturating_duration_since(now).as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The explicit receive-window control. It only appears on Linux, where
+/// Blueman can be asked to yield obexd's single agent slot.
+fn receive_window(
+    lease: &LeaseStatus,
+    receiver: &ReceiverStatus,
+    p: &ui::Palette,
+) -> Option<Element<'static, Message>> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+
+    Some(match lease {
+        LeaseStatus::Idle => {
+            if !matches!(receiver, ReceiverStatus::Off(_)) {
+                return None;
+            }
+            container(
+                column![
+                    text("Receive with Kalo")
+                        .size(12)
+                        .font(ui::SEMIBOLD)
+                        .color(p.text),
+                    text(
+                        "Blueman usually holds the Bluetooth receive slot. Kalo can pause its \
+                         transfer service for 10 minutes so incoming files get malware \
+                         scanning, filename hardening, and sender approval."
+                    )
+                    .size(11)
+                    .color(p.text_secondary),
+                    button(
+                        text("Open 10-minute receive window")
+                            .size(10.5)
+                            .font(ui::MEDIUM)
+                    )
+                    .padding([5, 10])
+                    .style(ui::primary_button)
+                    .on_press(Message::ArmReceiveWindow),
+                ]
+                .spacing(5),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(ui::inset)
+            .into()
+        }
+        LeaseStatus::Arming { .. } => container(
+            row![
+                column![
+                    text("Opening receive window")
+                        .size(12)
+                        .font(ui::SEMIBOLD)
+                        .color(p.warning_text),
+                    text("Pausing Blueman's transfer service…")
+                        .size(11)
+                        .color(p.text_secondary),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Cancel").size(10.5).font(ui::MEDIUM))
+                    .padding([5, 10])
+                    .style(ui::secondary_button)
+                    .on_press(Message::ReleaseReceiveWindow),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .style(ui::inset)
+        .into(),
+        LeaseStatus::Armed { expires_at } => {
+            let receiving = matches!(receiver, ReceiverStatus::Active);
+            let (title, detail, color) = if receiving {
+                (
+                    "Kalo is receiving",
+                    format!("Blueman paused · {} left", format_remaining(*expires_at)),
+                    p.success_text,
+                )
+            } else {
+                (
+                    "Receive window open",
+                    format!(
+                        "Reconnecting the Bluetooth receiver · {} left",
+                        format_remaining(*expires_at)
+                    ),
+                    p.warning_text,
+                )
+            };
+            container(
+                row![
+                    column![
+                        text(title).size(12).font(ui::SEMIBOLD).color(color),
+                        text(detail).size(11).color(p.text_secondary),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("Stop").size(10.5).font(ui::MEDIUM))
+                        .padding([5, 10])
+                        .style(ui::secondary_button)
+                        .on_press(Message::ReleaseReceiveWindow),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(ui::active_transfer)
+            .into()
+        }
+        LeaseStatus::Stopping { reason } => container(
+            column![
+                text("Closing receive window")
+                    .size(12)
+                    .font(ui::SEMIBOLD)
+                    .color(p.warning_text),
+                text(format!(
+                    "{reason}; finishing any in-flight transfer before restoring Blueman…"
+                ))
+                .size(11)
+                .color(p.text_secondary),
+            ]
+            .spacing(2),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .style(ui::inset)
+        .into(),
+        LeaseStatus::Restoring { .. } => container(
+            column![
+                text("Restoring Blueman")
+                    .size(12)
+                    .font(ui::SEMIBOLD)
+                    .color(p.warning_text),
+                text("Kalo is handing the Bluetooth receive slot back to Blueman…")
+                    .size(11)
+                    .color(p.text_secondary),
+            ]
+            .spacing(2),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .style(ui::inset)
+        .into(),
+        LeaseStatus::Error(reason) => container(
+            column![
+                text("Receive window unavailable")
+                    .size(12)
+                    .font(ui::SEMIBOLD)
+                    .color(p.danger_text),
+                text(reason.to_string()).size(11).color(p.text_secondary),
+                button(text("Try again").size(10.5).font(ui::MEDIUM))
+                    .padding([5, 10])
+                    .style(ui::secondary_button)
+                    .on_press(Message::ArmReceiveWindow),
+            ]
+            .spacing(4),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .style(ui::notice)
+        .into(),
+    })
 }
 
 fn receiver_notice<'a>(reason: &'a str, p: &ui::Palette) -> Element<'a, Message> {
@@ -3403,6 +3722,7 @@ mod tests {
             send_result: None,
             incoming: Vec::new(),
             receiver_state: ReceiverStatus::Starting,
+            lease: LeaseStatus::Idle,
             settings: Settings::default(),
             authorizer: Authorizer::new(trust.clone(), sink, true),
             trust,
@@ -3826,6 +4146,19 @@ mod tests {
         );
         assert_eq!(sender_name(&[], "AA:BB", "AA:BB"), "AA:BB");
         assert_eq!(sender_name(&devices, "", "Some sender"), "Some sender");
+    }
+
+    #[test]
+    fn remaining_time_is_clamped_and_formatted() {
+        let now = Instant::now();
+        assert_eq!(
+            format_remaining_at(now + Duration::from_secs(125), now),
+            "2:05"
+        );
+        assert_eq!(
+            format_remaining_at(now - Duration::from_secs(5), now),
+            "0:00"
+        );
     }
 
     #[test]

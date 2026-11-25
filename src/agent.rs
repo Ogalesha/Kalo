@@ -21,6 +21,7 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::crypto::{self, Encryption};
 use crate::events::{Event, EventSink, TransferStatus};
+use crate::lease::{LeaseAction, LeaseCommand, LeaseControl};
 use crate::paths;
 use crate::receiver::ReceiverHandle;
 use crate::sanitize;
@@ -49,6 +50,10 @@ const INCOMING_UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Receiver supervision cadence.
 const REGISTRATION_RETRY: Duration = Duration::from_secs(15);
+/// Give Blueman a moment to register its OBEX agent after a restore before
+/// Kalo retries; otherwise the retry can win the slot back by a few
+/// milliseconds and leave Blueman's freshly loaded plugin agentless.
+const RESTORE_GRACE: Duration = Duration::from_secs(2);
 const SESSION_BUS_RETRY: Duration = Duration::from_secs(5);
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STAGING_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -1777,6 +1782,36 @@ fn registration_path(id: u64) -> String {
     format!("{AGENT_PATH}/{id}")
 }
 
+/// Identity of one exported agent object. The id lets a late `Release` from a
+/// previous registration be ignored; the path lets the supervisor remove the
+/// object from the bus when the receive window closes.
+#[derive(Debug, Clone)]
+pub(crate) struct Registration {
+    pub(crate) id: u64,
+    pub(crate) path: String,
+}
+
+/// Unregister and remove one agent object, then mark the receiver off. The
+/// caller restores Blueman afterwards; the order matters because Blueman's
+/// plugin cannot claim the slot while Kalo still owns it.
+pub(crate) async fn release_registration(
+    conn: &Connection,
+    registration: &Registration,
+    handle: &ReceiverHandle,
+    reason: &str,
+) {
+    if let Ok(manager) = AgentManagerProxy::new(conn).await
+        && let Ok(path) = opath(&registration.path)
+    {
+        let _ = manager.unregister_agent(path).await;
+    }
+    let _ = conn
+        .object_server()
+        .remove::<AgentService, _>(registration.path.as_str())
+        .await;
+    handle.release(registration.id, reason);
+}
+
 async fn export_agent(conn: &Connection, path: &str, service: AgentService) -> Result<()> {
     conn.object_server()
         .at(path, service)
@@ -1786,7 +1821,8 @@ async fn export_agent(conn: &Connection, path: &str, service: AgentService) -> R
 }
 
 /// Export a uniquely-pathed agent object and register it with obexd. Returns
-/// the object path so the supervisor can remove it once replaced.
+/// the registration so the supervisor can remove it once replaced or when the
+/// receive window closes.
 async fn register_receiver(
     conn: &Connection,
     handle: ReceiverHandle,
@@ -1795,9 +1831,13 @@ async fn register_receiver(
     authorizer: Authorizer,
     save_dir: SaveDir,
     pairing: Option<crate::identity::PairingManager>,
-) -> Result<String> {
-    let registration = handle.begin_registration();
-    let path = registration_path(registration);
+) -> Result<Registration> {
+    let id = handle.begin_registration();
+    let path = registration_path(id);
+    let registration = Registration {
+        id,
+        path: path.clone(),
+    };
 
     let service = AgentService {
         conn: conn.clone(),
@@ -1805,7 +1845,7 @@ async fn register_receiver(
         reserved: Arc::new(AtomicUsize::new(0)),
         events: events.clone(),
         handle: handle.clone(),
-        registration,
+        registration: id,
         authorizer,
         save_dir,
         pairing,
@@ -1840,7 +1880,7 @@ async fn register_receiver(
         return Err(e.into());
     }
 
-    let became_active = handle.mark_active(registration);
+    let became_active = handle.mark_active(id);
     if !became_active && !handle.is_active() {
         // A Release (or an obexd restart) invalidated this registration
         // before the reply arrived. Undo it and let the supervisor retry.
@@ -1851,7 +1891,7 @@ async fn register_receiver(
             .await;
         return Err(anyhow!("agent registration was invalidated during startup"));
     }
-    Ok(path)
+    Ok(registration)
 }
 
 fn is_already_exists(e: &anyhow::Error) -> bool {
@@ -1864,8 +1904,9 @@ fn is_already_exists(e: &anyhow::Error) -> bool {
 /// User-facing registration error text, shared by the CLI and the UI retry.
 pub fn registration_error(e: &anyhow::Error) -> String {
     if is_already_exists(e) {
-        "the OBEX agent slot is taken (Blueman TransferService is active?). Disable \
-         Blueman's Transfer plugin or stop blueman-applet; Kalo will retry."
+        "Blueman's transfer service is using the Bluetooth receive slot. Open \
+         \"Receive with Kalo\" in the Kalo window to pause Blueman for 10 minutes; \
+         Kalo will retry automatically."
             .to_string()
     } else {
         format!("OBEX agent registration failed: {e}")
@@ -1875,6 +1916,7 @@ pub fn registration_error(e: &anyhow::Error) -> String {
 /// Supervisor shared by the UI and `kalo receive`: connects to the session
 /// bus, registers the agent, retries lost registrations and replaces the
 /// connection when the bus goes away.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_receiver(
     handle: ReceiverHandle,
     pending: PendingTransfers,
@@ -1883,7 +1925,25 @@ pub async fn run_receiver(
     authorizer: Authorizer,
     encryption: Encryption,
     pairing: Option<crate::identity::PairingManager>,
+    lease: LeaseControl,
 ) -> ! {
+    // A previous Kalo may have died while Blueman was paused. Restore it
+    // before this receiver tries to claim the slot.
+    match crate::lease::recover_stale_marker(&events).await {
+        Ok(true) => {
+            // Let Blueman's freshly loaded plugin register its OBEX agent
+            // before Kalo's first registration attempt.
+            tokio::time::sleep(RESTORE_GRACE).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            events.send(Event::Log(format!(
+                "could not recover an interrupted receive window: {error:#}"
+            )));
+        }
+    }
+
+    let mut lease = lease;
     loop {
         match Connection::session().await {
             Ok(conn) => {
@@ -1896,6 +1956,7 @@ pub async fn run_receiver(
                     &authorizer,
                     &encryption,
                     pairing.as_ref(),
+                    &mut lease,
                 )
                 .await
                 {
@@ -1923,6 +1984,7 @@ async fn receiver_session(
     authorizer: &Authorizer,
     encryption: &Encryption,
     pairing: Option<&crate::identity::PairingManager>,
+    lease_control: &mut LeaseControl,
 ) -> Result<()> {
     let mut owner_changes = match obexd_owner_changes(conn).await {
         Ok(changes) => Some(changes),
@@ -1933,7 +1995,7 @@ async fn receiver_session(
     };
 
     let mut last_registration_error: Option<String> = None;
-    let mut current_path = match register_receiver(
+    let mut current = match register_receiver(
         conn,
         handle.clone(),
         pending.clone(),
@@ -1944,9 +2006,9 @@ async fn receiver_session(
     )
     .await
     {
-        Ok(path) => {
+        Ok(registration) => {
             sweep_staging(save_dir, events, encryption, pairing);
-            Some(path)
+            Some(registration)
         }
         Err(e) => {
             let reason = registration_error(&e);
@@ -1960,7 +2022,7 @@ async fn receiver_session(
     };
     // Poll while any agent object exists: in-flight transfers may still
     // finish even after obexd released the registration.
-    let mut exported = current_path.is_some();
+    let mut exported = current.is_some();
 
     let mut retry = tokio::time::interval(REGISTRATION_RETRY);
     retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1971,11 +2033,19 @@ async fn receiver_session(
     let mut sweep = tokio::time::interval(STAGING_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     sweep.tick().await;
+    let mut lease_tick = tokio::time::interval(Duration::from_millis(500));
+    lease_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    lease_tick.tick().await;
 
     loop {
         if conn.is_closed() {
             bail!("session bus connection closed");
         }
+
+        // Lease work is decided inside the select but awaited after it, so
+        // it never holds a borrow of `current` while other branches run.
+        let mut action: Option<LeaseAction> = None;
+
         tokio::select! {
             change = async {
                 match owner_changes.as_mut() {
@@ -2007,7 +2077,7 @@ async fn receiver_session(
                     bail!("session bus connection closed");
                 }
             }
-            _ = retry.tick(), if !handle.is_active() => {
+            _ = retry.tick(), if !handle.is_active() && !lease_control.handle().is_closing() => {
                 match register_receiver(
                     conn,
                     handle.clone(),
@@ -2019,11 +2089,11 @@ async fn receiver_session(
                 )
                 .await
                 {
-                    Ok(path) => {
-                        if let Some(old) = current_path.replace(path) {
+                    Ok(new) => {
+                        if let Some(old) = current.replace(new) {
                             let _ = conn
                                 .object_server()
-                                .remove::<AgentService, _>(old.as_str())
+                                .remove::<AgentService, _>(old.path.as_str())
                                 .await;
                         }
                         exported = true;
@@ -2044,9 +2114,88 @@ async fn receiver_session(
                     }
                 }
             }
+            Some(command) = lease_control.recv() => {
+                match command {
+                    LeaseCommand::Arm => action = Some(LeaseAction::Arm),
+                    // `request_release` already moved the lease to Stopping;
+                    // the lease tick releases once in-flight work is done.
+                    LeaseCommand::Release => {}
+                }
+            }
+            _ = handle.notified() => {
+                // A receive window just freed the agent slot; don't wait for
+                // the periodic registration retry.
+                retry.reset();
+            }
+            _ = lease_tick.tick() => {
+                let pending_empty = pending.lock().expect("pending lock").is_empty();
+                action = crate::lease::tick(
+                    lease_control.handle(),
+                    handle,
+                    pending_empty,
+                    Instant::now(),
+                );
+            }
             _ = sweep.tick(), if handle.is_active() => {
                 sweep_staging(save_dir, events, encryption, pairing);
             }
+        }
+
+        match action {
+            Some(LeaseAction::Arm) => {
+                if let Err(error) =
+                    crate::lease::begin(conn, lease_control.handle(), handle, events).await
+                {
+                    let reason = format!("receive window could not open: {error:#}");
+                    events.send(Event::Log(reason.clone()));
+                    // Keep the cause even if the restore needs more attempts.
+                    lease_control.handle().mark_arm_failure_if_arming(&reason);
+                    let mut cleanup = current.take();
+                    match crate::lease::end(
+                        conn,
+                        lease_control.handle(),
+                        handle,
+                        &mut cleanup,
+                        events,
+                        "receive window could not open",
+                    )
+                    .await
+                    {
+                        Ok(()) => retry.reset_after(RESTORE_GRACE),
+                        Err(restore_error) => {
+                            events.send(Event::Log(format!(
+                                "could not restore Blueman after the failed receive window: \
+                                 {restore_error:#}; retrying"
+                            )));
+                        }
+                    }
+                }
+            }
+            Some(LeaseAction::Release { reason }) => {
+                let mut cleanup = current.take();
+                match crate::lease::end(
+                    conn,
+                    lease_control.handle(),
+                    handle,
+                    &mut cleanup,
+                    events,
+                    &reason,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        exported = false;
+                        // Let Blueman reclaim its agent before Kalo retries.
+                        retry.reset_after(RESTORE_GRACE);
+                    }
+                    Err(error) => {
+                        events.send(Event::Log(format!(
+                            "could not restore Blueman: {error:#}; retrying"
+                        )));
+                    }
+                }
+            }
+            None => {}
         }
     }
 }
@@ -2059,7 +2208,7 @@ pub async fn agent_check() -> Result<()> {
     let handle = ReceiverHandle::new(events.clone());
     let authorizer = Authorizer::new(TrustStore::in_memory(), events.clone(), false);
     let check_save = SaveDir::new(paths::default_save_dir());
-    let path = register_receiver(
+    let registration = register_receiver(
         &conn,
         handle,
         new_pending(),
@@ -2070,10 +2219,10 @@ pub async fn agent_check() -> Result<()> {
     )
     .await?;
     let manager = AgentManagerProxy::new(&conn).await?;
-    manager.unregister_agent(opath(&path)?).await?;
+    manager.unregister_agent(opath(&registration.path)?).await?;
     let _ = conn
         .object_server()
-        .remove::<AgentService, _>(path.as_str())
+        .remove::<AgentService, _>(registration.path.as_str())
         .await;
     while let Ok(event) = rx.try_recv() {
         println!("{event:?}");
@@ -2088,6 +2237,9 @@ pub async fn receive() -> Result<()> {
     let events = EventSink::new(1024);
     let mut rx = events.subscribe();
     let handle = ReceiverHandle::new(events.clone());
+    // The CLI receiver does not arm a window, but the handle must stay alive
+    // so the supervisor's command channel stays open.
+    let (_lease, lease_control) = crate::lease::LeaseHandle::new(events.clone());
     let pending = new_pending();
     let (settings, settings_warning) = Settings::load();
     if let Some(warning) = settings_warning {
@@ -2137,7 +2289,14 @@ pub async fn receive() -> Result<()> {
         }
     };
     run_receiver(
-        handle, pending, save_dir, events, authorizer, encryption, identity,
+        handle,
+        pending,
+        save_dir,
+        events,
+        authorizer,
+        encryption,
+        identity,
+        lease_control,
     )
     .await
 }

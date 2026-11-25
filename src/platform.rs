@@ -41,6 +41,7 @@ pub use crate::mac::{
     list_known_devices, new_pending, pair, receive, run_receiver,
 };
 
+pub use crate::lease::{LeaseControl, LeaseHandle};
 pub use crate::receiver::ReceiverHandle;
 
 /// Send a small Kalo control object (pairing request, response or

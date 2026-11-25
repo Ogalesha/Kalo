@@ -212,7 +212,7 @@ Kalo derives a key with Argon2id (64 MiB, 3 passes), encrypts the original filen
 
 ### Receive a file
 
-1. Open Kalo and check the receiver status at the top of the window. When it says **Ready to receive**, another compatible device can send a file to this computer.
+1. Open Kalo and check the receiver status at the top of the window. When it says **Ready to receive**, another compatible device can send a file to this computer. On Linux, if Blueman holds the Bluetooth receive slot, Kalo shows **Receiving unavailable** and a **Receive with Kalo** panel: choose **Open 10-minute receive window**. Kalo asks Blueman to pause its transfer service, receives with its usual checks, and restores Blueman when the window expires or you press **Stop**.
 2. The first time a sender is seen, an approval card shows the sender, Bluetooth address, file name and size. Choose **Allow once**, **Always allow**, **Decline** or **Block**. If the address is unknown, only the one-time choices are offered.
 3. Watch progress under **Incoming files**. The staged file is scanned against the malware blocklist, then saved to `Downloads/Kalo/<sender>/` under the folder shown under **Save to**; use **Open folder** to reveal the result. Files recovered after an interrupted transfer go to `Downloads/Kalo/Recovered/`.
 
@@ -220,7 +220,7 @@ An incoming Kalo container is decrypted first when a passphrase is configured or
 
 Use **Senders** to review remembered devices, remove a decision, or switch between **Ask** and **Trusted only**. **Trusted only** rejects unknown senders without showing a prompt. The CLI receiver has no prompt and rejects unknown senders; run the desktop app to approve new devices.
 
-**Important:** acceptance also depends on the operating system's Bluetooth stack. On Linux, a different program (such as Blueman's transfer service) may already own the OBEX agent registration. Close or disable the conflicting receiver; Kalo retries automatically. On Windows, Kalo must stay open to receive files. On macOS, Kalo cannot host the receiver at all; use Bluetooth Sharing.
+**Important:** acceptance also depends on the operating system's Bluetooth stack. On Linux, Blueman's transfer service normally owns obexd's single OBEX agent, so Kalo cannot receive while Blueman is holding it. Use **Open 10-minute receive window** rather than closing Blueman; Kalo restores Blueman when the window ends. The window is closed by its timer or by **Stop**, not after the first file, and a guard process restores Blueman if Kalo crashes. Other transfer tools that own the agent slot still conflict with Kalo. On Windows, Kalo must stay open to receive files. On macOS, Kalo cannot host the receiver at all; use Bluetooth Sharing.
 
 ## Command-line interface
 
@@ -269,7 +269,7 @@ The complete threat model, guarantees, and non-goals are in [SECURITY.md](SECURI
 
 **Trust storage:** decisions, pinned Ed25519 identities, and directional ratchet state are keyed by normalized Bluetooth address and stored in Kalo's configuration directory (`$XDG_CONFIG_HOME/kalo/trust.json` on Linux, `~/Library/Application Support/Kalo/trust.json` on macOS, and the local application data folder on Windows). The device identity lives in `identity.json` beside it. Theme, save-folder, and outgoing-encryption preferences live in `settings.json`; the encryption passphrase uses the OS keyring (`Kalo` / `encryption-passphrase`) and only falls back to the owner-only settings file when no keyring is available. Name-only identities are never persisted.
 
-**Receiver reliability:** Linux uses an OBEX agent registered with `obexd`, with retries after service or session-bus interruptions. On Windows, Kalo advertises its own OPP service while the app is running. A shared event system keeps transfer and receiver status consistent between the UI and CLI.
+**Receiver reliability:** Linux uses an OBEX agent registered with `obexd`, with retries after service or session-bus interruptions. When Blueman's transfer service owns the only agent slot, the UI can open a 10-minute receive window: Kalo snapshots Blueman's plugin state, asks the applet to pause `TransferService`, and restores the exact previous state when the window closes or expires. In-flight transfers finish before Kalo unregisters, and a guard process plus a recovery marker restore Blueman if Kalo dies. On Windows, Kalo advertises its own OPP service while the app is running. A shared event system keeps transfer and receiver status consistent between the UI and CLI.
 
 **Desktop integration:** the Linux status-area icon uses StatusNotifierItem and offers **Open Kalo** and **Quit Kalo**. Closing the window hides it when the tray is available, so the receiver keeps running in the background.
 
@@ -279,7 +279,7 @@ The complete threat model, guarantees, and non-goals are in [SECURITY.md](SECURI
 - **macOS has not been validated on Apple hardware by this project.** The backend is type-checked and CI builds and smoke-tests the app bundle, but pairing, sending, and permission prompts still need real-device testing.
 - **Windows is experimental.** Sending, receiving, pairing, trust persistence and Bluetooth radio edge cases need tests on physical Windows 10/11 machines. Windows builds are unsigned and there is no notification-area icon yet.
 - **The GUI does not perform active discovery.** It refreshes the operating system's known-device list; the CLI supports timed discovery.
-- **On Linux, only one OBEX agent can occupy the registration slot at a time.** Other Bluetooth transfer tools can conflict with Kalo's receiver.
+- **On Linux, only one OBEX agent can occupy the registration slot at a time.** Blueman's transfer service normally owns it, so Kalo offers an explicit 10-minute receive window instead of competing for the slot. Other transfer tools that own the agent still conflict with Kalo, and the handoff depends on Blueman's D-Bus applet API.
 - **The Linux tray depends on the desktop.** GNOME requires an AppIndicator extension; without a StatusNotifierItem host, Kalo cannot hide to the panel.
 - **Linux packages built locally are tied to the build machine.** Binary compatibility across different distributions, architectures, or older glibc versions is not guaranteed.
 - **Encryption is optional, Kalo-only, and off by default for unpaired devices.** Without it, confidentiality depends on the Bluetooth link encryption provided by pairing and the operating system. A stock OPP receiver or Apple's Bluetooth Sharing cannot open a Kalo container and saves it as an opaque file.

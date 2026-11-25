@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use tokio::sync::broadcast;
 
@@ -70,6 +71,38 @@ impl fmt::Display for ReceiverStatus {
                 f.write_str("receiver active — incoming files are saved to your save folder")
             }
             Self::Off(reason) => write!(f, "receiver OFF — {reason}"),
+        }
+    }
+}
+
+/// Explicit, time-bounded receive window. Blueman's TransferService normally
+/// owns obexd's single agent slot; arming a window asks Blueman to yield, lets
+/// Kalo register, and restores Blueman when the window closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseStatus {
+    /// No receive window; the receiver behaves normally.
+    Idle,
+    /// Blueman is being asked to release the agent slot.
+    Arming { deadline: Instant },
+    /// Kalo owns the agent slot until this instant.
+    Armed { expires_at: Instant },
+    /// The window is closing, but an in-flight transfer may still be running.
+    Stopping { reason: String },
+    /// Blueman is being restored after a failed or completed release.
+    Restoring { retry_at: Instant },
+    /// The window could not be opened or closed cleanly.
+    Error(String),
+}
+
+impl fmt::Display for LeaseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle => f.write_str("receive window closed"),
+            Self::Arming { .. } => f.write_str("opening receive window"),
+            Self::Armed { .. } => f.write_str("receive window open"),
+            Self::Stopping { reason } => write!(f, "closing receive window — {reason}"),
+            Self::Restoring { .. } => f.write_str("restoring Blueman"),
+            Self::Error(reason) => write!(f, "receive window error — {reason}"),
         }
     }
 }
@@ -148,6 +181,8 @@ pub enum Event {
     },
     /// State of the receiver (OBEX agent).
     ReceiverState(ReceiverStatus),
+    /// State of the explicit receive window that borrows Blueman's slot.
+    LeaseState(LeaseStatus),
     /// A Kalo pairing completed or failed. `ok` is false for an expected
     /// protocol error; the message is safe to show and never contains keys.
     Pairing {

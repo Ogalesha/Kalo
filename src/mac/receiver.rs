@@ -33,6 +33,7 @@ const REASON: &str = "macOS has no public OPP receiver API — enable Bluetooth 
 
 /// The UI starts the receiver once; on macOS it only publishes the reason and
 /// then stays parked. `!` matches the other backends' supervisor signature.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_receiver(
     handle: ReceiverHandle,
     _pending: PendingTransfers,
@@ -41,6 +42,7 @@ pub async fn run_receiver(
     _authorizer: Authorizer,
     _encryption: Encryption,
     _pairing: Option<crate::identity::PairingManager>,
+    _lease: crate::lease::LeaseControl,
 ) -> ! {
     handle.mark_lost(REASON);
     events.send(crate::events::Event::Log(REASON.to_string()));

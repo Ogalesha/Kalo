@@ -6,6 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Notify;
+
 use crate::events::{Event, EventSink, ReceiverStatus};
 
 /// Single source of truth for the receiver slot. Both the backend service and
@@ -17,6 +19,9 @@ use crate::events::{Event, EventSink, ReceiverStatus};
 pub struct ReceiverHandle {
     inner: Arc<Mutex<ReceiverInner>>,
     events: EventSink,
+    /// Wakes the supervisor when a lease asks it to retry registration
+    /// immediately instead of waiting for the periodic retry tick.
+    wake: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -37,6 +42,7 @@ impl ReceiverHandle {
                 next: 1,
             })),
             events,
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -47,6 +53,18 @@ impl ReceiverHandle {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn is_active(&self) -> bool {
         self.status() == ReceiverStatus::Active
+    }
+
+    /// Ask the supervisor to retry registration now.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Cancel-safe wake future used by the Linux supervisor's select loop.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) async fn notified(&self) {
+        self.wake.notified().await;
     }
 
     /// Allocate the id for a registration attempt and make it the only one

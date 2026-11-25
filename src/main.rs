@@ -32,10 +32,17 @@
 mod agent;
 mod app;
 #[cfg(target_os = "linux")]
+mod blueman;
+#[cfg(target_os = "linux")]
 mod bluez;
 mod crypto;
 mod events;
 mod identity;
+#[cfg(target_os = "linux")]
+mod lease;
+#[cfg(not(target_os = "linux"))]
+#[path = "lease_stub.rs"]
+mod lease;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "linux")]
@@ -101,6 +108,14 @@ enum Cmd {
     /// Listen for incoming OPP pushes (trusted senders only; approve new
     /// senders in the Kalo window)
     Receive,
+    /// Internal: restore Blueman if Kalo dies during a receive window
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    LeaseGuard {
+        /// Marker token written by the process that opened the window
+        #[arg(long)]
+        token: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -216,5 +231,7 @@ async fn cli_main(cmd: Cmd) -> Result<()> {
             security::init();
             platform::receive().await
         }
+        #[cfg(target_os = "linux")]
+        Cmd::LeaseGuard { token } => lease::guard(&token).await,
     }
 }
