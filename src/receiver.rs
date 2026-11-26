@@ -56,7 +56,7 @@ impl ReceiverHandle {
     }
 
     /// Ask the supervisor to retry registration now.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
     }

@@ -16,6 +16,10 @@
 //! Pairing files are never saved as received files: the receiver recognizes
 //! the `kalo-pair-*.kalopair` name, processes the object, and deletes it.
 
+// macOS has no OPP receiver, so the pairing handshake and receiver-side
+// helpers are unused there; sending still uses the identity types.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;

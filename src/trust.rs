@@ -6,6 +6,9 @@
 //! remembered devices. Windows falls back to a display-name identity when the
 //! Bluetooth address cannot be resolved; those identities are never stored.
 
+// macOS has no OPP receiver, so the trust and authorization plumbing is unused.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

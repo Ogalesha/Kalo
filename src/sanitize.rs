@@ -1,5 +1,9 @@
 //! Filename safety helpers for untrusted (remote-provided) file names.
 
+// Only the shared pairing code uses this module on macOS; the filename helpers
+// are exercised by the Linux and Windows receivers.
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};

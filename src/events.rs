@@ -78,6 +78,7 @@ impl fmt::Display for ReceiverStatus {
 /// Explicit, time-bounded receive window. Blueman's TransferService normally
 /// owns obexd's single agent slot; arming a window asks Blueman to yield, lets
 /// Kalo register, and restores Blueman when the window closes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseStatus {
     /// No receive window; the receiver behaves normally.
