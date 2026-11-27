@@ -23,6 +23,7 @@ pub const TRANSFER_PLUGIN: &str = "TransferService";
 const GSETTINGS_SCHEMA: &str = "org.blueman.general";
 const GSETTINGS_KEY: &str = "plugin-list";
 const POLL: Duration = Duration::from_millis(100);
+const LIST_POLL: Duration = Duration::from_millis(250);
 
 #[proxy(
     default_service = "org.blueman.Applet",
@@ -104,8 +105,9 @@ pub async fn wait_for_transfer_service(
 /// Exact GSettings value of `org.blueman.general plugin-list`.
 ///
 /// `SetPluginConfig` appends an explicit entry to this list. Capturing the raw
-/// GVariant text before the handoff lets us restore the user's original list,
-/// including the common empty list that relies on plugin auto-loading.
+/// GVariant text before the handoff lets us restore the user's original list.
+/// An empty list is not a disable request: it means "no overrides", so the
+/// plugin keeps following Blueman's auto-loading default.
 pub fn plugin_list_snapshot() -> Result<String> {
     let output = Command::new("gsettings")
         .args(["get", GSETTINGS_SCHEMA, GSETTINGS_KEY])
@@ -146,6 +148,46 @@ pub fn list_disables_transfer(raw: &str) -> bool {
     raw.contains(&format!("!{TRANSFER_PLUGIN}"))
 }
 
+/// True when a captured plugin list contains `TransferService` without an
+/// explicit disable entry.
+pub fn list_enables_transfer(raw: &str) -> bool {
+    raw.contains(TRANSFER_PLUGIN) && !list_disables_transfer(raw)
+}
+
+/// Wait until the persisted list shows the transfer plugin as enabled.
+/// `SetPluginConfig` writes GSettings asynchronously, so a restore must not
+/// race a disable entry that is still queued from the handoff.
+pub async fn wait_for_transfer_list_enabled(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let raw = plugin_list_snapshot()?;
+        if list_enables_transfer(&raw) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Blueman did not persist its transfer service as enabled in time");
+        }
+        tokio::time::sleep(LIST_POLL).await;
+    }
+}
+
+/// Wait until the persisted list shows the transfer plugin as disabled. This
+/// makes the handoff deterministic: the window does not open while a disable
+/// entry is still queued to Blueman.
+pub async fn wait_for_transfer_list_disabled(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let raw = plugin_list_snapshot()?;
+        if list_disables_transfer(&raw) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Blueman did not persist its transfer service as disabled in time");
+        }
+        tokio::time::sleep(LIST_POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +197,15 @@ mod tests {
         assert!(list_disables_transfer(r#"['!TransferService']"#));
         assert!(!list_disables_transfer(r#"['TransferService']"#));
         assert!(!list_disables_transfer("@as []"));
+    }
+
+    #[test]
+    fn detects_an_enabled_transfer_entry() {
+        assert!(list_enables_transfer(r#"['TransferService']"#));
+        assert!(!list_enables_transfer(r#"['!TransferService']"#));
+        assert!(!list_enables_transfer("@as []"));
+        assert!(!list_enables_transfer(
+            r#"['TransferService', '!TransferService']"#
+        ));
     }
 }

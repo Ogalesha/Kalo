@@ -4,7 +4,12 @@
 //! owns it, so Kalo cannot register until Blueman yields. This module opens a
 //! short, explicit window: it snapshots Blueman's plugin state, asks the applet
 //! to unload `TransferService`, lets the receiver register, and restores
-//! Blueman when the window closes or expires.
+//! Blueman when the window closes or expires. Restore writes the user's plugin
+//! list back first, then verifies that a running applet really has the plugin
+//! loaded again; an unreadable applet keeps the marker for a retry. An empty
+//! list relies on Blueman's autoload: it does not unload a plugin that is
+//! already loaded, so the exact original list can be restored after the plugin
+//! is back.
 //!
 //! Crash safety is layered. Before Blueman is touched, a guard process is
 //! started with its stdin connected to Kalo. If Kalo dies, the pipe closes and
@@ -36,8 +41,18 @@ pub const RECEIVE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const ARM_TIMEOUT: Duration = Duration::from_secs(20);
 /// Delay before retrying a failed Blueman restore.
 const RESTORE_RETRY: Duration = Duration::from_secs(5);
-/// How long a restore is allowed to take.
-const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long Blueman may take to load the plugin. The applet can block on
+/// BlueZ for a minute or more, so this is deliberately generous.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Blueman may take to persist a plugin-list change.
+const PLUGIN_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the plugin must stay loaded before a restore is considered
+/// complete.
+const RESTORE_SETTLE: Duration = Duration::from_secs(3);
+/// How many load/settle/verify rounds a single restore may attempt.
+const RESTORE_ATTEMPTS: usize = 2;
+/// Poll interval while checking that the plugin stays loaded.
+const STABLE_POLL: Duration = Duration::from_millis(200);
 const MARKER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,7 +534,10 @@ pub async fn begin(
 
             if let Err(error) = async {
                 blueman::set_transfer_service(conn, false).await?;
-                blueman::wait_for_transfer_service(conn, false, ARM_TIMEOUT).await
+                blueman::wait_for_transfer_service(conn, false, ARM_TIMEOUT).await?;
+                // Do not open the window while Blueman still has a queued
+                // disable write; it could land after the restore.
+                blueman::wait_for_transfer_list_disabled(PLUGIN_LIST_TIMEOUT).await
             }
             .await
             {
@@ -643,35 +661,133 @@ async fn recover_stale_marker_locked(events: &EventSink) -> Result<bool> {
     Ok(true)
 }
 
+/// Runtime state of the Blueman applet as observed during a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreApplet {
+    Running,
+    Absent,
+    Unknown,
+}
+
+/// What a restore must do after the user's plugin list is written back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestorePlan {
+    /// The list alone describes the desired state: it explicitly disables the
+    /// plugin, or there is no applet to talk to (Blueman's autoload will apply
+    /// the list when it next starts).
+    RestoreOnly,
+    /// The list does not disable the plugin, so a running applet must be asked
+    /// to load it again. After the plugin is back, the user's exact list is
+    /// restored; an empty list does not unload an already-loaded plugin.
+    EnsureLoaded,
+    /// The applet state could not be read. Keep the marker and retry instead
+    /// of silently leaving the plugin unloaded.
+    Retry,
+}
+
+fn restore_plan(original_plugin_list: &str, applet: RestoreApplet) -> RestorePlan {
+    if blueman::list_disables_transfer(original_plugin_list) {
+        return RestorePlan::RestoreOnly;
+    }
+    match applet {
+        RestoreApplet::Running => RestorePlan::EnsureLoaded,
+        RestoreApplet::Absent => RestorePlan::RestoreOnly,
+        RestoreApplet::Unknown => RestorePlan::Retry,
+    }
+}
+
+/// True when the plugin stayed loaded for the whole `duration`. `None` (the
+/// applet went away) is treated as stable: Blueman's autoload applies the
+/// restored list when it next starts.
+async fn wait_for_stable_transfer_service(conn: &Connection, duration: Duration) -> Result<bool> {
+    let deadline = Instant::now() + duration;
+    loop {
+        match blueman::transfer_service_loaded(conn).await? {
+            Some(true) | None => {}
+            Some(false) => return Ok(false),
+        }
+        if Instant::now() >= deadline {
+            return Ok(true);
+        }
+        tokio::time::sleep(STABLE_POLL).await;
+    }
+}
+
 async fn restore_marker(
     marker: &LeaseMarker,
     conn: Option<&Connection>,
     events: &EventSink,
 ) -> Result<()> {
     let explicit_disable = blueman::list_disables_transfer(&marker.original_plugin_list);
-    let mut applet_running = false;
 
-    if let Some(conn) = conn {
-        applet_running = blueman::applet_running(conn).await.unwrap_or(false);
-        if applet_running && !explicit_disable {
-            let loaded = blueman::transfer_service_loaded(conn).await.ok().flatten();
-            if loaded != Some(true) {
-                blueman::set_transfer_service(conn, true).await?;
-                blueman::wait_for_transfer_service(conn, true, RESTORE_TIMEOUT).await?;
+    // Put the user's persisted list back first. An empty list is the normal
+    // "no overrides" value and relies on Blueman's autoload; it does not
+    // unload a plugin that is already loaded. An explicit `!TransferService`
+    // entry does unload it, which is the state the user asked for.
+    blueman::restore_plugin_list(&marker.original_plugin_list)?;
+
+    if explicit_disable {
+        return Ok(());
+    }
+
+    let applet = match conn {
+        Some(conn) => match blueman::transfer_service_loaded(conn).await {
+            Ok(Some(_)) => RestoreApplet::Running,
+            Ok(None) => RestoreApplet::Absent,
+            Err(error) => {
+                events.send(Event::Log(format!(
+                    "warning: could not inspect Blueman while restoring it: {error:#}"
+                )));
+                RestoreApplet::Unknown
             }
-        }
-    }
+        },
+        None => RestoreApplet::Unknown,
+    };
 
-    if let Err(error) = blueman::restore_plugin_list(&marker.original_plugin_list) {
-        if applet_running {
-            events.send(Event::Log(format!(
-                "warning: could not restore Blueman's exact plugin list: {error:#}"
-            )));
-        } else {
-            return Err(error);
+    match restore_plan(&marker.original_plugin_list, applet) {
+        RestorePlan::RestoreOnly => Ok(()),
+        RestorePlan::Retry => bail!(
+            "could not determine whether Blueman's transfer service needs restoring; \
+             keeping the recovery marker for a retry"
+        ),
+        RestorePlan::EnsureLoaded => {
+            let conn = conn.context("no session-bus connection to restore Blueman")?;
+            for attempt in 0..RESTORE_ATTEMPTS {
+                blueman::set_transfer_service(conn, true).await?;
+                // Make sure the queued handoff write has been superseded in
+                // GSettings before trusting the plugin's loaded state. A slow
+                // applet is not fatal here: the load wait below and the final
+                // verification still decide the outcome.
+                if let Err(error) =
+                    blueman::wait_for_transfer_list_enabled(PLUGIN_LIST_TIMEOUT).await
+                {
+                    events.send(Event::Log(format!(
+                        "warning: Blueman's plugin list did not settle in time: {error:#}"
+                    )));
+                }
+                blueman::wait_for_transfer_service(conn, true, RESTORE_TIMEOUT).await?;
+                // Put the user's exact list back. An empty list means "no
+                // overrides" and does not unload the plugin that is already
+                // loaded, so this leaves no explicit entry behind.
+                blueman::restore_plugin_list(&marker.original_plugin_list)?;
+                // Blueman applies GSettings changes asynchronously. Keep
+                // checking for a whole settle window so a late write cannot
+                // undo the restore after it has already returned.
+                if wait_for_stable_transfer_service(conn, RESTORE_SETTLE).await? {
+                    return Ok(());
+                }
+                if attempt + 1 < RESTORE_ATTEMPTS {
+                    events.send(Event::Log(
+                        "Blueman unloaded its transfer service during restore; retrying".into(),
+                    ));
+                }
+            }
+            bail!(
+                "Blueman kept unloading its transfer service while it was being restored; \
+                 keeping the recovery marker for a retry"
+            )
         }
     }
-    Ok(())
 }
 
 /// Hidden `kalo lease-guard` subcommand. Reads one line from Kalo: `done`
@@ -1104,5 +1220,49 @@ mod tests {
         write_marker_at(&path, &marker).unwrap();
         assert!(read_marker_at(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_plugin_list_still_requires_loading_the_transfer_service() {
+        assert_eq!(
+            restore_plan("@as []", RestoreApplet::Running),
+            RestorePlan::EnsureLoaded
+        );
+    }
+
+    #[test]
+    fn an_explicit_disable_is_restored_without_loading_the_plugin() {
+        assert_eq!(
+            restore_plan("['!TransferService']", RestoreApplet::Running),
+            RestorePlan::RestoreOnly
+        );
+        assert_eq!(
+            restore_plan("['!TransferService']", RestoreApplet::Unknown),
+            RestorePlan::RestoreOnly
+        );
+    }
+
+    #[test]
+    fn an_explicitly_enabled_plugin_is_loaded_when_missing() {
+        assert_eq!(
+            restore_plan("['TransferService']", RestoreApplet::Running),
+            RestorePlan::EnsureLoaded
+        );
+    }
+
+    #[test]
+    fn an_unknown_applet_state_keeps_the_marker_for_a_retry() {
+        assert_eq!(
+            restore_plan("@as []", RestoreApplet::Unknown),
+            RestorePlan::Retry
+        );
+    }
+
+    #[test]
+    fn an_absent_applet_relies_on_autoload() {
+        assert_eq!(
+            restore_plan("@as []", RestoreApplet::Absent),
+            RestorePlan::RestoreOnly
+        );
     }
 }
